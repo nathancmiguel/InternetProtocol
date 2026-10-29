@@ -4,6 +4,7 @@
 #define ENABLE_SSL
 #include <fstream>
 #include <iostream>
+#include <iostream>
 #include "ip.hpp"
 
 using namespace internetprotocol;

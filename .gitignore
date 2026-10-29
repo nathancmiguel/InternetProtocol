@@ -1,27 +1,12 @@
-# Xmake cache
-.xmake/
+# Build
 build/
-
-# MacOS Cache
+cmake-build-*/
+out/
+CMakeUserPresets.json
+# IDE
+.idea/
+.vs/
+.vscode/
+*.user
+# OS
 .DS_Store
-
-CMakeLists.txt.user
-CMakeLists.txt
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
-debug/*
-.idea/*
-out/*
-.vscode/*
-.vs/*
-.cache/*
-
-

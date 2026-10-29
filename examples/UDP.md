@@ -3,6 +3,7 @@
 ## UDP Server
 
 ```cpp
+#include <iostream>
 #include "ip.hpp"
 
 using namespace internetprotocol;
@@ -47,6 +48,7 @@ int main(int argc, char** argv) {
 ## UDP Client
 
 ```cpp
+#include <iostream>
 #include "ip.hpp"
 
 using namespace internetprotocol;

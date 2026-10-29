@@ -1,636 +1,349 @@
-/** 
+/**
  * MIT License (MIT)
  * Copyright © 2025 Nathan Miguel
-*/
+ */
 
 #pragma once
 
-#include "ip/net/common.hpp"
-#include "ip/utils/net.hpp"
+#include "ip/transport/stream_client.hpp"
+#include "ip/utils/httpparser.hpp"
+#include "ip/utils/tls.hpp"
 
 namespace internetprotocol {
-    class http_client_c {
+    namespace detail {
+        /// Shared state of an HTTP client: ordered request queue over ONE keep-alive connection.
+        template<typename Stream>
+        class http_client_state : public std::enable_shared_from_this<http_client_state<Stream>> {
+        public:
+            using response_cb = std::function<void(const std::error_code &, const http_response_t &)>;
+
+            std::shared_ptr<stream_client<Stream>> link = std::make_shared<stream_client<Stream>>();
+
+            explicit http_client_state(http_limits_t limits = {}) : parser_(http_parser::kind::response, limits) {}
+
+            void init() {
+                auto w = this->weak_from_this();
+                link->data_hook = [w](const uint8_t *p, std::size_t n) { if (auto s = w.lock()) s->on_data(p, n); };
+                link->on_connected = [w] { if (auto s = w.lock()) s->send_front(); };
+                link->on_close = [w] { if (auto s = w.lock()) s->on_closed(); };
+                link->on_error = [w](const std::error_code &ec) { if (auto s = w.lock()) s->on_error(ec); };
+            }
+
+            void set_host(const client_bind_options_t &b) {
+                std::lock_guard l(m_);
+                bind_ = b;
+            }
+
+            std::atomic<uint16_t> request_timeout_seconds{30};
+
+            void request(const http_request_t &req, response_cb cb) {
+                {
+                    std::lock_guard l(m_);
+                    q_.push_back(item{req, std::move(cb), 0});
+                }
+                pump();
+            }
+
+            /// Graceful close; queued requests fail with operation_aborted.
+            void close() {
+                std::deque<item> dropped;
+                {
+                    std::lock_guard l(m_);
+                    dropped.swap(q_);
+                    inflight_ = sent_ = false;
+                    ++seq_;
+                }
+                link->close();
+                for (auto &i: dropped) finish(i.cb, asio::error::operation_aborted, {});
+            }
+
+            void shutdown() {
+                {
+                    std::lock_guard l(m_);
+                    q_.clear();
+                    inflight_ = sent_ = false;
+                    ++seq_;
+                }
+                link->shutdown();
+            }
+
+        private:
+            struct item {
+                http_request_t req;
+                response_cb cb;
+                int attempts = 0;
+            };
+
+            mutable std::mutex m_;
+            std::deque<item> q_;
+            client_bind_options_t bind_;
+            http_parser parser_;
+            bool inflight_ = false;  // front item is being processed
+            bool sent_ = false;      // front item was written to the wire
+            bool got_bytes_ = false;
+            bool reused_ = false;
+            std::uint64_t seq_ = 0;
+            std::error_code last_ec_;
+            std::shared_ptr<asio::steady_timer> timer_;
+
+            static void finish(const response_cb &cb, const std::error_code &ec, const http_response_t &res) {
+                if (!cb) return;
+                try { cb(ec, res); } catch (...) {}
+            }
+
+            static bool idempotent(request_method_e m) { return m != POST && m != PATCH; }
+
+            void pump() {
+                bool send = false;
+                {
+                    std::lock_guard l(m_);
+                    if (q_.empty() || inflight_) return;
+                    inflight_ = true;
+                    sent_ = false;
+                    reused_ = link->is_open();
+                    send = reused_;
+                }
+                if (send) send_front();
+                else connect_link();
+            }
+
+            void connect_link() {
+                client_bind_options_t b;
+                {
+                    std::lock_guard l(m_);
+                    b = bind_;
+                }
+                // If the link is mid-close (or already connecting) on_closed()/on_connected() continue the flow.
+                link->connect(b);
+            }
+
+            void send_front() {
+                http_request_t req;
+                client_bind_options_t b;
+                std::uint64_t id;
+                {
+                    std::lock_guard l(m_);
+                    if (q_.empty() || !inflight_ || sent_) return;
+                    req = q_.front().req;
+                    b = bind_;
+                    sent_ = true;
+                    got_bytes_ = false;
+                    last_ec_.clear();
+                    parser_.reset();
+                    parser_.expect_no_body(req.method == HEAD);
+                    id = ++seq_;
+                }
+                uint16_t port = 0;
+                try { port = static_cast<uint16_t>(std::stoul(b.port)); } catch (...) {}
+                const std::string payload = prepare_request(req, b.address, port);
+                arm_timer(id);
+                if (!link->write(reinterpret_cast<const uint8_t *>(payload.data()), payload.size()))
+                    fail_front(make_error_code(errc::not_connected), id);
+            }
+
+            void arm_timer(std::uint64_t id) {
+                const auto secs = request_timeout_seconds.load();
+                if (secs == 0) return;
+                auto t = std::make_shared<asio::steady_timer>(runtime::instance().context());
+                {
+                    std::lock_guard l(m_);
+                    if (timer_) timer_->cancel();
+                    timer_ = t;
+                }
+                t->expires_after(std::chrono::seconds(secs));
+                t->async_wait([w = this->weak_from_this(), id, t](const std::error_code &ec) {
+                    if (ec) return;
+                    if (auto s = w.lock()) {
+                        if (s->fail_front(make_error_code(errc::timeout), id)) s->link->abort();
+                    }
+                });
+            }
+
+            void cancel_timer_locked() {
+                if (timer_) timer_->cancel();
+                timer_.reset();
+            }
+
+            /// Completes the front request with an error. `id` guards against stale timers (0 = any).
+            bool fail_front(const std::error_code &ec, std::uint64_t id = 0) {
+                item it;
+                {
+                    std::lock_guard l(m_);
+                    if (q_.empty() || !inflight_ || (id && id != seq_)) return false;
+                    it = std::move(q_.front());
+                    q_.pop_front();
+                    inflight_ = sent_ = false;
+                    ++seq_;
+                    cancel_timer_locked();
+                }
+                finish(it.cb, ec, {});
+                pump();
+                return true;
+            }
+
+            void on_data(const uint8_t *p, std::size_t n) {
+                std::size_t off = 0;
+                while (off < n) {
+                    item done_item;
+                    http_response_t res;
+                    std::error_code ec;
+                    bool completed = false, close_link = false;
+                    {
+                        std::lock_guard l(m_);
+                        if (!inflight_ || !sent_) return; // unsolicited bytes are ignored
+                        got_bytes_ = true;
+                        off += parser_.feed(p + off, n - off, ec);
+                        if (!ec && parser_.done()) {
+                            const int sc = parser_.response().status_code;
+                            if (sc >= 100 && sc < 200 && sc != 101) { // interim response: keep waiting
+                                parser_.reset();
+                                parser_.expect_no_body(q_.front().req.method == HEAD);
+                                continue;
+                            }
+                            res = std::move(parser_.response());
+                            close_link = header_has_token(res.headers, "connection", "close") ||
+                                         (res.version == "1.0" && !header_has_token(res.headers, "connection", "keep-alive"));
+                            completed = true;
+                        } else if (ec) {
+                            completed = true;
+                        }
+                        if (completed) {
+                            done_item = std::move(q_.front());
+                            q_.pop_front();
+                            inflight_ = sent_ = false;
+                            ++seq_;
+                            cancel_timer_locked();
+                        }
+                    }
+                    if (!completed) return;
+                    if (ec || close_link) link->close();
+                    finish(done_item.cb, ec, ec ? http_response_t{} : res);
+                    pump();
+                    return; // one response per request; trailing bytes are discarded
+                }
+            }
+
+            void on_error(const std::error_code &ec) {
+                bool never_sent;
+                {
+                    std::lock_guard l(m_);
+                    never_sent = inflight_ && !sent_;
+                    if (!never_sent) last_ec_ = ec;
+                }
+                if (never_sent) fail_front(ec);
+            }
+
+            void on_closed() {
+                item it;
+                http_response_t res;
+                std::error_code ec;
+                bool complete = false, retry = false, reconnect = false;
+                {
+                    std::lock_guard l(m_);
+                    if (!inflight_) return;
+                    if (!sent_) { reconnect = true; }
+                    else {
+                        ec = last_ec_ ? last_ec_ : make_error_code(errc::closed_by_peer);
+                        std::error_code eof_ec;
+                        if (parser_.reads_until_close()) {
+                            parser_.on_eof(eof_ec);
+                            res = std::move(parser_.response());
+                            complete = true;
+                            ec.clear();
+                        } else if (!got_bytes_ && reused_ && q_.front().attempts == 0 && idempotent(q_.front().req.method)) {
+                            ++q_.front().attempts;
+                            inflight_ = sent_ = false;
+                            ++seq_;
+                            cancel_timer_locked();
+                            retry = true;
+                        }
+                        if (complete || !retry) {
+                            it = std::move(q_.front());
+                            q_.pop_front();
+                            inflight_ = sent_ = false;
+                            ++seq_;
+                            cancel_timer_locked();
+                        }
+                    }
+                }
+                if (reconnect) { connect_link(); return; }
+                if (!retry) finish(it.cb, ec, res);
+                pump();
+            }
+        };
+    }
+
+    /**
+     * HTTP/1.1 client (plain or TLS) over one persistent connection. Requests are queued and
+     * executed strictly in order; the connection is (re)opened on demand, idempotent requests that
+     * hit a stale keep-alive connection are retried once, responses may use Content-Length, chunked
+     * encoding or read-until-close.
+     *
+     * @code
+     * http_client_c client;
+     * client.set_host({"example.com", "80", v4});
+     * http_request_t req; req.path = "/";
+     * client.request(req, [](const asio::error_code &ec, const http_response_t &res) { ... });
+     * @endcode
+     */
+    template<typename Stream>
+    class basic_http_client {
     public:
-        http_client_c() {
-            idle_timer = std::make_unique<asio::steady_timer>(net.context);
-        }
+        using response_callback = std::function<void(const asio::error_code &, const http_response_t &)>;
 
-        ~http_client_c() {
-            if (net.socket.is_open())
-                close();
-            consume_recv_buffer();
-        }
+        basic_http_client() : basic_http_client(std::make_shared<detail::http_client_state<Stream>>()) {}
 
-        /**
-         * Set/Get timeout value in seconds
-         *
-         * Timeout is always reseted when socket send or receive data
-         *
-         * @par Example
-         * @code
-         * http_client_c client;
-         * client.idle_timeout_seconds = 5;
-         * @endcode
-         */
+        basic_http_client(const basic_http_client &) = delete;
+
+        basic_http_client &operator=(const basic_http_client &) = delete;
+
+        ~basic_http_client() { state_->shutdown(); }
+
+        /// Close the keep-alive connection after this many idle seconds (0 = never). Applied on the next (re)connect.
         uint16_t idle_timeout_seconds = 0;
 
-        /**
-         * Return true if socket is open.
-         *
-         * @par Example
-         * @code
-         * http_client_c client;
-         * bool is_open = client.is_open();
-         * @endcode
-         */
-        bool is_open() const { return net.socket.is_open(); }
+        /// Max seconds to wait for a complete response (0 = no limit). Default 30.
+        void set_request_timeout(uint16_t seconds) { state_->request_timeout_seconds.store(seconds); }
 
-        /**
-         * Set address and port to resolve. Must be called before use 'request()' function.
-         *
-         * @param bind_opts An struct specifying protocol parameters to be used.
-         * If 'port' is not specified or is 0, the operating system will attempt to bind to a random port.
-         * If 'address' is not specified, the operating system will attempt to bind to local host
-         *
-         * @par Example
-         * @code
-         * http_client_c client;
-         * client.set_host({});
-         * @endcode
-         */
-        void set_host(const client_bind_options_t &bind_opts = {}) {
-            bind_options = bind_opts;
+        bool is_open() const { return state_->link->is_open(); }
+
+        client_options_t &options() { return state_->link->options(); }
+
+        void set_host(const client_bind_options_t &bind_opts = {}) { state_->set_host(bind_opts); }
+
+        /// Queues a request. The callback receives the parsed response or an error (timeout, connection closed, ...).
+        void request(const http_request_t &req, const response_callback &response_cb) {
+            if (!state_->link->is_open())
+                state_->link->options().idle_timeout = std::chrono::seconds(idle_timeout_seconds);
+            state_->request(req, response_cb);
         }
 
-        /**
-         * Process payload and send request.
-         *
-         * @param req Request data.
-         *
-         * @param response_cb lambada function to receive and process response.
-         *
-         * @par Example
-         * @code
-         * http_client_c client;
-         * client.set_host({});
-         *
-         * net.request(req, [&](const asio::error_code &ec, const http_response_t &res) {
-         *      if (ec) {
-         *          // ec will be true if any error occur when trying to connect, send or receive payload
-         *          std::cout << ec.message() << std::endl;
-         *          return;
-         *      }
-         *      std::cout << res.status_code << " " << res.status_message << std::endl;
-         *      std::cout << res.body << std::endl;
-         * });
-         * @endcode
-         */
-        void request(const http_request_t &req,
-                     const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (!net.socket.is_open()) {
-                net.resolver.async_resolve(bind_options.protocol == v4 ? tcp::v4() : tcp::v6(),
-                                           bind_options.address, bind_options.port,
-                                           [&, req, response_cb](const asio::error_code &ec,
-                                                                 const tcp::resolver::results_type &results) {
-                                               resolve(ec, results, req, response_cb);
-                                           });
-                asio::post(thread_pool, [&] { run_context_thread(); });
-                return;
-            }
+        /// Closes the connection; pending requests complete with operation_aborted.
+        void close() { state_->close(); }
 
-            std::string payload = prepare_request(req, net.socket.remote_endpoint().address().to_string(),
-                                                  net.socket.remote_endpoint().port());
-            if (idle_timeout_seconds > 0)
-                reset_idle_timer();
-            asio::async_write(net.socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, response_cb](const asio::error_code &ec, const size_t bytes_sent) {
-                                  write_cb(ec, bytes_sent, response_cb);
-                              });
+    protected:
+        explicit basic_http_client(std::shared_ptr<detail::http_client_state<Stream>> st) : state_(std::move(st)) {
+            state_->init();
         }
 
-        /**
-         * Close the underlying socket and stop listening for data on it. Also can be used to force cancel the request process.
-         *
-         * @par Example
-         * @code
-         * http_client_c client;
-         * client.close();
-         * @endcode
-         */
-        void close() {
-            is_closing.store(true);
-            asio::error_code ec;
-            if (net.socket.is_open()) {
-                net.socket.shutdown(tcp::socket::shutdown_both, ec);
-                net.socket.close(ec);
-            }
-            net.context.stop();
-            net.context.restart();
-            net.endpoint = tcp::endpoint();
-            is_closing.store(false);
-        }
-
-    private:
-        std::mutex mutex_io;
-        std::atomic<bool> is_closing = false;
-        std::unique_ptr<asio::steady_timer> idle_timer;
-        client_bind_options_t bind_options;
-        tcp_client_t net;
-        asio::streambuf recv_buffer;
-
-        void start_idle_timer() {
-            if (idle_timeout_seconds == 0)
-                return;
-
-            idle_timer->expires_after(std::chrono::seconds(idle_timeout_seconds));
-            idle_timer->async_wait([&](const asio::error_code &ec) {
-                if (ec == asio::error::operation_aborted)
-                    return;
-
-                if (is_closing.load())
-                    return;
-
-                close();
-            });
-        }
-
-        void reset_idle_timer() {
-            if (is_closing.load() || idle_timeout_seconds == 0)
-                return;
-
-            idle_timer->cancel();
-            start_idle_timer();
-        }
-
-        void run_context_thread() {
-            std::lock_guard guard(mutex_io);
-            net.context.run();
-            if (!is_closing.load())
-                close();
-        }
-
-        void resolve(const asio::error_code &error, const tcp::resolver::results_type &results,
-                     const http_request_t &req,
-                     const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                response_cb(error, http_response_t());
-                return;
-            }
-
-            net.endpoint = results.begin()->endpoint();
-            asio::async_connect(net.socket,
-                                results,
-                                [&, req, response_cb](const asio::error_code &ec, const tcp::endpoint &ep) {
-                                    conn(ec, req, response_cb);
-                                });
-        }
-
-        void conn(const asio::error_code &error, const http_request_t &req,
-                  const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                response_cb(error, http_response_t());
-                return;
-            }
-
-            std::string payload = prepare_request(req, net.socket.remote_endpoint().address().to_string(),
-                                                  net.socket.remote_endpoint().port());
-            if (idle_timeout_seconds > 0)
-                start_idle_timer();
-            asio::async_write(net.socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, response_cb](const asio::error_code &ec, const size_t bytes_sent) {
-                                  write_cb(ec, bytes_sent, response_cb);
-                              });
-        }
-
-        void write_cb(const asio::error_code &error, const size_t bytes_sent,
-                      const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                response_cb(error, http_response_t());
-                return;
-            }
-
-
-            consume_recv_buffer();
-            if (idle_timeout_seconds > 0)
-                reset_idle_timer();
-            asio::async_read_until(net.socket,
-                                   recv_buffer, "\r\n",
-                                   [&, response_cb](const asio::error_code &ec, const size_t bytes_received) {
-                                       read_cb(ec, bytes_received, response_cb);
-                                   });
-        }
-
-        void consume_recv_buffer() {
-            const size_t size = recv_buffer.size();
-            if (size > 0)
-                recv_buffer.consume(size);
-        }
-
-        void read_cb(const asio::error_code &error, const size_t bytes_recvd,
-                     const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                consume_recv_buffer();
-                response_cb(error, http_response_t());
-                return;
-            }
-            if (idle_timeout_seconds > 0)
-                reset_idle_timer();
-
-            http_response_t response;
-            std::istream response_stream(&recv_buffer);
-            std::string http_version;
-            unsigned int status_code;
-            std::string status_message;
-            response_stream >> http_version;
-            response_stream >> status_code;
-            std::getline(response_stream, status_message);
-            if (!response_stream || http_version.substr(0, 5) != "HTTP/") {
-                consume_recv_buffer();
-                response.status_code = 505;
-                response.status_message = "HTTP Version Not Supported";
-                response_cb(error, response);
-                return;
-            }
-            response.status_code = status_code;
-            response.status_message = status_message;
-            if (status_code != 200 && recv_buffer.size() == 0) {
-                consume_recv_buffer();
-                response_cb(error, response);
-                return;
-            }
-
-            asio::async_read_until(net.socket,
-                                   recv_buffer, "\r\n\r\n",
-                                   std::bind(&http_client_c::read_headers,
-                                             this, asio::placeholders::error,
-                                             response,
-                                             response_cb));
-        }
-
-        void read_headers(const asio::error_code &error, http_response_t &response,
-                          const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                consume_recv_buffer();
-                response_cb(error, response);
-                return;
-            }
-            std::istream response_stream(&recv_buffer);
-            std::string header;
-
-            while (std::getline(response_stream, header) && header != "\r")
-                res_append_header(response, header);
-
-            if (recv_buffer.size() > 0) {
-                std::ostringstream body_buffer;
-                body_buffer << &recv_buffer;
-                response.body = body_buffer.str();
-            }
-
-            consume_recv_buffer();
-            response_cb(error, response);
-        }
+        std::shared_ptr<detail::http_client_state<Stream>> state_;
     };
-#ifdef ENABLE_SSL
-    class http_client_ssl_c {
+
+    using http_client_c = basic_http_client<plain_stream>;
+
+#ifdef IP_ENABLE_SSL
+    class http_client_ssl_c : public basic_http_client<ssl_stream> {
     public:
-        explicit http_client_ssl_c(const security_context_opts &sec_opts = {}) {
-            idle_timer = std::make_unique<asio::steady_timer>(net.context);
-            if (!sec_opts.private_key.empty()) {
-                const asio::const_buffer buffer(sec_opts.private_key.data(), sec_opts.private_key.size());
-                net.ssl_context.use_private_key(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.cert.empty()) {
-                const asio::const_buffer buffer(sec_opts.cert.data(), sec_opts.cert.size());
-                net.ssl_context.use_certificate(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.cert_chain.empty()) {
-                const asio::const_buffer buffer(sec_opts.cert_chain.data(), sec_opts.cert_chain.size());
-                net.ssl_context.use_certificate_chain(buffer);
-            }
-
-            if (!sec_opts.rsa_private_key.empty()) {
-                const asio::const_buffer buffer(sec_opts.rsa_private_key.data(), sec_opts.rsa_private_key.size());
-                net.ssl_context.use_rsa_private_key(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.host_name_verification.empty()) {
-                net.ssl_context.set_verify_callback(asio::ssl::host_name_verification(sec_opts.host_name_verification));
-            }
-
-            switch (sec_opts.verify_mode) {
-                case none:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_none);
-                    break;
-                case verify_peer:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_peer);
-                    break;
-                case verify_fail_if_no_peer_cert:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_fail_if_no_peer_cert);
-                    break;
-                default:
-                    break;
-            }
-
-            net.ssl_socket = asio::ssl::stream<tcp::socket>(net.context, net.ssl_context);
-        }
-
-        ~http_client_ssl_c() {
-            if (net.ssl_socket.next_layer().is_open())
-                close();
-            consume_recv_buffer();
-        }
-
-        /**
-         * Set/Get timeout value in seconds
-         *
-         * Timeout is always reseted when socket send or receive data
-         *
-         * @par Example
-         * @code
-         * http_client_ssl_c client({});
-         * client.idle_timeout_seconds = 5;
-         * @endcode
-         */
-        uint16_t idle_timeout_seconds = 0;
-
-        /**
-         * Return true if socket is open.
-         *
-         * @par Example
-         * @code
-         * http_client_ssl_c client({});
-         * bool is_open = client.is_open();
-         * @endcode
-         */
-        bool is_open() const { return net.ssl_socket.next_layer().is_open(); }
-
-        /**
-         * Set address and port to resolve. Must be called before use 'request()' function.
-         *
-         * @param bind_opts An struct specifying protocol parameters to be used.
-         * If 'port' is not specified or is 0, the operating system will attempt to bind to a random port.
-         * If 'address' is not specified, the operating system will attempt to bind to local host
-         *
-         * @par Example
-         * @code
-         * http_client_ssl_c client({});
-         * client.set_host({});
-         * @endcode
-         */
-        void set_host(const client_bind_options_t &bind_opts = {}) {
-            bind_options = bind_opts;
-        }
-
-        /**
-         * Process payload and send request.
-         *
-         * @param req Request data.
-         *
-         * @param response_cb lambada function to receive and process response.
-         *
-         * @par Example
-         * @code
-         * http_client_ssl_c client({});
-         * client.set_host({});
-         *
-         * net.request(req, [&](const asio::error_code &ec, const http_response_t &res) {
-         *      if (ec) {
-         *          // ec will be true if any error occur when trying to connect, send or receive payload
-         *          std::cout << ec.message() << std::endl;
-         *          return;
-         *      }
-         *      std::cout << res.status_code << " " << res.status_message << std::endl;
-         *      std::cout << res.body << std::endl;
-         * });
-         * @endcode
-         */
-        void request(const http_request_t &req,
-                     const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (!net.ssl_socket.next_layer().is_open()) {
-                net.resolver.async_resolve(bind_options.protocol == v4 ? tcp::v4() : tcp::v6(),
-                                           bind_options.address, bind_options.port,
-                                           [&, req, response_cb](const asio::error_code &ec,
-                                                                 const tcp::resolver::results_type &results) {
-                                               resolve(ec, results, req, response_cb);
-                                           });
-                asio::post(thread_pool, [&] { run_context_thread(); });
-                return;
-            }
-
-            std::string payload = prepare_request(
-                req, net.ssl_socket.next_layer().remote_endpoint().address().to_string(),
-                net.ssl_socket.next_layer().remote_endpoint().port());
-            if (idle_timeout_seconds > 0)
-                reset_idle_timer();
-            asio::async_write(net.ssl_socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, response_cb](const asio::error_code &ec, const size_t bytes_sent) {
-                                  write_cb(ec, bytes_sent, response_cb);
-                              });
-        }
-
-        /**
-         * Close the underlying socket and stop listening for data on it. Also can be used to force cancel the request process.
-         *
-         * @par Example
-         * @code
-         * http_client_ssl_c client({});
-         * client.close();
-         * @endcode
-         */
-        void close() {
-            is_closing.store(true);
-            asio::error_code ec;
-            if (net.ssl_socket.next_layer().is_open()) {
-                net.ssl_socket.lowest_layer().shutdown(asio::socket_base::shutdown_both, ec);
-                net.ssl_socket.lowest_layer().close(ec);
-
-                net.ssl_socket.shutdown(ec);
-                net.ssl_socket.next_layer().close(ec);
-            }
-            net.context.stop();
-            net.context.restart();
-            net.endpoint = tcp::endpoint();
-            is_closing.store(false);
-        }
+        explicit http_client_ssl_c(const security_context_opts &sec_opts = {})
+            : basic_http_client<ssl_stream>(make_state(sec_opts)) {}
 
     private:
-        std::mutex mutex_io;
-        std::atomic<bool> is_closing = false;
-        std::unique_ptr<asio::steady_timer> idle_timer;
-        client_bind_options_t bind_options;
-        tcp_client_ssl_t net;
-        asio::streambuf recv_buffer;
-
-        void start_idle_timer() {
-            if (idle_timeout_seconds == 0)
-                return;
-
-            idle_timer->expires_after(std::chrono::seconds(idle_timeout_seconds));
-            idle_timer->async_wait([&](const asio::error_code &ec) {
-                if (ec == asio::error::operation_aborted)
-                    return;
-
-                if (is_closing.load())
-                    return;
-
-                close();
-            });
-        }
-
-        void reset_idle_timer() {
-            if (is_closing.load() || idle_timeout_seconds == 0)
-                return;
-
-            idle_timer->cancel();
-            start_idle_timer();
-        }
-
-        void run_context_thread() {
-            std::lock_guard guard(mutex_io);
-            net.context.run();
-            if (!is_closing.load())
-                close();
-        }
-
-        void resolve(const asio::error_code &error, const tcp::resolver::results_type &results,
-                     const http_request_t &req,
-                     const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                response_cb(error, http_response_t());
-                return;
-            }
-
-            net.endpoint = results.begin()->endpoint();
-            asio::async_connect(net.ssl_socket.lowest_layer(),
-                                results,
-                                [&, req, response_cb](const asio::error_code &ec, const tcp::endpoint &ep) {
-                                    conn(ec, req, response_cb);
-                                });
-        }
-
-        void conn(const asio::error_code &error,
-                  const http_request_t &req,
-                  const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                response_cb(error, http_response_t());
-                return;
-            }
-
-            net.ssl_socket.async_handshake(asio::ssl::stream_base::client,
-                                           [&, req, response_cb](const asio::error_code &ec) {
-                                               ssl_handshake(ec, req, response_cb);
-                                           });
-        }
-
-        void ssl_handshake(const asio::error_code &error,
-                           const http_request_t &req,
-                           const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                response_cb(error, http_response_t());
-                return;
-            }
-
-            std::string payload = prepare_request(req, net.ssl_socket.next_layer().remote_endpoint().address().to_string(),
-                                                  net.ssl_socket.next_layer().remote_endpoint().port());
-            if (idle_timeout_seconds > 0)
-                start_idle_timer();
-            asio::async_write(net.ssl_socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, response_cb](const asio::error_code &ec, const size_t bytes_sent) {
-                                  write_cb(ec, bytes_sent, response_cb);
-                              });
-        }
-
-        void write_cb(const asio::error_code &error, const size_t bytes_sent,
-                      const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                response_cb(error, http_response_t());
-                return;
-            }
-
-            consume_recv_buffer();
-            if (idle_timeout_seconds > 0)
-                reset_idle_timer();
-            asio::async_read_until(net.ssl_socket,
-                             recv_buffer, "\r\n",
-                             [&, response_cb](const asio::error_code &ec, const size_t bytes_received) {
-                                 read_cb(ec, bytes_received, response_cb);
-                             });
-        }
-
-        void consume_recv_buffer() {
-            const size_t size = recv_buffer.size();
-            if (size > 0)
-                recv_buffer.consume(size);
-        }
-
-        void read_cb(const asio::error_code &error, const size_t bytes_recvd,
-                     const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                consume_recv_buffer();
-                response_cb(error, http_response_t());
-                return;
-            }
-            if (idle_timeout_seconds > 0)
-                reset_idle_timer();
-
-            http_response_t response;
-            std::istream response_stream(&recv_buffer);
-            std::string http_version;
-            unsigned int status_code;
-            std::string status_message;
-            response_stream >> http_version;
-            response_stream >> status_code;
-            std::getline(response_stream, status_message);
-            if (!response_stream || http_version.substr(0, 5) != "HTTP/") {
-                consume_recv_buffer();
-                response.status_code = 505;
-                response.status_message = "HTTP Version Not Supported";
-                response_cb(error, response);
-                return;
-            }
-            response.status_code = status_code;
-            response.status_message = status_message;
-            if (status_code != 200 && recv_buffer.size() == 0) {
-                consume_recv_buffer();
-                response_cb(error, response);
-                return;
-            }
-
-            asio::async_read_until(net.ssl_socket,
-                                   recv_buffer, "\r\n\r\n",
-                                   std::bind(&http_client_ssl_c::read_headers,
-                                             this, asio::placeholders::error,
-                                             response,
-                                             response_cb));
-        }
-
-        void read_headers(const asio::error_code &error, http_response_t &response,
-                          const std::function<void(const asio::error_code &, const http_response_t &)> &response_cb) {
-            if (error) {
-                consume_recv_buffer();
-                response_cb(error, response);
-                return;
-            }
-            std::istream response_stream(&recv_buffer);
-            std::string header;
-
-            while (std::getline(response_stream, header) && header != "\r")
-                res_append_header(response, header);
-
-            if (recv_buffer.size() > 0) {
-                std::ostringstream body_buffer;
-                body_buffer << &recv_buffer;
-                response.body = body_buffer.str();
-            }
-
-            consume_recv_buffer();
-            response_cb(error, response);
+        static std::shared_ptr<detail::http_client_state<ssl_stream>> make_state(const security_context_opts &o) {
+            auto st = std::make_shared<detail::http_client_state<ssl_stream>>();
+            std::error_code ec;
+            auto ctx = make_client_ssl_context(o, ec);
+            st->link->set_tls(std::move(ctx), o, ec);
+            return st;
         }
     };
 #endif

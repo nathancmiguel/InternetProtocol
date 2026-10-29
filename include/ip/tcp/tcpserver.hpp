@@ -1,649 +1,88 @@
-/** 
+/**
  * MIT License (MIT)
  * Copyright © 2025 Nathan Miguel
-*/
+ */
 
 #pragma once
 
-#include "ip/net/common.hpp"
 #include "ip/tcp/tcpremote.hpp"
+#include "ip/transport/stream_server.hpp"
+#include "ip/utils/tls.hpp"
 
 namespace internetprotocol {
-    class tcp_server_c {
+    /**
+     * TCP server (plain or TLS). Every accepted client is a basic_tcp_remote handed to
+     * `on_client_accepted`, where its callbacks must be configured before reading starts.
+     */
+    template<typename Stream>
+    class basic_tcp_server {
     public:
-        tcp_server_c() {}
+        using remote_t = basic_tcp_remote<Stream>;
+        using core_t = stream_server<Stream, remote_t>;
 
-        ~tcp_server_c() {
-            if (net.acceptor.is_open()) {
-                close();
-            }
-        }
+    protected:
+        // Declared before the public references below: initialisation order matters.
+        std::shared_ptr<core_t> core_;
 
-        /**
-         * Set/Get the maximum number of simultaneous client connections the server will accept in queue.
-         *
-         * This method configures the maximum number of concurrent client connections
-         * that the server will maintain in queue. When this limit is reached, any new connection
-         * attempts will be rejected automatically. The default value is INT_MAX (2147483647).
-         *
-         * @param max_connections The maximum number of concurrent connections to allow.
-         *                        Must be a positive integer.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * // Limit the server to handle at most 100 concurrent clients
-         * server.backlog = 100;
-         * server.open({"", 8080});
-         * @endcode
-         */
-        int backlog = 2147483647;
+    public:
+        basic_tcp_server() : basic_tcp_server(make_plain_core()) {}
 
-        /**
-         * Return true if socket is open.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * bool is_open = server.is_open();
-         * @endcode
-         */
-        bool is_open() const { return net.acceptor.is_open(); }
+        basic_tcp_server(const basic_tcp_server &) = delete;
 
-        /**
-         * Get the local endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * asio::ip::tcp::endpoint ep = server.local_endpoint();
-         * @endcode
-         */
-        tcp::endpoint local_endpoint() const { return net.acceptor.local_endpoint(); }
+        basic_tcp_server &operator=(const basic_tcp_server &) = delete;
 
-        /**
-         * Gets a constant reference to the set of clients connected to the server.
-         *
-         * This method returns a std::set containing shared pointers to all tcp_remote_c
-         * clients currently connected to the server. Useful for monitoring active
-         * connections or performing operations on all connected clients.
-         *
-         * @return A constant reference to the std::set of connected clients.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * server.open();
-         *
-         * // Check the number of connected clients
-         * size_t num_clients = server.clients().size();
-         *
-         * // Iterate over all connected clients
-         * for(const auto& client : server.clients()) {
-         *     // Perform some operation with each client
-         *     client->write("Message to everyone");
-         * }
-         * @endcode
-         */
-        const std::set<std::shared_ptr<tcp_remote_c>> &clients() const { return net.clients; }
+        ~basic_tcp_server() { core_->shutdown(); }
 
-        /**
-         * Return a const ref of the latest error code returned by asio.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * asio::error_code ec = server.get_error_code();
-         * @endcode
-         */
-        const asio::error_code &get_error_code() const { return error_code; }
+        bool is_open() const { return core_->is_open(); }
 
-        /**
-         * Opens the TCP server and starts listening for incoming connections.
-         *
-         * This method initializes the server socket, binds it to the specified address and port,
-         * and begins listening for client connections. If the server is already open, the method
-         * returns false without making any changes.
-         *
-         * If any operation fails, the error handler (on_error) will be called if set,
-         * and the method will return false.
-         *
-         * @param bind_opts An struct specifying protocol parameters to be used.
-         * If 'port' is not specified or is 0, the operating system will attempt to bind to a random port.
-         * If 'address' is not specified, the operating system will attempt to listen on all addresses.
-         *
-         * @return true if the server was successfully opened and is now listening;
-         *         false if the server is already open or if any error occurred during setup.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * server.open({"", 8080, v4, true})
-         * @endcode
-         */
-        bool open(const server_bind_options_t &bind_opts = { "", 8080, v4, true }) {
-            if (net.acceptor.is_open())
-                return false;
+        tcp::endpoint local_endpoint() const { return core_->local_endpoint(); }
 
-            net.acceptor.open(bind_opts.protocol == v4
-                                  ? tcp::v4()
-                                  : tcp::v6(),
-                                  error_code);
+        /// Snapshot of the connected clients (safe to iterate while clients connect/disconnect).
+        std::vector<std::shared_ptr<remote_t>> clients() const { return core_->clients(); }
 
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
+        asio::error_code get_error_code() const { return core_->get_error_code(); }
 
-            net.acceptor.set_option(asio::socket_base::reuse_address(bind_opts.reuse_address), error_code);
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
+        server_options_t &options() { return core_->options(); }
 
-            const tcp::endpoint endpoint = bind_opts.address.empty() ?
-                                        tcp::endpoint(bind_opts.protocol == v4
-                                                        ? tcp::v4()
-                                                        : tcp::v6(),
-                                                        bind_opts.port) :
-                                        tcp::endpoint(make_address(bind_opts.address), bind_opts.port);
+        /// Starts listening. Returns false (and fires on_error) if the socket cannot be bound.
+        bool open(const server_bind_options_t &bind_opts = {"", 8080, v4, true}) { return core_->open(bind_opts); }
 
-            net.acceptor.bind(endpoint, error_code);
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
+        /// Stops listening and closes all clients.
+        void close() { core_->close(); }
 
-            net.acceptor.listen(backlog, error_code);
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
+        int &backlog;
+        event<void()> &on_listening;
+        event<void(const std::shared_ptr<remote_t> &)> &on_client_accepted;
+        event<void()> &on_close;
+        event<void(const asio::error_code &)> &on_error;
 
-            if (on_listening)
-                on_listening();
+    protected:
+        explicit basic_tcp_server(std::shared_ptr<core_t> core)
+            : core_(std::move(core)), backlog(core_->backlog), on_listening(core_->on_listening),
+              on_client_accepted(core_->on_client_accepted), on_close(core_->on_close), on_error(core_->on_error) {}
 
-            asio::post(thread_pool, [&]{ run_context_thread(); });
-            return true;
-        }
-
-        /**
-         * Close the underlying socket and stop listening for data on it. 'on_close' event will be triggered.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * server.close(false);
-         * @endcode
-         */
-        void close() {
-            is_closing.store(true);
-            if (net.acceptor.is_open()) {
-                std::lock_guard guard(mutex_error);
-                net.acceptor.close(error_code);
-                if (on_error) on_error(error_code);
-            }
-            if (!net.clients.empty()) {
-                std::lock_guard guard(mutex_error);
-                for (const auto &client : net.clients) {
-                    if (client)
-                        client->close();
-                }
-                net.clients.clear();
-            }
-            net.context.stop();
-            net.context.restart();
-            net.acceptor = tcp::acceptor(net.context);
-            if (on_close)
-                on_close();
-            is_closing.store(false);
-        }
-
-        /**
-         * Adds the listener function to 'on_listening'.
-         * This event will be triggered when socket start to listening.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * server.on_listening = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_listening;
-
-        /**
-         * Adds the listener function to 'on_client_accepted'.
-         * This event will be triggered when new client connect.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * server.on_client_accepted = [&](const std::shared_ptr<tcp_remote_c> &remote) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const std::shared_ptr<tcp_remote_c> &)> on_client_accepted;
-
-        /**
-         * Adds the listener function to 'on_close'.
-         * This event will be triggered after acceptor socket has been closed and all client has been disconnected.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * server.on_close = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_close;
-
-        /**
-         * Adds the listener function to 'on_error'.
-         * This event will be triggered when any error has been returned by asio.
-         *
-         * @par Example
-         * @code
-         * tcp_server_c server;
-         * server.on_error = [&](const asio::error_code &ec) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const asio::error_code &)> on_error;
-
-    private:
-        std::mutex mutex_io;
-        std::mutex mutex_error;
-        std::atomic<bool> is_closing = false;
-        tcp_server_t<tcp_remote_c> net;
-        asio::error_code error_code;
-
-        void run_context_thread() {
-            std::lock_guard guard(mutex_io);
-            error_code.clear();
-            std::shared_ptr<tcp_remote_c> client_socket = std::make_shared<tcp_remote_c>(net.context);
-            net.acceptor.async_accept(client_socket->get_socket(),
-                                        [&, client_socket](const asio::error_code &ec) {
-                                            accept(ec, client_socket);
-                                        });
-            net.context.run();
-            if (!is_closing.load())
-                close();
-        }
-
-        void accept(const asio::error_code &error, const std::shared_ptr<tcp_remote_c> &client) {
-            if (error) {
-                std::lock_guard guard(mutex_error);
-                error_code = error;
-                client->close();
-                if (net.acceptor.is_open()) {
-                    std::shared_ptr<tcp_remote_c> client_socket = std::make_shared<tcp_remote_c>(net.context);
-                    net.acceptor.async_accept(client_socket->get_socket(),
-                                                [&, client_socket](const asio::error_code &ec) {
-                                                    accept(ec, client_socket);
-                                                });
-                }
-                return;
-            }
-            net.clients.insert(client);
-            client->on_close = [&, client]() { net.clients.erase(client); };
-            if (on_client_accepted)
-                on_client_accepted(client);
-            client->connect();
-            if (net.acceptor.is_open()) {
-                std::shared_ptr<tcp_remote_c> client_socket = std::make_shared<tcp_remote_c>(net.context);
-                net.acceptor.async_accept(client_socket->get_socket(),
-                                        [&, client_socket](const asio::error_code &ec) {
-                                            accept(ec, client_socket);
-                                        });
-            }
+        static std::shared_ptr<core_t> make_plain_core() {
+            return std::make_shared<core_t>([](std::shared_ptr<connection<Stream>> c) {
+                return std::make_shared<remote_t>(std::move(c));
+            });
         }
     };
-#ifdef ENABLE_SSL
-    class tcp_server_ssl_c {
+
+    using tcp_server_c = basic_tcp_server<plain_stream>;
+
+#ifdef IP_ENABLE_SSL
+    class tcp_server_ssl_c : public basic_tcp_server<ssl_stream> {
     public:
-        tcp_server_ssl_c(const security_context_opts sec_opts = {}) {
-            if (!sec_opts.private_key.empty()) {
-                const asio::const_buffer buffer(sec_opts.private_key.data(), sec_opts.private_key.size());
-                net.ssl_context.use_private_key(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.cert.empty()) {
-                const asio::const_buffer buffer(sec_opts.cert.data(), sec_opts.cert.size());
-                net.ssl_context.use_certificate(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.cert_chain.empty()) {
-                const asio::const_buffer buffer(sec_opts.cert_chain.data(), sec_opts.cert_chain.size());
-                net.ssl_context.use_certificate_chain(buffer);
-            }
-
-            if (!sec_opts.rsa_private_key.empty()) {
-                const asio::const_buffer buffer(sec_opts.rsa_private_key.data(), sec_opts.rsa_private_key.size());
-                net.ssl_context.use_rsa_private_key(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.host_name_verification.empty()) {
-                net.ssl_context.set_verify_callback(asio::ssl::host_name_verification(sec_opts.host_name_verification));
-            }
-
-            switch (sec_opts.verify_mode) {
-                case none:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_none);
-                    break;
-                case verify_peer:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_peer);
-                    break;
-                case verify_fail_if_no_peer_cert:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_fail_if_no_peer_cert);
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        ~tcp_server_ssl_c() {
-            if (net.acceptor.is_open())
-                close();
-        }
-
-        /**
-         * Set/Get the maximum number of simultaneous client connections the server will accept in queue.
-         *
-         * This method configures the maximum number of concurrent client connections
-         * that the server will maintain in queue. When this limit is reached, any new connection
-         * attempts will be rejected automatically. The default value is INT_MAX (2147483647).
-         *
-         * @param max_connections The maximum number of concurrent connections to allow.
-         *                        Must be a positive integer.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * // Limit the server to handle at most 100 concurrent clients
-         * server.backlog = 100;
-         * server.open({"", 8080});
-         * @endcode
-         */
-        int backlog = 2147483647;
-
-        /**
-         * Return true if socket is open.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * bool is_open = server.is_open();
-         * @endcode
-         */
-        bool is_open() const { return net.acceptor.is_open(); }
-
-        /**
-         * Get the local endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * asio::ip::tcp::endpoint ep = server.local_endpoint();
-         * @endcode
-         */
-        tcp::endpoint local_endpoint() const { return net.acceptor.local_endpoint(); }
-
-        /**
-         * Gets a constant reference to the set of clients connected to the server.
-         *
-         * This method returns a std::set containing shared pointers to all tcp_remote_c
-         * clients currently connected to the server. Useful for monitoring active
-         * connections or performing operations on all connected clients.
-         *
-         * @return A constant reference to the std::set of connected clients.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * server.open();
-         *
-         * // Check the number of connected clients
-         * size_t num_clients = server.clients().size();
-         *
-         * // Iterate over all connected clients
-         * for(const auto& client : server.clients()) {
-         *     // Perform some operation with each client
-         *     client->write("Message to everyone");
-         * }
-         * @endcode
-         */
-        const std::set<std::shared_ptr<tcp_remote_ssl_c>> &clients() const { return net.ssl_clients; }
-
-        /**
-         * Return a const ref of the latest error code returned by asio.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * asio::error_code ec = server.get_error_code();
-         * @endcode
-         */
-        const asio::error_code &get_error_code() const { return error_code; }
-
-        /**
-         * Opens the TCP server and starts listening for incoming connections.
-         *
-         * This method initializes the server socket, binds it to the specified address and port,
-         * and begins listening for client connections. If the server is already open, the method
-         * returns false without making any changes.
-         *
-         * If any operation fails, the error handler (on_error) will be called if set,
-         * and the method will return false.
-         *
-         * @param bind_opts An struct specifying protocol parameters to be used.
-         * If 'port' is not specified or is 0, the operating system will attempt to bind to a random port.
-         * If 'address' is not specified, the operating system will attempt to listen on all addresses.
-         *
-         * @return true if the server was successfully opened and is now listening;
-         *         false if the server is already open or if any error occurred during setup.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         *
-         * server.open({"", 8080, v4, true})
-         * @endcode
-         */
-        bool open(const server_bind_options_t &bind_opts = { "", 8080, v4, true }) {
-            if (net.acceptor.is_open())
-                return false;
-
-            net.acceptor.open(bind_opts.protocol == v4
-                                  ? tcp::v4()
-                                  : tcp::v6(),
-                                  error_code);
-
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
-
-            net.acceptor.set_option(asio::socket_base::reuse_address(bind_opts.reuse_address), error_code);
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
-
-            const tcp::endpoint endpoint = bind_opts.address.empty() ?
-                                        tcp::endpoint(bind_opts.protocol == v4
-                                                        ? tcp::v4()
-                                                        : tcp::v6(),
-                                                        bind_opts.port) :
-                                        tcp::endpoint(make_address(bind_opts.address), bind_opts.port);
-
-            net.acceptor.bind(endpoint, error_code);
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
-
-            net.acceptor.listen(backlog, error_code);
-            if (error_code && on_error) {
-                std::lock_guard guard(mutex_error);
-                on_error(error_code);
-                return false;
-            }
-
-            if (on_listening)
-                on_listening();
-            
-            asio::post(thread_pool, [&]{ run_context_thread(); });
-            return true;
-        }
-
-        /**
-         * Close the underlying socket and stop listening for data on it. 'on_close' event will be triggered.
-         *
-         * @param force Cancel all asynchronous operations associated with the client sockets if true.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * server.close(false);
-         * @endcode
-         */
-        void close() {
-            is_closing.store(true);
-            if (net.acceptor.is_open()) {
-                std::lock_guard guard(mutex_error);
-                net.acceptor.close(error_code);
-                if (on_error) on_error(error_code);
-            }
-            if (!net.ssl_clients.empty()) {
-                std::lock_guard guard(mutex_error);
-                for (const auto &client : net.ssl_clients) {
-                    if (client)
-                        client->close();
-                }
-                net.ssl_clients.clear();
-            }
-            net.context.stop();
-            net.context.restart();
-            net.acceptor = tcp::acceptor(net.context);
-            if (on_close)
-                on_close();
-            is_closing.store(false);
-        }
-
-        /**
-         * Adds the listener function to 'on_listening'.
-         * This event will be triggered when socket start to listening.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * server.on_listening = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_listening;
-
-        /**
-         * Adds the listener function to 'on_client_accepted'.
-         * This event will be triggered when new client connect.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * server.on_client_accepted = [&](const std::shared_ptr<tcp_remote_ssl_c> &remote) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const std::shared_ptr<tcp_remote_ssl_c> &)> on_client_accepted;
-
-        /**
-         * Adds the listener function to 'on_close'.
-         * This event will be triggered after acceptor socket has been closed and all client has been disconnected.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * server.on_close = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_close;
-
-        /**
-         * Adds the listener function to 'on_error'.
-         * This event will be triggered when any error has been returned by asio.
-         *
-         * @par Example
-         * @code
-         * tcp_server_ssl_c server({});
-         * server.on_error = [&](const asio::error_code &ec) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const asio::error_code &)> on_error;
+        explicit tcp_server_ssl_c(const security_context_opts &sec_opts = {})
+            : basic_tcp_server<ssl_stream>(make_core(sec_opts)) {}
 
     private:
-        std::mutex mutex_io;
-        std::mutex mutex_error;
-        std::atomic<bool> is_closing = false;
-        tcp_server_ssl_t<tcp_remote_ssl_c> net;
-        asio::error_code error_code;
-
-        void run_context_thread() {
-            std::lock_guard guard(mutex_io);
-            error_code.clear();
-            std::shared_ptr<tcp_remote_ssl_c> client_socket = std::make_shared<tcp_remote_ssl_c>(net.context, net.ssl_context);
-            net.acceptor.async_accept(client_socket->get_socket().lowest_layer(),
-                                        [&, client_socket](const asio::error_code &ec) {
-                                            accept(ec, client_socket);
-                                        });
-            net.context.run();
-            if (!is_closing.load())
-                close();
-        }
-
-        void accept(const asio::error_code &error, const std::shared_ptr<tcp_remote_ssl_c> &client) {
-            if (error) {
-                std::lock_guard guard(mutex_error);
-                error_code = error;
-                client->close();
-                if (net.acceptor.is_open()) {
-                    std::shared_ptr<tcp_remote_ssl_c> client_socket = std::make_shared<tcp_remote_ssl_c>(net.context, net.ssl_context);
-                    net.acceptor.async_accept(client_socket->get_socket().lowest_layer(),
-                                                [&, client_socket](const asio::error_code &ec) {
-                                                    accept(ec, client_socket);
-                                                });
-                }
-                return;
-            }
-            net.ssl_clients.insert(client);
-            client->on_close = [&, client]() { net.ssl_clients.erase(client); };
-            if (on_client_accepted)
-                on_client_accepted(client);
-            client->connect();
-            if (net.acceptor.is_open()) {
-                std::shared_ptr<tcp_remote_ssl_c> client_socket = std::make_shared<tcp_remote_ssl_c>(net.context, net.ssl_context);
-                net.acceptor.async_accept(client_socket->get_socket().lowest_layer(),
-                                            [&, client_socket](const asio::error_code &ec) {
-                                                accept(ec, client_socket);
-                                            });
-            }
+        static std::shared_ptr<core_t> make_core(const security_context_opts &o) {
+            auto core = make_plain_core();
+            std::error_code ec;
+            auto ctx = make_server_ssl_context(o, ec);
+            core->set_tls(std::move(ctx), ec);
+            return core;
         }
     };
 #endif

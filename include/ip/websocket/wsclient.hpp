@@ -1,1460 +1,295 @@
-/** 
+/**
  * MIT License (MIT)
  * Copyright © 2025 Nathan Miguel
-*/
+ */
 
 #pragma once
 
-#include "ip/net/common.hpp"
-#include "ip/utils/dataframe.hpp"
-#include "ip/utils/handshake.hpp"
-
-using namespace asio::ip;
+#include "ip/transport/stream_client.hpp"
+#include "ip/utils/httpparser.hpp"
+#include "ip/utils/tls.hpp"
+#include "ip/websocket/wsengine.hpp"
 
 namespace internetprotocol {
-    class ws_client_c {
+    namespace detail {
+        template<typename Stream>
+        class ws_client_state : public std::enable_shared_from_this<ws_client_state<Stream>> {
+        public:
+            using write_cb = std::function<void(const std::error_code &, std::size_t)>;
+
+            std::shared_ptr<stream_client<Stream>> link = std::make_shared<stream_client<Stream>>();
+            std::shared_ptr<ws_settings> settings = std::make_shared<ws_settings>();
+
+            event<void(const http_response_t &)> on_connected;
+            event<void(const http_response_t &)> on_unexpected_handshake;
+            event<void(const std::vector<uint8_t> &, bool)> on_message_received;
+            event<void()> on_ping;
+            event<void()> on_pong;
+            event<void(const uint16_t, const std::string &)> on_close;
+            event<void(const std::error_code &)> on_error;
+
+            ws_client_state() : resp_parser_(http_parser::kind::response) {}
+
+            void init() {
+                auto w = this->weak_from_this();
+                link->data_hook = [w](const uint8_t *p, std::size_t n) { if (auto s = w.lock()) s->on_data(p, n); };
+                link->on_connected = [w] { if (auto s = w.lock()) s->send_handshake(); };
+                link->on_close = [w] { if (auto s = w.lock()) s->on_link_closed(); };
+                link->on_error = [w](const std::error_code &ec) { if (auto s = w.lock()) s->on_error(ec); };
+            }
+
+            void set_handshake_request(const http_request_t &r) {
+                std::lock_guard l(m_);
+                hs_req_ = r;
+            }
+
+            std::shared_ptr<ws_engine> engine() const {
+                std::lock_guard l(m_);
+                return eng_;
+            }
+
+            bool connect(const client_bind_options_t &b) {
+                {
+                    std::lock_guard l(m_);
+                    bind_ = b;
+                }
+                return link->connect(b);
+            }
+
+            void shutdown() {
+                on_connected.reset();
+                on_unexpected_handshake.reset();
+                on_message_received.reset();
+                on_ping.reset();
+                on_pong.reset();
+                on_close.reset();
+                on_error.reset();
+                link->shutdown();
+            }
+
+        private:
+            mutable std::mutex m_;
+            client_bind_options_t bind_;
+            http_request_t hs_req_;
+            http_request_t sent_;
+            http_parser resp_parser_;
+            std::shared_ptr<ws_engine> eng_;
+            bool handshaking_ = false;
+
+            void send_handshake() {
+                http_request_t req;
+                client_bind_options_t b;
+                {
+                    std::lock_guard l(m_);
+                    req = hs_req_;
+                    b = bind_;
+                    resp_parser_.reset();
+                    eng_.reset();
+                    handshaking_ = true;
+                }
+                req.method = GET;
+                if (req.path.empty()) req.path = "/";
+                req.headers["Upgrade"] = "websocket";
+                req.headers["Connection"] = "Upgrade";
+                req.headers["Sec-WebSocket-Key"] = generate_websocket_key(); // fresh nonce per connection
+                req.headers["Sec-WebSocket-Version"] = "13";
+                uint16_t port = 0;
+                try { port = static_cast<uint16_t>(std::stoul(b.port)); } catch (...) {}
+                const std::string payload = prepare_request(req, b.address, port);
+                {
+                    std::lock_guard l(m_);
+                    sent_ = req;
+                }
+                if (!link->write(reinterpret_cast<const uint8_t *>(payload.data()), payload.size())) {
+                    on_error(make_error_code(errc::not_connected));
+                    link->disconnect(true);
+                }
+            }
+
+            void on_data(const uint8_t *p, std::size_t n) {
+                if (auto e = engine()) { e->on_data(p, n); return; }
+                std::error_code ec;
+                http_response_t res;
+                http_request_t sent;
+                std::size_t used;
+                {
+                    std::lock_guard l(m_);
+                    if (!handshaking_) return;
+                    used = resp_parser_.feed(p, n, ec);
+                    if (!ec && !resp_parser_.done()) return;
+                    if (!ec) res = std::move(resp_parser_.response());
+                    sent = sent_;
+                }
+                if (ec) {
+                    on_error(ec);
+                    link->disconnect(true);
+                    return;
+                }
+                if (!validate_handshake_response(sent, res)) {
+                    on_unexpected_handshake(res);
+                    on_error(make_error_code(errc::handshake_failed));
+                    link->disconnect(true);
+                    return;
+                }
+                auto ex = link->executor();
+                if (!ex) return;
+                ws_engine::hooks h;
+                auto lk = link;
+                h.send = [lk](std::vector<uint8_t> &&d, ws_engine::write_cb cb) { return lk->write(std::move(d), std::move(cb)); };
+                h.close_transport = [lk] { lk->disconnect(false); };
+                h.abort_transport = [lk] { lk->disconnect(true); };
+                auto w = this->weak_from_this();
+                h.on_message = [w](std::vector<uint8_t> &&m, bool bin) { if (auto s = w.lock()) s->on_message_received(m, bin); };
+                h.on_ping = [w] { if (auto s = w.lock()) s->on_ping(); };
+                h.on_pong = [w] { if (auto s = w.lock()) s->on_pong(); };
+                auto engine = std::make_shared<ws_engine>(*ex, true, std::move(h), settings);
+                {
+                    std::lock_guard l(m_);
+                    eng_ = engine;
+                    handshaking_ = false;
+                }
+                on_connected(res);
+                engine->start_heartbeat();
+                if (used < n) engine->on_data(p + used, n - used);
+            }
+
+            void on_link_closed() {
+                std::shared_ptr<ws_engine> e;
+                {
+                    std::lock_guard l(m_);
+                    e = std::move(eng_);
+                    handshaking_ = false;
+                }
+                if (!e) return; // never reached OPEN: the error was already reported
+                const auto st = e->on_transport_closed();
+                on_close(st.first, st.second);
+            }
+        };
+    }
+
+    /**
+     * WebSocket client (plain or TLS). Callbacks run on a worker thread, serialised per connection.
+     *
+     * @code
+     * ws_client_c ws;
+     * ws.on_connected = [&](const http_response_t &) { ws.write("hello"); };
+     * ws.on_message_received = [](const std::vector<uint8_t> &data, bool binary) { ... };
+     * ws.connect({"localhost", "8080", v4});
+     * @endcode
+     */
+    template<typename Stream>
+    class basic_ws_client {
+    protected:
+        // Declared first: the public event references below are bound to state_ (initialisation order).
+        std::shared_ptr<detail::ws_client_state<Stream>> state_;
+
     public:
-        ws_client_c() {
-            idle_timer = std::make_unique<asio::steady_timer>(net.context, 5);
-            handshake.path = "/chat";
-            handshake.headers.insert_or_assign("Connection", "Upgrade");
-            handshake.headers.insert_or_assign("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
-            handshake.headers.insert_or_assign("Sec-WebSocket-Version", "13");
-            handshake.headers.insert_or_assign("Upgrade", "websocket");
+        using write_callback = std::function<void(const asio::error_code &, const size_t)>;
+
+        basic_ws_client() : basic_ws_client(std::make_shared<detail::ws_client_state<Stream>>()) {}
+
+        basic_ws_client(const basic_ws_client &) = delete;
+
+        basic_ws_client &operator=(const basic_ws_client &) = delete;
+
+        ~basic_ws_client() { state_->shutdown(); }
+
+        bool is_open() const {
+            auto e = state_->engine();
+            return e && e->is_open();
         }
 
-        ~ws_client_c() {
-            if (net.socket.is_open())
-                close(1000, "Normal closure");
+        close_state_e get_state() const {
+            auto e = state_->engine();
+            return e ? e->state() : CLOSED;
         }
 
-        /**
-         * Set/Get handshake headers.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * std::map<std::string, std::string> &headers = client.handshake;
-         * @endcode
-         */
-        http_request_t handshake;
+        asio::error_code get_error_code() const { return state_->link->get_error_code(); }
 
-        /**
-         * Return true if socket is open.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * bool is_open = client.is_open();
-         * @endcode
-         */
-        bool is_open() const { return net.socket.is_open() && close_state.load() == OPEN; }
+        tcp::endpoint local_endpoint() const { return state_->link->local_endpoint(); }
 
-        /**
-         * Get the local endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * asio::ip::tcp::endpoint ep = client.local_endpoint();;
-         * @endcode
-         */
-        tcp::endpoint local_endpoint() const { return net.socket.local_endpoint(); }
+        tcp::endpoint remote_endpoint() const { return state_->link->remote_endpoint(); }
 
-        /**
-         * Get the remote endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * asio::ip::tcp::endpoint ep = client.remote_endpoint();
-         * @endcode
-         */
-        tcp::endpoint remote_endpoint() const { return net.socket.remote_endpoint(); }
+        /// Connect timeout, reconnection policy, idle timeout, buffer sizes. Configure before connect().
+        client_options_t &options() { return state_->link->options(); }
 
-        /**
-         * Return a const ref of the latest error code returned by asio.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * asio::error_code ec = client.get_error_code();
-         * @endcode
-         */
-        const asio::error_code &get_error_code() const { return error_code; }
+        /// Request path / extra headers (e.g. Authorization, Origin, Sec-WebSocket-Protocol) for the upgrade.
+        void set_handshake_request(const http_request_t &req) { state_->set_handshake_request(req); }
 
-        /**
-         * Sends string data on the socket.
-         * It returns false if socket is closed or if buffer is empty.
-         *
-         * @param message String to be send.
-         *
-         * @param dataframe Custom dataframe if needed.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * client.connect("localhost", 8080, v4);
-         *
-         * std::string message = "...";
-         * client.write(message);
-         * @endcode
-         */
-        bool write(const std::string &message, const dataframe_t &dataframe = {},
-                   const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open() || message.empty()) return false;
+        void set_max_message_size(std::size_t bytes) { state_->settings->max_message_bytes.store(bytes); }
 
-            dataframe_t frame = dataframe;
-            frame.opcode = TEXT_FRAME;
-            frame.mask = true;
-            std::string payload = encode_string_payload(message, frame);
-            asio::async_write(net.socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, callback](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
+        /// Automatic keep-alive ping every `seconds` (0 = off). A silent peer is dropped after one more interval.
+        void set_ping_interval(uint16_t seconds) { state_->settings->ping_interval_seconds.store(seconds); }
+
+        bool write(const std::string &message, const dataframe_t &dataframe = {}, const write_callback &callback = nullptr) {
+            auto e = state_->engine();
+            return e && e->send_message(reinterpret_cast<const uint8_t *>(message.data()), message.size(), false, dataframe, callback);
         }
 
-        /**
-         * Sends buffer data on the socket.
-         * It returns false if socket is closed or if buffer is empty.
-         *
-         * @param buffer String to be send.
-         *
-         * @param dataframe Custom dataframe if needed.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * client.connect("localhost", 8080, v4);
-         *
-         * std::vector<uint8_t> buffer = { 0, 1, 2, ... };
-         * client.write_buffer(buffer);
-         * @endcode
-         */
-        bool write_buffer(const std::vector<uint8_t> &buffer, const dataframe_t &dataframe = {},
-                          const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open() || buffer.empty()) return false;
-
-            dataframe_t frame = dataframe;
-            frame.opcode = BINARY_FRAME;
-            frame.mask = true;
-            std::vector<uint8_t> payload = encode_buffer_payload(buffer, frame);
-            asio::async_write(net.socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, callback](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
+        bool write_buffer(const std::vector<uint8_t> &buffer, const dataframe_t &dataframe = {}, const write_callback &callback = nullptr) {
+            auto e = state_->engine();
+            return e && e->send_message(buffer.data(), buffer.size(), true, dataframe, callback);
         }
 
-        /**
-         * Send a ping message.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * client.ping();
-         * @endcode
-         */
-        bool ping(const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open()) return false;
-
-            dataframe_t dataframe;
-            dataframe.opcode = PING;
-            std::vector<uint8_t> payload = encode_buffer_payload({}, dataframe);
-            asio::async_write(net.socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, callback](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
+        bool ping(const write_callback &callback = nullptr) {
+            auto e = state_->engine();
+            return e && e->send_control(PING, {}, callback);
         }
 
-        /**
-         * Send a pong message. This is already performed automatically.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * client.pong();
-         * @endcode
-         */
-        bool pong(const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open()) return false;
-
-            dataframe_t dataframe;
-            dataframe.opcode = PONG;
-            std::vector<uint8_t> payload = encode_buffer_payload({}, dataframe);
-            asio::async_write(net.socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
+        bool pong(const write_callback &callback = nullptr) {
+            auto e = state_->engine();
+            return e && e->send_control(PONG, {}, callback);
         }
 
-        /**
-         * Initiate a connection on a given socket.
-         * It returns false if socket is already open or if asio return any error code during the listening.
-         *
-         * @param address A string identifying a location. May be a descriptive name or a numeric address string. If an empty string and the passive flag has been specified, the resolved endpoints are suitable for local service binding.
-         * @param port This may be a descriptive name or a numeric string corresponding to a port number. May be an empty string, in which case all resolved endpoints will have a port number of 0.
-         * @param protocol A protocol object, normally representing either the IPv4 or IPv6 version of an internet protocol.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * client.connect("localhost", 8080, v4, true);
-         * @endcode
-         */
-        bool connect(const client_bind_options_t &bind_opts = {}) {
-            if (net.socket.is_open())
-                return false;
+        bool connect(const client_bind_options_t &bind_opts = {}) { return state_->connect(bind_opts); }
 
-            close_state.store(OPEN);
-            net.resolver.async_resolve(bind_opts.protocol == v4 ? tcp::v4() : tcp::v6(),
-                                       bind_opts.address, bind_opts.port,
-                                       [&](const asio::error_code &ec, const tcp::resolver::results_type &results) {
-                                           resolve(ec, results);
-                                       });
-
-            asio::post(thread_pool, [&] { run_context_thread(); });
-            return true;
-        }
-
-        /**
-         * Perform a smooth close of socket following ws protocol and stop listening for data on it. 'on_close' event will be triggered.
-         *
-         * @param code Closing code.
-         *
-         * @param reason Reason.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * client.end();
-         * @endcode
-         */
+        /// Closing handshake: sends CLOSE and waits (bounded) for the server's CLOSE. Cancels reconnection.
         void end(const uint16_t code = 1000, const std::string &reason = "") {
-            if (close_state.load() == CLOSED) return;
-
-            if (close_state.load() == OPEN) {
-                // Client send close frame
-                close_state.store(CLOSING);
-                send_close_frame(code, reason);
-            } else {
-                // End connection
-                close(code, reason);
-            }
+            state_->link->cancel_reconnect();
+            if (auto e = state_->engine()) e->close(code, reason, true);
+            else state_->link->close();
         }
 
-        /**
-         * Close the underlying socket and stop listening for data on it. 'on_close' event will be triggered.
-         *
-         * @param code Closing code.
-         *
-         * @param reason Reason.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client;
-         * client.close();
-         * @endcode
-         */
+        /// Sends CLOSE, flushes and closes TCP without waiting. Cancels reconnection.
         void close(const uint16_t code = 1000, const std::string &reason = "") {
-            if (close_state.load() == CLOSED) return;
-
-            close_state.store(CLOSED);
-            wait_close_frame_response.store(true);
-
-            if (net.socket.is_open()) {
-                bool is_locked = mutex_error.try_lock();
-
-                net.socket.shutdown(tcp::socket::shutdown_both, error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-                net.socket.close(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-
-                if (is_locked)
-                    mutex_error.unlock();
-            }
-            net.context.stop();
-            net.context.restart();
-            net.endpoint = tcp::endpoint();
-
-            if (on_close) {
-                on_close(code, reason);
-            }
+            state_->link->cancel_reconnect();
+            if (auto e = state_->engine()) e->close(code, reason, false);
+            else state_->link->close();
         }
 
-        /**
-         * Adds the listener function to 'on_connected'.
-         * This event will be triggered when socket start to listening.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client();
-         * client.on_connected = [&](const http_response_t &server_handshake) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const http_response_t &)> on_connected;
+        event<void(const http_response_t &)> &on_connected;
+        event<void(const http_response_t &)> &on_unexpected_handshake;
+        event<void(const std::vector<uint8_t> &, bool)> &on_message_received;
+        event<void()> &on_ping;
+        event<void()> &on_pong;
+        event<void(const uint16_t, const std::string &)> &on_close;
+        event<void(const asio::error_code &)> &on_error;
 
-        /**
-         * Adds the listener function to 'on_unexpected_handshake'.
-         * This event will be triggered when a bad handshake has been received from server.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client();
-         * client.on_unexpected_handshake = [&](const http_response_t &server_handshake) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const http_response_t &)> on_unexpected_handshake;
-
-        /**
-         * Adds the listener function to 'on_message_received'.
-         * This event will be triggered when a message has been received.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client();
-         * client.on_message_received = [&](const std::vector<uint8_t> &buffer, bool is_binary) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const std::vector<uint8_t> &, bool)> on_message_received;
-
-        /**
-         * Adds the listener function to 'on_ping'.
-         * This event will be triggered when a ping has been received.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client();
-         * client.on_ping = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_ping;
-
-        /**
-         * Adds the listener function to 'on_pong'.
-         * This event will be triggered when a pong has been received.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client();
-         * client.on_pong = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_pong;
-
-        /**
-         * Adds the listener function to 'on_close'.
-         * This event will be triggered when socket is closed.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client();
-         * client.on_close = [&](const uint16_t code, const std::string &reason) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const uint16_t, const std::string &)> on_close;
-
-        /**
-         * Adds the listener function to 'on_error'.
-         * This event will be triggered when any error has been returned by asio.
-         *
-         * @par Example
-         * @code
-         * ws_client_c client();
-         * client.on_error = [&](const asio::error_code &ec) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const asio::error_code &)> on_error;
-
-    private:
-        std::mutex mutex_io;
-        std::mutex mutex_error;
-        std::atomic<close_state_e> close_state = CLOSED;
-        std::atomic<bool> wait_close_frame_response = true;
-        std::unique_ptr<asio::steady_timer> idle_timer;
-        tcp_client_t net;
-        asio::error_code error_code;
-        asio::streambuf recv_buffer;
-
-        void start_idle_timer() {
-            idle_timer->expires_after(std::chrono::seconds(5));
-            idle_timer->async_wait([&](const asio::error_code &ec) {
-                if (ec == asio::error::operation_aborted)
-                    return;
-
-                if (close_state.load() == CLOSED)
-                    return;
-
-                close(1000, "Timeout");
-            });
-        }
-
-        // Send close frame
-        void send_close_frame(const uint16_t code, const std::string &reason, bool wait_server = false) {
-            if (!net.socket.is_open()) {
-                close(code, reason);
-                return;
-            }
-
-            dataframe_t dataframe;
-            dataframe.opcode = CLOSE_FRAME;
-
-            std::vector<uint8_t> close_payload;
-            close_payload.reserve(2 + reason.size());
-            // status code
-            close_payload.push_back(static_cast<uint8_t>(code >> 8));
-            close_payload.push_back(static_cast<uint8_t>(code & 0xFF));
-
-            // Reason
-            if (!reason.empty()) {
-                close_payload.insert(close_payload.end(), reason.begin(), reason.end());
-            }
-
-            if (close_payload.capacity() > close_payload.size())
-                close_payload.shrink_to_fit();
-
-            std::vector<uint8_t> encoded_payload = encode_buffer_payload(close_payload, dataframe);
-            asio::async_write(net.socket,
-                              asio::buffer(encoded_payload.data(), encoded_payload.size()),
-                              [this, code, reason](const asio::error_code &ec, const size_t bytes_sent) {
-                                  close_frame_sent_cb(ec, bytes_sent, code, reason);
-                              });
-        }
-
-        // Callback for close frame
-        void close_frame_sent_cb(const asio::error_code &error, const size_t bytes_sent,
-                                 const uint16_t code, const std::string &reason) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                close(code, reason);
-            }
-
-            if (!wait_close_frame_response.load()) {
-                end(code, reason);
-                return;
-            }
-            start_idle_timer();
-            asio::async_read(net.socket,
-                             recv_buffer,
-                             asio::transfer_at_least(1),
-                             [&](const asio::error_code &ec, const size_t bytes_recvd) {
-                                 read_cb(ec, bytes_recvd);
-                             });
-        }
-
-        void run_context_thread() {
-            std::lock_guard guard(mutex_io);
-            error_code.clear();
-            net.context.run();
-            if (close_state.load() == OPEN) {
-                close(1006, "Abnormal closure");
-            }
-            close_state.store(CLOSED);
-        }
-
-        void resolve(const asio::error_code &error, const tcp::resolver::results_type &results) {
-            if (error) {
-                std::lock_guard guard(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-            net.endpoint = results.begin()->endpoint();
-            asio::async_connect(net.socket,
-                                results,
-                                [&](const asio::error_code &ec, const tcp::endpoint &ep) {
-                                    conn(ec);
-                                });
-        }
-
-        void conn(const asio::error_code &error) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-
-            std::string request = prepare_request(handshake, net.socket.remote_endpoint().address().to_string(),
-                                                  net.socket.remote_endpoint().port());
-
-            asio::async_write(net.socket, asio::buffer(request.data(), request.size()),
-                              [&](const asio::error_code &ec, const size_t bytes_sent) {
-                                  write_handshake_cb(ec, bytes_sent);
-                              });
-        }
-
-        void write_handshake_cb(const asio::error_code &error, const size_t bytes_sent) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                close(1006, "Abnormal closure");
-                return;
-            }
-
-            asio::async_read_until(net.socket,
-                                   recv_buffer, "\r\n",
-                                   [&](const asio::error_code &ec, const size_t bytes_received) {
-                                       read_handshake_cb(ec, bytes_received);
-                                   });
-        }
-
-        void read_handshake_cb(const asio::error_code &error, const size_t bytes_recvd) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                consume_recv_buffer();
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-
-            http_response_t response;
-            std::istream response_stream(&recv_buffer);
-            std::string http_version;
-            unsigned int status_code;
-            std::string status_message;
-            response_stream >> http_version;
-            response_stream >> status_code;
-            std::getline(response_stream, status_message);
-            if (!response_stream || http_version.substr(0, 5) != "HTTP/") {
-                consume_recv_buffer();
-                response.status_code = 505;
-                response.status_message = "HTTP Version Not Supported";
-                if (on_unexpected_handshake) on_unexpected_handshake(response);
-                close(1002, "Protocol error");
-                return;
-            }
-            response.status_code = status_code;
-            response.status_message = status_message;
-            if (status_code != 101 && recv_buffer.size() == 0) {
-                consume_recv_buffer();
-                if (on_unexpected_handshake) on_unexpected_handshake(response);
-                close(1002, "Protocol error");
-                return;
-            }
-
-            asio::async_read_until(net.socket,
-                                   recv_buffer, "\r\n\r\n",
-                                   std::bind(&ws_client_c::read_headers, this, asio::placeholders::error, response));
-        }
-
-        void read_headers(const asio::error_code &error, http_response_t &response) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                consume_recv_buffer();
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-            std::istream response_stream(&recv_buffer);
-            std::string header;
-
-            while (std::getline(response_stream, header) && header != "\r")
-                res_append_header(response, header);
-
-            consume_recv_buffer();
-
-            if (!validate_handshake_response(handshake, response)) {
-                if (on_unexpected_handshake) on_unexpected_handshake(response);
-                close(1002, "Protocol error");
-                return;
-            }
-
-            if (on_connected) on_connected(response);
-
-            asio::async_read(net.socket,
-                             recv_buffer,
-                             asio::transfer_at_least(1),
-                             [&](const asio::error_code &ec, const size_t bytes_recvd) {
-                                 read_cb(ec, bytes_recvd);
-                             });
-        }
-
-        void consume_recv_buffer() {
-            const size_t size = recv_buffer.size();
-            if (size > 0)
-                recv_buffer.consume(size);
-        }
-
-        void read_cb(const asio::error_code &error, const size_t bytes_recvd) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                consume_recv_buffer();
-                if (on_error) on_error(error);
-                return;
-            }
-
-            std::vector<uint8_t> buffer;
-            buffer.resize(bytes_recvd);
-            asio::buffer_copy(asio::buffer(buffer, bytes_recvd),
-                              recv_buffer.data());
-
-            dataframe_t dataframe;
-            std::vector<uint8_t> payload{};
-            if (decode_payload(buffer, payload, dataframe)) {
-                if (dataframe.mask) {
-                    consume_recv_buffer();
-                    end(1002, "Protocol error - unexpected payload mask");
-                    return;
-                }
-                switch (dataframe.opcode) {
-                    case TEXT_FRAME:
-                        if (on_message_received) on_message_received(payload, false);
-                        break;
-                    case BINARY_FRAME:
-                        if (on_message_received) on_message_received(payload, true);
-                        break;
-                    case PING:
-                        if (on_ping) on_ping();
-                        pong();
-                        break;
-                    case PONG:
-                        if (on_pong) on_pong();
-                        break;
-                    case CLOSE_FRAME:
-                        uint16_t close_code = 1000;
-                        std::string close_reason = "Shutdown connection";
-                        if (payload.size() >= 2) {
-                            close_code = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-                            if (payload.size() > 2) {
-                                close_reason = std::string(payload.begin() + 2, payload.end());
-                            }
-                        }
-                        wait_close_frame_response.store(close_state.load() == CLOSING);
-                        end(close_code, close_reason);
-                        return;
-                }
-            } else {
-                consume_recv_buffer();
-                end(1002, "Protocol error - failed to decode payload");
-                return;
-            }
-
-            consume_recv_buffer();
-
-            if (close_state == OPEN) {
-                asio::async_read(net.socket,
-                                 recv_buffer,
-                                 asio::transfer_at_least(1),
-                                 [&](const asio::error_code &ec, const size_t bytes_received) {
-                                     read_cb(ec, bytes_received);
-                                 });
-            }
+    protected:
+        explicit basic_ws_client(std::shared_ptr<detail::ws_client_state<Stream>> st)
+            : state_(std::move(st)), on_connected(state_->on_connected),
+              on_unexpected_handshake(state_->on_unexpected_handshake),
+              on_message_received(state_->on_message_received), on_ping(state_->on_ping),
+              on_pong(state_->on_pong), on_close(state_->on_close), on_error(state_->on_error) {
+            state_->init();
         }
     };
 
-#ifdef ENABLE_SSL
-    class ws_client_ssl_c {
+    using ws_client_c = basic_ws_client<plain_stream>;
+
+#ifdef IP_ENABLE_SSL
+    class ws_client_ssl_c : public basic_ws_client<ssl_stream> {
     public:
-        ws_client_ssl_c(const security_context_opts sec_opts = {}) {
-            idle_timer = std::make_unique<asio::steady_timer>(net.context, 5);
-            if (!sec_opts.private_key.empty()) {
-                const asio::const_buffer buffer(sec_opts.private_key.data(), sec_opts.private_key.size());
-                net.ssl_context.use_private_key(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.cert.empty()) {
-                const asio::const_buffer buffer(sec_opts.cert.data(), sec_opts.cert.size());
-                net.ssl_context.use_certificate(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.cert_chain.empty()) {
-                const asio::const_buffer buffer(sec_opts.cert_chain.data(), sec_opts.cert_chain.size());
-                net.ssl_context.use_certificate_chain(buffer);
-            }
-
-            if (!sec_opts.rsa_private_key.empty()) {
-                const asio::const_buffer buffer(sec_opts.rsa_private_key.data(), sec_opts.rsa_private_key.size());
-                net.ssl_context.use_rsa_private_key(buffer, sec_opts.file_format);
-            }
-
-            if (!sec_opts.host_name_verification.empty()) {
-                net.ssl_context.set_verify_callback(asio::ssl::host_name_verification(sec_opts.host_name_verification));
-            }
-
-            switch (sec_opts.verify_mode) {
-                case none:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_none);
-                    break;
-                case verify_peer:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_peer);
-                    break;
-                case verify_fail_if_no_peer_cert:
-                    net.ssl_context.set_verify_mode(asio::ssl::verify_fail_if_no_peer_cert);
-                    break;
-                default:
-                    break;
-            }
-
-            net.ssl_socket = asio::ssl::stream<tcp::socket>(net.context, net.ssl_context);
-
-            handshake.path = "/chat";
-            handshake.headers.insert_or_assign("Connection", "Upgrade");
-            handshake.headers.insert_or_assign("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
-            handshake.headers.insert_or_assign("Sec-WebSocket-Version", "13");
-            handshake.headers.insert_or_assign("Upgrade", "websocket");
-        }
-
-        ~ws_client_ssl_c() {
-        }
-        
-        /**
-         * Return a ref of handshake headers.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * std::map<std::string, std::string> &headers = client.handshake;
-         * @endcode
-         */
-        http_request_t handshake;
-
-        /**
-         * Return true if socket is open.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * bool is_open = client.is_open();
-         * @endcode
-         */
-        bool is_open() const { return net.ssl_socket.next_layer().is_open() && close_state.load() == OPEN; }
-
-        /**
-         * Get the local endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * asio::ip::tcp::endpoint ep = client.local_endpoint();;
-         * @endcode
-         */
-        tcp::endpoint local_endpoint() const { return net.ssl_socket.next_layer().local_endpoint(); }
-
-        /**
-         * Get the remote endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * asio::ip::tcp::endpoint ep = client.remote_endpoint();
-         * @endcode
-         */
-        tcp::endpoint remote_endpoint() const { return net.ssl_socket.next_layer().remote_endpoint(); }
-
-        /**
-         * Return a const ref of the latest error code returned by asio.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * asio::error_code ec = client.get_error_code();
-         * @endcode
-         */
-        const asio::error_code &get_error_code() const { return error_code; }
-
-        /**
-         * Sends buffer data on the socket.
-         * It returns false if socket is closed or if buffer is empty.
-         *
-         * @param buffer String to be send.
-         *
-         * @param dataframe Custom dataframe if needed.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.connect("localhost", 8080, v4);
-         *
-         * std::string msg = "...";
-         * client.write(msg);
-         * @endcode
-         */
-        bool write(const std::string &message, const dataframe_t &dataframe = {}, const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open() || message.empty()) return false;
-
-            dataframe_t frame = dataframe;
-            frame.opcode = TEXT_FRAME;
-            frame.mask = true;
-            std::string payload = encode_string_payload(message, frame);
-            asio::async_write(net.ssl_socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&, callback](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
-        }
-
-        /**
-         * Sends buffer data on the socket.
-         * It returns false if socket is closed or if buffer is empty.
-         *
-         * @param buffer String to be send.
-         *
-         * @param dataframe Custom dataframe if needed.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.connect("localhost", 8080, v4);
-         *
-         * std::vector<uint8_t> buffer = { 0, 1, 2, ... };
-         * client.write_buffer(buffer);
-         * @endcode
-         */
-        bool write_buffer(const std::vector<uint8_t> &buffer, const dataframe_t &dataframe = {}, const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open() || buffer.empty()) return false;
-
-            dataframe_t frame = dataframe;
-            frame.opcode = BINARY_FRAME;
-            frame.mask = true;
-            std::vector<uint8_t> payload = encode_buffer_payload(buffer, dataframe);
-            asio::async_write(net.ssl_socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
-        }
-
-        /**
-         * Send a ping message.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.ping();
-         * @endcode
-         */
-        bool ping(const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open()) return false;
-
-            dataframe_t dataframe;
-            dataframe.opcode = PING;
-            std::vector<uint8_t> payload = encode_buffer_payload({}, dataframe);
-            asio::async_write(net.ssl_socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
-        }
-
-        /**
-         * Send a pong message. This is already performed automatically.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.pong();
-         * @endcode
-         */
-        bool pong(const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!is_open()) return false;
-
-            dataframe_t dataframe;
-            dataframe.opcode = PONG;
-            std::vector<uint8_t> payload = encode_buffer_payload({}, dataframe);
-            asio::async_write(net.ssl_socket,
-                              asio::buffer(payload.data(), payload.size()),
-                              [&](const asio::error_code &ec, const size_t bytes_sent) {
-                                  if (callback) callback(ec, bytes_sent);
-                              });
-            return true;
-        }
-
-        /**
-         * Initiate a connection on a given socket.
-         * It returns false if socket is already open or if asio return any error code during the listening.
-         *
-         * @param address A string identifying a location. May be a descriptive name or a numeric address string. If an empty string and the passive flag has been specified, the resolved endpoints are suitable for local service binding.
-         * @param port This may be a descriptive name or a numeric string corresponding to a port number. May be an empty string, in which case all resolved endpoints will have a port number of 0.
-         * @param protocol A protocol object, normally representing either the IPv4 or IPv6 version of an internet protocol.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.connect("localhost", 8080, v4, true);
-         * @endcode
-         */
-        bool connect(const client_bind_options_t &bind_opts = {}) {
-            if (net.ssl_socket.next_layer().is_open())
-                return false;
-
-            close_state.store(OPEN);
-            net.resolver.async_resolve(bind_opts.protocol == v4 ? tcp::v4() : tcp::v6(),
-                                       bind_opts.address, bind_opts.port,
-                                       [&](const asio::error_code &ec, const tcp::resolver::results_type &results) {
-                                           resolve(ec, results);
-                                       });
-
-            asio::post(thread_pool, [&] { run_context_thread(); });
-            return true;
-        }
-
-        /**
-         * Perform a smooth close of socket following ws protocol and stop listening for data on it. 'on_close' event will be triggered.
-         *
-         * @param code Closing code.
-         *
-         * @param reason Reason.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.end();
-         * @endcode
-         */
-        void end(const uint16_t code = 1000, const std::string &reason = "") {
-            if (close_state.load() == CLOSED) return;
-
-            if (close_state.load() == OPEN) {
-                // Client send close frame
-                close_state.store(CLOSING);
-                send_close_frame(code, reason);
-            } else {
-                // End connection
-                perform_close(code, reason);
-            }
-        }
-
-        /**
-         * Close the underlying socket and stop listening for data on it. 'on_close' event will be triggered.
-         *
-         * @param code Closing code.
-         *
-         * @param reason Reason.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.close();
-         * @endcode
-         */
-        void close(const uint16_t code = 1000, const std::string &reason = "") {
-            if (close_state.load() == CLOSED) return;
-
-            close_state.store(CLOSED);
-            wait_close_frame_response.store(true);
-
-            if (net.ssl_socket.next_layer().is_open()) {
-                bool is_locked = mutex_error.try_lock();
-
-                net.ssl_socket.lowest_layer().shutdown(asio::socket_base::shutdown_both, error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-                net.ssl_socket.lowest_layer().close(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-
-                net.ssl_socket.shutdown(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-                net.ssl_socket.next_layer().close(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-
-                if (is_locked)
-                    mutex_error.unlock();
-            }
-            net.context.stop();
-            net.context.restart();
-            net.endpoint = tcp::endpoint();
-            net.ssl_socket = asio::ssl::stream<tcp::socket>(net.context, net.ssl_context);
-        }
-
-        /**
-         * Adds the listener function to 'on_connected'.
-         * This event will be triggered when socket start to listening.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.on_connected = [&](const http_response_t &server_handshake) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const http_response_t &)> on_connected;
-
-        /**
-         * Adds the listener function to 'on_unexpected_handshake'.
-         * This event will be triggered when a bad handshake has been received from server.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.on_unexpected_handshake = [&](const http_response_t &server_handshake) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const http_response_t &)> on_unexpected_handshake;
-
-        /**
-         * Adds the listener function to 'on_message_sent'.
-         * This event will be triggered when a message has been sent.
-         * 'error_code' may be used to check if socket fail to send message.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.on_message_sent = [&](const asio::error_code &ec, const size_t bytes_sent, const tcp::endpoint &endpoint) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const asio::error_code &, const size_t)> on_message_sent;
-
-        /**
-         * Adds the listener function to 'on_message_received'.
-         * This event will be triggered when a message has been received.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.on_message_received = [&](const std::vector<uint8_t> &buffer, bool is_binary) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const std::vector<uint8_t> &, bool)> on_message_received;
-
-        /**
-         * Adds the listener function to 'on_ping'.
-         * This event will be triggered when a ping has been received.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.on_ping = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_ping;
-
-        /**
-         * Adds the listener function to 'on_pong'.
-         * This event will be triggered when a pong has been received.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.on_pong = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_pong;
-
-        /**
-         * Adds the listener function to 'on_close'.
-         * This event will be triggered when socket is closed.
-         *
-         * @par Example
-         * @code
-         * tcp_client_ssl_c client({});
-         * client.on_close = [&](const uint16_t code, const std::string &reason) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const uint16_t, const std::string &)> on_close;
-
-        /**
-         * Adds the listener function to 'on_error'.
-         * This event will be triggered when any error has been returned by asio.
-         *
-         * @par Example
-         * @code
-         * ws_client_ssl_c client({});
-         * client.on_error = [&](const asio::error_code &ec) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const asio::error_code &)> on_error;
+        explicit ws_client_ssl_c(const security_context_opts &sec_opts = {})
+            : basic_ws_client<ssl_stream>(make_state(sec_opts)) {}
 
     private:
-        std::mutex mutex_io;
-        std::mutex mutex_error;
-        std::atomic<close_state_e> close_state = CLOSED;
-        std::atomic<bool> wait_close_frame_response = true;
-        std::unique_ptr<asio::steady_timer> idle_timer;
-        tcp_client_ssl_t net;
-        asio::error_code error_code;
-        asio::streambuf recv_buffer;
-
-        void start_idle_timer() {
-            idle_timer->expires_after(std::chrono::seconds(5));
-            idle_timer->async_wait([&](const asio::error_code &ec) {
-                if (ec == asio::error::operation_aborted)
-                    return;
-
-                if (close_state.load() == CLOSED)
-                    return;
-
-                close(1000, "");
-            });
-        }
-
-        // Send close frame
-        void send_close_frame(const uint16_t code, const std::string &reason) {
-            if (!net.ssl_socket.next_layer().is_open()) {
-                perform_close(code, reason);
-                return;
-            }
-
-            dataframe_t dataframe;
-            dataframe.opcode = CLOSE_FRAME;
-
-            std::vector<uint8_t> close_payload;
-            close_payload.reserve(2 + reason.size());
-            // status code
-            close_payload.push_back(static_cast<uint8_t>(code >> 8));
-            close_payload.push_back(static_cast<uint8_t>(code & 0xFF));
-
-            // Reason
-            if (!reason.empty()) {
-                close_payload.insert(close_payload.end(), reason.begin(), reason.end());
-            }
-
-            if (close_payload.capacity() > close_payload.size())
-                close_payload.shrink_to_fit();
-
-            std::vector<uint8_t> encoded_payload = encode_buffer_payload(close_payload, dataframe);
-            asio::async_write(net.ssl_socket,
-                              asio::buffer(encoded_payload.data(), encoded_payload.size()),
-                              [this, code, reason](const asio::error_code &ec, const size_t bytes_sent) {
-                                  close_frame_sent_cb(ec, bytes_sent, code, reason);
-                              });
-        }
-
-        // Callback for close frame
-        void close_frame_sent_cb(const asio::error_code &error, const size_t bytes_sent,
-                                 const uint16_t code, const std::string &reason) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                perform_close(code, reason);
-            }
-
-            if (!wait_close_frame_response.load()) {
-                end(code, reason);
-                return;
-            }
-            start_idle_timer();
-            asio::async_read(net.ssl_socket,
-                             recv_buffer,
-                             asio::transfer_at_least(1),
-                             [&](const asio::error_code &ec, const size_t bytes_recvd) {
-                                 read_cb(ec, bytes_recvd);
-                             });
-        }
-
-        // Handle close frame received
-        void handle_close_frame_received(const uint16_t code, const std::string &reason) {
-            if (close_state.load() == OPEN) {
-                close_state.store(CLOSING);
-                send_close_frame(code, reason);
-                perform_close(code, reason);
-            } else if (close_state.load() == CLOSING) {
-                perform_close(code, reason);
-            }
-        }
-
-        void perform_close(const uint16_t code, const std::string &reason) {
-            if (close_state.load() == CLOSED) return;
-
-            close_state.store(CLOSED);
-            close_socket();
-
-            if (on_close) {
-                on_close(code, reason);
-            }
-        }
-
-        void close_socket() {
-            if (net.ssl_socket.next_layer().is_open()) {
-                std::lock_guard guard(mutex_error);
-                net.ssl_socket.lowest_layer().shutdown(asio::socket_base::shutdown_both, error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-                net.ssl_socket.lowest_layer().close(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-
-                net.ssl_socket.shutdown(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-                net.ssl_socket.next_layer().close(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-            }
-            net.context.stop();
-            net.context.restart();
-            net.endpoint = tcp::endpoint();
-            net.ssl_socket = asio::ssl::stream<tcp::socket>(net.context, net.ssl_context);
-        }
-
-        void run_context_thread() {
-            std::lock_guard guard(mutex_io);
-            error_code.clear();
-            net.context.run();
-            if (close_state.load() == OPEN) {
-                close(1006, "Abnormal closure");
-            }
-        }
-
-        void resolve(const asio::error_code &error, const tcp::resolver::results_type &results) {
-            if (error) {
-                std::lock_guard guard(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-            net.endpoint = results.begin()->endpoint();
-            asio::async_connect(net.ssl_socket.lowest_layer(),
-                                results,
-                                [&](const asio::error_code &ec, const tcp::endpoint &ep) {
-                                    conn(ec);
-                                });
-        }
-
-        void conn(const asio::error_code &error) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-
-            net.ssl_socket.async_handshake(asio::ssl::stream_base::client,
-                                           [&](const asio::error_code &ec) {
-                                               ssl_handshake(ec);
-                                           });
-        }
-
-        void ssl_handshake(const asio::error_code &error) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-
-            std::string request = prepare_request(
-                handshake, net.ssl_socket.next_layer().remote_endpoint().address().to_string(),
-                net.ssl_socket.next_layer().remote_endpoint().port());
-
-            asio::async_write(net.ssl_socket, asio::buffer(request.data(), request.size()),
-                              [&](const asio::error_code &ec, const size_t bytes_sent) {
-                                  write_handshake_cb(ec, bytes_sent);
-                              });
-        }
-
-        void write_handshake_cb(const asio::error_code &error, const size_t bytes_sent) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                close(1002, "Protocol error");
-                return;
-            }
-
-            asio::async_read_until(net.ssl_socket,
-                                   recv_buffer, "\r\n",
-                                   [&](const asio::error_code &ec, const size_t bytes_received) {
-                                       read_handshake_cb(ec, bytes_received);
-                                   });
-        }
-
-        void read_handshake_cb(const asio::error_code &error, const size_t bytes_recvd) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                consume_recv_buffer();
-                error_code = error;
-                if (on_error) on_error(error);
-                close(1002, "Protocol error");
-                return;
-            }
-
-            http_response_t response;
-            std::istream response_stream(&recv_buffer);
-            std::string http_version;
-            unsigned int status_code;
-            std::string status_message;
-            response_stream >> http_version;
-            response_stream >> status_code;
-            std::getline(response_stream, status_message);
-            if (!response_stream || http_version.substr(0, 5) != "HTTP/") {
-                consume_recv_buffer();
-                response.status_code = 505;
-                response.status_message = "HTTP Version Not Supported";
-                if (on_unexpected_handshake) on_unexpected_handshake(response);
-                close(1002, "Protocol error");
-                return;
-            }
-            response.status_code = status_code;
-            response.status_message = status_message;
-            if (status_code != 101 && recv_buffer.size() == 0) {
-                consume_recv_buffer();
-                if (on_unexpected_handshake) on_unexpected_handshake(response);
-                close(1002, "Protocol error");
-                return;
-            }
-
-            asio::async_read_until(net.ssl_socket,
-                                   recv_buffer, "\r\n\r\n",
-                                   std::bind(&ws_client_ssl_c::read_headers, this, asio::placeholders::error,
-                                             response));
-        }
-
-        void read_headers(const asio::error_code &error, http_response_t &response) {
-            if (error) {
-                consume_recv_buffer();
-                close(1002, "Protocol error");
-                return;
-            }
-            std::istream response_stream(&recv_buffer);
-            std::string header;
-
-            while (std::getline(response_stream, header) && header != "\r")
-                res_append_header(response, header);
-
-            consume_recv_buffer();
-
-            if (!validate_handshake_response(handshake, response)) {
-                if (on_unexpected_handshake) on_unexpected_handshake(response);
-                close(1002, "Protocol error");
-                return;
-            }
-
-            if (on_connected) on_connected(response);
-
-            asio::async_read(net.ssl_socket,
-                             recv_buffer,
-                             asio::transfer_at_least(1),
-                             [&](const asio::error_code &ec, const size_t bytes_recvd) {
-                                 read_cb(ec, bytes_recvd);
-                             });
-        }
-
-        void consume_recv_buffer() {
-            const size_t size = recv_buffer.size();
-            if (size > 0)
-                recv_buffer.consume(size);
-        }
-
-        void read_cb(const asio::error_code &error, const size_t bytes_recvd) {
-            if (error) {
-                std::lock_guard lock(mutex_error);
-                consume_recv_buffer();
-                if (on_error) on_error(error);
-                close(1006, "Abnormal closure");
-                return;
-            }
-
-            std::vector<uint8_t> buffer;
-            buffer.resize(bytes_recvd);
-            asio::buffer_copy(asio::buffer(buffer, bytes_recvd),
-                              recv_buffer.data());
-
-            dataframe_t dataframe;
-            std::vector<uint8_t> payload{};
-            if (decode_payload(buffer, payload, dataframe)) {
-                if (dataframe.mask) {
-                    consume_recv_buffer();
-                    end(1002, "Protocol error");
-                    return;
-                }
-                switch (dataframe.opcode) {
-                    case TEXT_FRAME:
-                        if (on_message_received) on_message_received(payload, false);
-                        break;
-                    case BINARY_FRAME:
-                        if (on_message_received) on_message_received(payload, true);
-                        break;
-                    case PING:
-                        if (on_ping) on_ping();
-                        pong();
-                        break;
-                    case PONG:
-                        if (on_pong) on_pong();
-                        break;
-                    case CLOSE_FRAME:
-                        uint16_t close_code = 1000;
-                        std::string close_reason = "Shutdown connection";
-                        if (payload.size() >= 2) {
-                            close_code = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-                            if (payload.size() > 2) {
-                                close_reason = std::string(payload.begin() + 2, payload.end());
-                            }
-                        }
-                        wait_close_frame_response.store(close_state.load() == CLOSING);
-                        end(close_code, close_reason);
-                        return;
-                }
-            } else {
-                consume_recv_buffer();
-                end(1002, "Protocol error - failed to decode payload");
-                return;
-            }
-
-            consume_recv_buffer();
-
-            if (close_state == OPEN) {
-                asio::async_read(net.ssl_socket,
-                                 recv_buffer,
-                                 asio::transfer_at_least(1),
-                                 [&](const asio::error_code &ec, const size_t bytes_received) {
-                                     read_cb(ec, bytes_received);
-                                 });
-            }
+        static std::shared_ptr<detail::ws_client_state<ssl_stream>> make_state(const security_context_opts &o) {
+            auto st = std::make_shared<detail::ws_client_state<ssl_stream>>();
+            std::error_code ec;
+            auto ctx = make_client_ssl_context(o, ec);
+            st->link->set_tls(std::move(ctx), o, ec);
+            return st;
         }
     };
 #endif

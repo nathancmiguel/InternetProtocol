@@ -3,6 +3,7 @@
 ## WS Server
 
 ```cpp
+#include <iostream>
 #include "ip.hpp"
 
 using namespace internetprotocol;
@@ -48,6 +49,7 @@ int main(int argc, char** argv) {
 ## WS Client
 
 ```cpp
+#include <iostream>
 #include "ip.hpp"
 
 using namespace internetprotocol;

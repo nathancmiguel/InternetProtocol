@@ -1,0 +1,11 @@
+add_executable(ip_tests ip_tests.cpp)
+target_link_libraries(ip_tests PRIVATE InternetProtocol::InternetProtocol ip_project_options)
+add_test(NAME ip_tests COMMAND ip_tests)
+set_tests_properties(ip_tests PROPERTIES TIMEOUT 120)
+
+if(IP_ENABLE_SSL)
+    add_executable(ip_tls_tests tls_tests.cpp)
+    target_link_libraries(ip_tls_tests PRIVATE InternetProtocol::InternetProtocol ip_project_options)
+    add_test(NAME ip_tls_tests COMMAND ip_tls_tests)
+    set_tests_properties(ip_tls_tests PROPERTIES TIMEOUT 120)
+endif()

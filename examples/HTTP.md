@@ -3,6 +3,7 @@
 ## HTTP Server
 
 ```cpp
+#include <iostream>
 #include "ip.hpp"
 
 using namespace internetprotocol;
@@ -35,6 +36,7 @@ int main(int argc, char** argv) {
 ## HTTP Client
 
 ```cpp
+#include <iostream>
 #include "ip.hpp"
 
 using namespace internetprotocol;

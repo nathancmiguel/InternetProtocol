@@ -1,150 +1,77 @@
 # InternetProtocol
 
-InternetProtocol is a versatile header only library to use with C++ 17 projects. You can also find the port for unreal
-in the unreal-dev branch.
+Abstração simples e segura de **UDP, TCP, HTTP e WebSocket** (com TLS opcional) sobre o
+**ASIO standalone 1.38.2** (header-only, sem Boost) para aplicações C++20 e Unreal Engine.
 
-📚 See the full documentation by accessing: https://internet-protocol-documentation.vercel.app/
+* Header-only — o único requisito é um compilador C++20 (MSVC, Clang, GCC) em Windows, Linux ou macOS.
+* ASIO 1.38.2 já vem em `thirdparty/asio`.
+* TLS opcional (`-DIP_ENABLE_SSL=ON`, requer OpenSSL).
 
-## Sponsor me
+## Build (CMake ≥ 3.24)
 
-<p align="center">
-  <a href="https://www.paypal.com/donate?hosted_button_id=L48BPZ4VVCN6Q"><img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif"></a>
-</p>
-<p align="center">
-  <a href="https://nubank.com.br/pagar/1bcou4/5D6eezlHdm"><img src="https://logodownload.org/wp-content/uploads/2020/02/pix-bc-logo.png" width="128"></a>
-</p>
-
-### Suported Platforms
-
----
-
-- [x] Windows
-
-- [X] Linux
-
-- [ ] Mac(Help Wanted)
-
-## Download and Install
-
----
-
-- [Git](https://git-scm.com)
-
-- [CMake 3.20 or above](https://cmake.org/download/)
-
-- [Xmake 3 or above](https://xmake.io/)
-
-- Windows only
-    - Build With Visual Studio 2019/2022 is more recommended
-        - [Visual Studio](https://visualstudio.microsoft.com/downloads/)
-        - 👇 Install the following workloads:
-        - Desktop development with C++ ```Visual studio```'
-        - MSVC v142 or above | x64/x86
-        - C++ 2015/2022 redistributable update
-
-- Linux only
-    - Build With GNU ```install with package manager```
-        - GCC 9.x or above
-        - make
-        - m4
-        - autoconf
-        - automake
-
-### Roadmap
-
----
-
-- [X] TCP server
-
-- [X] TCP client
-
-- [X] UDP server
-
-- [X] UDP client
-
-- [X] Http server
-
-- [X] Http client
-
-- [X] Websocket server
-
-- [X] Websocket client
-
-- [X] SSL support
-
-## How to use
-
-- Clone the repository or download a stable tag release.
-
-- Copy content inside include folder to your project.
-
-- Add [ASIO NON-BOOST](https://sourceforge.net/projects/asio/files/asio/) header to your project.
-
-- Add [Openssl](https://sourceforge.net/projects/asio/files/asio/) lib to your project if you need to use it.
-
-
-## Setup Repository
-
----
-
-```shell
-git clone https://github.com/Cesio137/InternetProtocol.git
+```bash
+cmake -S . -B build -DIP_ENABLE_SSL=OFF      # ON para habilitar tcp/http/ws *_ssl_c
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-#### Setup Project
-Configure and install all dependencies
-```shell
-xmake f --mode=debug
-```
-```shell
-xmake f --mode=release
-```
+| Opção CMake | Padrão | Descrição |
+|---|---|---|
+| `IP_ENABLE_SSL` | OFF | Habilita as classes TLS (OpenSSL) |
+| `IP_BUILD_TESTS` | ON (top-level) | Compila a suíte de testes |
+| `IP_BUILD_EXAMPLES` | ON (top-level) | Compila `examples/src/main.cpp` |
+| `IP_WARNINGS_AS_ERRORS` | OFF | `-Werror` / `/WX` |
+| `IP_ENABLE_SANITIZERS` | OFF | ASan + UBSan (GCC/Clang) |
 
-#### Generate cmake/vs files
+Uso em outro projeto:
 
-* CMake
-  * Commands to generate cmake project
-    * ```shell
-      xmake project -k cmake
-      ``` 
-* Visual Studio
-  * Commands to generate visual studio project
-    * ```shell
-      xmake project -k vsxmake
-      ```
-
-### Bug Reporting Template:
-
-```
-**Detailed description of issue**
-Write a detailed explanation of the issue here.
-
-**Steps To Reproduce:**
-1: Detailed Steps to reproduce the issue 
-2: Clear steps
-3: Etc
-
-**Expected Results:**
-A description of what should happen.
-
-**Actual Results:**
-A description of what actually happens.
+```cmake
+add_subdirectory(InternetProtocol)
+target_link_libraries(meu_app PRIVATE InternetProtocol::InternetProtocol)
 ```
 
-# Thirdparty libraries
+## Arquitetura
 
-- [Asio Standalone](https://think-async.com/Asio/)
-- [Openssl](https://www.openssl.org/)
+```
+include/ip.hpp                umbrella
+include/ip/core/              config, error (std::error_code), runtime (io_context + pool), types
+include/ip/events/            event<> – callbacks thread-safe (on_xxx = lambda)
+include/ip/transport/         connection (fila de escrita, strand), stream_client, stream_server, remote
+include/ip/utils/             string, package, net (HTTP), httpparser, dataframe/handshake (WS), tls
+include/ip/{udp,tcp,http,websocket}/   APIs públicas
+```
 
-# LICENCE
+Princípios: **um único `io_context`** com pool fixo de threads; cada conexão tem sua **strand**
+(sem locks no caminho de I/O); todo handler assíncrono captura `shared_from_this()`/`weak_ptr`
+(nunca `this` cru ou `[&]`); buffers de escrita pertencem à fila (nunca dangling); fila de saída
+com limite (back-pressure); `close()` é gracioso (descarrega a fila) e `abort()` é imediato.
 
-InternetProtocol is licensed under the MIT License.
+## Exemplo
 
-See the full license text in the `LICENSE` file or
-at [https://mit-license.org/](https://mit-license.org/).
+```cpp
+#include "ip.hpp"
+using namespace internetprotocol;
 
-## Support the Project
+ws_client_c ws;
+ws.options().reconnect.enabled = true;        // reconexão com backoff exponencial
+ws.set_ping_interval(15);                     // keep-alive + detecção de peer mudo
+ws.on_connected        = [&](const http_response_t &) { ws.write("hello"); };
+ws.on_message_received = [](const std::vector<uint8_t> &data, bool binary) { /* ... */ };
+ws.on_error            = [](const asio::error_code &ec) { /* ec.message() */ };
+ws.connect({"localhost", "8080", v4});
+```
 
-If you find this project useful and want to support me, purchasing a copy
-on [Fab.com](https://www.fab.com/listings/4eb6260b-19ea-4629-a653-250ea1777b8d) provided by Epic Games. Your support help me keep developing and maintening the project.
+Mais exemplos em [`examples/`](examples) (TCP, UDP, HTTP, WS, TLS). Relatório técnico da Fase 1:
+[`docs/RELATORIO_FASE1.md`](docs/RELATORIO_FASE1.md).
 
+## Notas de threading
+
+* Callbacks executam em threads do pool (serializados por conexão). Nunca bloqueie dentro deles.
+* Todos os métodos públicos (`write`, `close`, `connect`, ...) são thread-safe.
+* `on_xxx = ...` pode ser reatribuído a qualquer momento (`event<>` é thread-safe).
+* `join_threads()` aguarda o trabalho pendente; `stop_threads()` interrompe imediatamente.
+  O runtime reinicia sozinho no próximo `connect()/open()`.
+
+## Licença
+
+MIT. ASIO: Boost Software License 1.0 (`thirdparty/asio/LICENSE_1_0.txt`).

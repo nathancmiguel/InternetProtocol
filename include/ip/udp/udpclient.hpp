@@ -1,342 +1,255 @@
-/** 
+/**
  * MIT License (MIT)
  * Copyright © 2025 Nathan Miguel
-*/
+ */
 
 #pragma once
 
-#include "ip/net/common.hpp"
-#include "ip/utils/package.hpp"
-
-using namespace asio::ip;
+#include "ip/core/runtime.hpp"
+#include "ip/core/types.hpp"
+#include "ip/events/event.hpp"
 
 namespace internetprotocol {
-    class udp_client_c {
-    public:
-        udp_client_c() { recv_buffer.reserve(recv_buffer_size); }
+    namespace detail {
+        /// Shared UDP socket engine: strand-serialised receive loop + owned send buffers.
+        class udp_core : public std::enable_shared_from_this<udp_core> {
+        public:
+            using send_cb = std::function<void(const std::error_code &, std::size_t)>;
 
-        ~udp_client_c() {
-            net.resolver.cancel();
-            if (net.socket.is_open()) close();
-        }
+            udp_core() : strand_(asio::make_strand(runtime::instance().context())), socket_(strand_) {}
 
-        /**
-         * Return true if socket is open.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.local_endpoint();
-         * @endcode
-         */
-        bool is_open() const { return net.socket.is_open(); }
+            event<void()> on_ready;
+            event<void(const std::vector<uint8_t> &, const size_t, const udp::endpoint &)> on_message_received;
+            event<void()> on_close;
+            event<void(const std::error_code &)> on_error;
 
-        /**
-         * Get the local endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.local_endpoint();
-         * @endcode
-         */
-        udp::endpoint local_endpoint() const { return net.socket.local_endpoint(); }
+            std::size_t max_pending_bytes = 16u * 1024u * 1024u;
 
-        /**
-         * Get the remote endpoint of the socket. Use this function only after open connection.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.remote_endpoint();
-         * @endcode
-         */
-        udp::endpoint remote_endpoint() const { return net.socket.remote_endpoint(); }
+            void set_recv_buffer_size(std::size_t n) { recv_size_.store(std::max<std::size_t>(n, 64)); }
 
-        /**
-         * Return a const ref of the latest error code returned by asio.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * asio::error_code ec = client.get_error_code();
-         * @endcode
-         */
-        const asio::error_code &get_error_code() const { return error_code; }
+            std::size_t recv_buffer_size() const { return recv_size_.load(); }
 
-        /**
-         * Set receive buffer size in bytes
-         *
-         * @param size Size of buffer
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.set_recv_buffer_size(16384);
-         * @endcode
-         */
-        void set_recv_buffer_size(const size_t size = 16384) {
-            recv_buffer_size = size;
-        }
+            bool is_open() const { return open_.load(std::memory_order_acquire); }
 
-        /**
-         * Get receive buffer size in bytes
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * size_t size = client.get_recv_buffer_size();
-         * @endcode
-         */
-        size_t get_recv_buffer_size() const { return recv_buffer_size; }
-
-        /**
-         * Broadcasts a buffer to an specific endpoint.
-         * It returns false if socket is closed or if buffer is empty.
-         *
-         * @param message String to be send.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.connect("localhost", 8080, v4);
-         *
-         * std::string message = "...";
-         * client.send(message);
-         * @endcode
-         */
-        bool send(const std::string &message, const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!net.socket.is_open() || message.empty())
-                return false;
-
-            net.socket.async_send_to(asio::buffer(message.c_str(), message.size()),
-                                        net.endpoint,
-                                        [&, callback](const asio::error_code &ec, size_t bytes_sent) {
-                                            if (callback) callback(ec, bytes_sent);
-                                        });
-            return true;
-        }
-
-        /**
-         * Broadcasts a buffer to an specific endpoint.
-         * It returns false if socket is closed or if buffer is empty.
-         *
-         * @param buffer Data to be send.
-         *
-         * @param callback An optional callback function may be specified to as a way of reporting DNS errors or for determining when it is safe to reuse the buf object.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.connect("localhost", 8080, v4);
-         *
-         * udp::endpoint ep = ...; // You must store endpoint from 'on_message_event'
-         * std::vector<uint8_t> buffer = { 0, 1, 2... };
-         * client.send_buffer(buffer);
-         * @endcode
-         */
-        bool send_buffer(const std::vector<uint8_t> &buffer, const std::function<void(const asio::error_code &, const size_t)> &callback = nullptr) {
-            if (!net.socket.is_open() || buffer.empty())
-                return false;
-
-            net.socket.async_send_to(asio::buffer(buffer.data(), buffer.size()),
-                                        net.endpoint,
-                                        [&, callback](const asio::error_code &ec, size_t bytes_sent) {
-                                            if (callback) callback(ec, bytes_sent);
-                                        });
-            return true;
-        }
-
-        /**
-         * Listen for datagram messages on a named port and address.
-         * It returns false if socket is already open or if asio return any error code during the bind.
-         *
-         * @param bind_opts An struct specifying protocol parameters to be used.
-         * If 'port' is not specified or is 0, the operating system will attempt to bind to a random port.
-         * If 'address' is not specified, the operating system will attempt to listen on all addresses.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.connect();
-         * @endcode
-         */
-        bool connect(const client_bind_options_t &bind_opts = {}) {
-            if (net.socket.is_open())
-                return false;
-
-            net.resolver.async_resolve(bind_opts.protocol == v4 ? udp::v4() : udp::v6(),
-                                        bind_opts.address, bind_opts.port,
-                                        [&](const asio::error_code &ec, const udp::resolver::results_type &results) {
-                                            resolve(ec, results);
-                                        });
-
-            asio::post(thread_pool, [&]{ run_context_thread(); });
-            return true;
-        }
-
-        /**
-         * Close the underlying socket and stop listening for data on it. 'on_close' event will be triggered.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.close();
-         * @endcode
-         */
-        void close() {
-            is_closing.store(true);
-            if (net.socket.is_open()) {
-                std::lock_guard guard(mutex_error);
-                net.socket.shutdown(udp::socket::shutdown_both, error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
-                net.socket.close(error_code);
-                if (error_code && on_error)
-                    on_error(error_code);
+            udp::endpoint local_endpoint() const {
+                std::lock_guard l(m_);
+                return local_;
             }
-            net.context.stop();
-            net.context.restart();
-            if (on_close)
-                on_close();
-            is_closing.store(false);
-        }
 
-        /**
-         * Adds the listener function to 'on_connected'.
-         * This event will be triggered when socket start to listening.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.on_connected = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_connected;
+            udp::endpoint remote_endpoint() const {
+                std::lock_guard l(m_);
+                return remote_;
+            }
 
-        /**
-         * Adds the listener function to 'on_message_received'.
-         * This event will be triggered when a message has been received.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.on_message_received = [&](const std::vector<uint8_t> &buffer, const size_t bytes_recvd, const udp::endpoint &endpoint) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const std::vector<uint8_t> &, const size_t, const udp::endpoint &)> on_message_received;
+            std::error_code get_error_code() const {
+                std::lock_guard l(m_);
+                return ec_;
+            }
 
-        /**
-         * Adds the listener function to 'on_close'.
-         * This event will be triggered when socket is closed.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.on_close = [&]() {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void()> on_close;
+            /// Opens (and optionally binds / connects) the socket synchronously, then starts receiving.
+            bool activate(udp::socket &&opened, const udp::endpoint &local, const udp::endpoint &remote) {
+                runtime::instance().start();
+                {
+                    std::lock_guard l(m_);
+                    if (open_.load()) return false;
+                    socket_ = std::move(opened);
+                    local_ = local;
+                    remote_ = remote;
+                    closing_ = false;
+                }
+                open_.store(true, std::memory_order_release);
+                on_ready();
+                asio::post(strand_, [self = shared_from_this()] { self->receive(); });
+                return true;
+            }
 
-        /**
-         * Adds the listener function to 'on_error'.
-         * This event will be triggered when any error has been returned by asio.
-         *
-         * @par Example
-         * @code
-         * udp_client_c client;
-         * client.on_error = [&](const asio::error_code &ec) {
-         *      // your code...
-         * };
-         * @endcode
-         */
-        std::function<void(const asio::error_code &)> on_error;
+            udp::socket &socket() { return socket_; }
 
-    private:
-        std::mutex mutex_io;
-        std::mutex mutex_error;
-        std::atomic<bool> is_closing = false;
-        udp_client_t net;
-        asio::error_code error_code;
-        size_t recv_buffer_size = 16384;
-        std::vector<uint8_t> recv_buffer;
+            asio::any_io_executor executor() { return strand_; }
 
-        void run_context_thread() {
-            std::lock_guard guard(mutex_io);
-            error_code.clear();
-            net.context.run();
-            if (net.socket.is_open() && !is_closing.load())
+            /// Sends one datagram. `to` empty => connected socket send.
+            bool send(std::vector<uint8_t> &&data, std::optional<udp::endpoint> to, send_cb cb) {
+                if (data.empty() || !is_open()) return false;
+                const std::size_t n = data.size();
+                if (pending_.fetch_add(n) + n > max_pending_bytes) {
+                    pending_.fetch_sub(n);
+                    return false;
+                }
+                auto payload = std::make_shared<std::vector<uint8_t>>(std::move(data));
+                asio::post(strand_, [self = shared_from_this(), payload, to, cb = std::move(cb)]() mutable {
+                    if (!self->socket_.is_open()) {
+                        self->pending_.fetch_sub(payload->size());
+                        if (cb) try { cb(asio::error::operation_aborted, 0); } catch (...) {}
+                        return;
+                    }
+                    auto h = [self, payload, cb = std::move(cb)](const std::error_code &ec, std::size_t sent) {
+                        self->pending_.fetch_sub(payload->size());
+                        if (ec && ec != asio::error::operation_aborted) self->report(ec);
+                        if (cb) try { cb(ec, sent); } catch (...) {}
+                    };
+                    if (to) self->socket_.async_send_to(asio::buffer(*payload), *to, std::move(h));
+                    else self->socket_.async_send(asio::buffer(*payload), std::move(h));
+                });
+                return true;
+            }
+
+            void close() {
+                if (!open_.exchange(false)) return;
+                auto self = shared_from_this();
+                auto fin = [self] {
+                    std::error_code ig;
+                    if (self->socket_.is_open()) {
+                        self->socket_.cancel(ig);
+                        self->socket_.close(ig);
+                    }
+                    self->on_close();
+                };
+                if (strand_.running_in_this_thread()) fin();
+                else asio::post(strand_, fin);
+            }
+
+            void shutdown() {
+                on_ready.reset();
+                on_message_received.reset();
+                on_close.reset();
+                on_error.reset();
                 close();
-        }
-
-        void resolve(const asio::error_code &error, const udp::resolver::results_type &results) {
-            if (error) {
-                std::lock_guard guard(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
-            }
-            net.endpoint = results.begin()->endpoint();
-            net.socket.async_connect(net.endpoint,
-                                        [&](const asio::error_code &ec) {
-                                            conn(ec);
-                                        });
-        }
-
-        void conn(const asio::error_code &error) {
-            if (error) {
-                std::lock_guard guard(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
             }
 
-            if (on_connected)
-                on_connected();
-
-            consume_receive_buffer();
-            net.socket.async_receive_from(asio::buffer(recv_buffer, recv_buffer.size()),
-                                            net.endpoint,
-                                            [&](const asio::error_code &ec, const size_t bytes_recvd) {
-                                                receive_from_cb(ec, bytes_recvd);
-                                            });
-        }
-
-        void consume_receive_buffer() {
-            if (!recv_buffer.empty()) 
-                recv_buffer.clear();
-
-            if (recv_buffer.capacity() != recv_buffer_size) {
-                recv_buffer.shrink_to_fit();
-                recv_buffer.resize(recv_buffer_size);
-            }
-        }
-
-        void receive_from_cb(const asio::error_code &error, const size_t bytes_recvd) {
-            if (error) {
-                std::lock_guard guard(mutex_error);
-                error_code = error;
-                if (on_error) on_error(error);
-                return;
+            void report(const std::error_code &ec) {
+                {
+                    std::lock_guard l(m_);
+                    ec_ = ec;
+                }
+                on_error(ec);
             }
 
-            if (on_message_received)
-                on_message_received(recv_buffer, bytes_recvd, net.endpoint);
+        private:
+            strand_t strand_;
+            udp::socket socket_;
+            mutable std::mutex m_;
+            udp::endpoint local_, remote_, sender_;
+            std::error_code ec_;
+            std::atomic<bool> open_{false};
+            std::atomic<std::size_t> pending_{0};
+            std::atomic<std::size_t> recv_size_{16384};
+            std::vector<uint8_t> rbuf_;
+            bool closing_ = false;
 
-            consume_receive_buffer();
-            net.socket.async_receive_from(asio::buffer(recv_buffer, recv_buffer.size()),
-                                            net.endpoint,
-                                            [&](const asio::error_code &ec, const size_t bytes_received) {
-                                                receive_from_cb(ec, bytes_received);
-                                            });
+            void receive() {
+                if (!socket_.is_open()) return;
+                rbuf_.resize(recv_size_.load());
+                socket_.async_receive_from(asio::buffer(rbuf_), sender_,
+                                           [self = shared_from_this()](const std::error_code &ec, std::size_t n) {
+                                               if (ec == asio::error::operation_aborted || !self->is_open()) return;
+                                               if (ec) {
+                                                   // ICMP "port unreachable" on a connected socket is transient for UDP.
+                                                   self->report(ec);
+                                                   if (!self->socket_.is_open()) return;
+                                               } else {
+                                                   self->on_message_received(self->rbuf_, n, self->sender_);
+                                               }
+                                               self->receive();
+                                           });
+            }
+        };
+    }
+
+    /**
+     * UDP client: resolves the host, "connects" the datagram socket (fixed peer) and receives.
+     * Unlike the old implementation the destination is never overwritten by the sender address.
+     */
+    class udp_client_c {
+        // Declared first: the public event references below are bound to core_ (initialisation order).
+        std::shared_ptr<detail::udp_core> core_ = std::make_shared<detail::udp_core>();
+        std::shared_ptr<std::atomic<bool>> connecting_ = std::make_shared<std::atomic<bool>>(false);
+
+    public:
+        using send_callback = std::function<void(const asio::error_code &, const size_t)>;
+
+        udp_client_c() : on_connected(core_->on_ready), on_message_received(core_->on_message_received),
+                         on_close(core_->on_close), on_error(core_->on_error) {}
+
+        udp_client_c(const udp_client_c &) = delete;
+
+        udp_client_c &operator=(const udp_client_c &) = delete;
+
+        ~udp_client_c() { core_->shutdown(); }
+
+        bool is_open() const { return core_->is_open(); }
+
+        udp::endpoint local_endpoint() const { return core_->local_endpoint(); }
+
+        udp::endpoint remote_endpoint() const { return core_->remote_endpoint(); }
+
+        asio::error_code get_error_code() const { return core_->get_error_code(); }
+
+        /// Size of the receive buffer, i.e. the largest datagram delivered intact (default 16 KiB).
+        void set_recv_buffer_size(const size_t size = 16384) { core_->set_recv_buffer_size(size); }
+
+        size_t get_recv_buffer_size() const { return core_->recv_buffer_size(); }
+
+        /// Allow sending to broadcast addresses (e.g. 255.255.255.255). Call after connect().
+        bool set_broadcast(bool enable) {
+            std::error_code ec;
+            core_->socket().set_option(asio::socket_base::broadcast(enable), ec);
+            return !ec;
         }
+
+        bool send(const std::string &message, const send_callback &callback = nullptr) {
+            return core_->send(std::vector<uint8_t>(message.begin(), message.end()), std::nullopt, callback);
+        }
+
+        bool send_buffer(const std::vector<uint8_t> &buffer, const send_callback &callback = nullptr) {
+            return core_->send(std::vector<uint8_t>(buffer), std::nullopt, callback);
+        }
+
+        bool send_buffer(std::vector<uint8_t> &&buffer, const send_callback &callback = nullptr) {
+            return core_->send(std::move(buffer), std::nullopt, callback);
+        }
+
+        /// Resolves and connects asynchronously. 'on_connected' fires when ready.
+        bool connect(const client_bind_options_t &bind_opts = {}) {
+            if (core_->is_open() || connecting_->exchange(true)) return false;
+            if (bind_opts.address.empty()) {
+                connecting_->store(false);
+                core_->report(make_error_code(errc::invalid_argument));
+                return false;
+            }
+            runtime::instance().start();
+            auto resolver = std::make_shared<udp::resolver>(runtime::instance().context());
+            resolver->async_resolve(bind_opts.address, bind_opts.port,
+                                    [core = core_, resolver, bind_opts, flag = connecting_](
+                                const std::error_code &ec, udp::resolver::results_type results) {
+                                        auto done = [&] { flag->store(false); };
+                                        if (ec) { core->report(ec); done(); return; }
+                                        for (const auto &r: results) {
+                                            const udp::endpoint ep = r.endpoint();
+                                            if (bind_opts.protocol == v4 && !ep.address().is_v4()) continue;
+                                            if (bind_opts.protocol == v6 && !ep.address().is_v6()) continue;
+                                            std::error_code e;
+                                            udp::socket s(core->executor());
+                                            s.open(ep.protocol(), e);
+                                            if (!e) s.connect(ep, e);
+                                            if (e) continue;
+                                            const udp::endpoint local = s.local_endpoint(e);
+                                            core->activate(std::move(s), local, ep);
+                                            done();
+                                            return;
+                                        }
+                                        core->report(make_error_code(errc::host_not_found));
+                                        done();
+                                    });
+            return true;
+        }
+
+        void close() { core_->close(); }
+
+        event<void()> &on_connected;
+        /// buffer holds at least `bytes_recvd` valid bytes (the buffer is reused between datagrams).
+        event<void(const std::vector<uint8_t> &, const size_t, const udp::endpoint &)> &on_message_received;
+        event<void()> &on_close;
+        event<void(const asio::error_code &)> &on_error;
+
     };
 }
