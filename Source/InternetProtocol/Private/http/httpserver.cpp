@@ -1,14 +1,20 @@
-﻿/** 
+/** 
  * Copyright © 2025 Nathan Miguel
  */
 
 #include "http/httpserver.h"
+#include "net/httpfacade.h"
+
+using IPNet::FFacadeAccess;
+using IPNet::FHttpAccess;
+
+// ---------------------------------------------------------------------------------------------------------
+// UHttpServer
 
 void UHttpServer::BeginDestroy() {
-	is_being_destroyed = true;
-	if (net.acceptor.is_open())
-		Close();
-	UObject::BeginDestroy();
+	FFacadeAccess::ReleaseServer(Server);
+	ClientSet.Empty();
+	Super::BeginDestroy();
 }
 
 void UHttpServer::AddToRoot() {
@@ -24,20 +30,19 @@ bool UHttpServer::IsRooted() {
 }
 
 bool UHttpServer::IsOpen() {
-	return net.acceptor.is_open();
+	return Server.bOpen;
 }
 
 FTcpEndpoint UHttpServer::LocalEndpoint() {
-	tcp::endpoint ep = net.acceptor.local_endpoint();
-	return FTcpEndpoint(ep);
+	return Server.Local;
 }
 
 TSet<UHttpRemote*>& UHttpServer::Clients() {
-	return net.clients;
+	return ClientSet;
 }
 
 FErrorCode UHttpServer::GetErrorCode() {
-	return FErrorCode(error_code);
+	return Server.LastError;
 }
 
 void UHttpServer::All(const FString& Path, const FDelegateHttpServerRequest& Callback) {
@@ -73,196 +78,99 @@ void UHttpServer::Patch(const FString& Path, const FDelegateHttpServerRequest& C
 }
 
 bool UHttpServer::Open(const FServerBindOptions& BindOpts) {
-	if (net.acceptor.is_open())
-		return false;
-
-	net.acceptor.open(BindOpts.Protocol == EProtocolType::V4 
-						  ? tcp::v4()
-						  : tcp::v6(),
-						  error_code);
-
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
-		return false;
-	}
-
-	net.acceptor.set_option(asio::socket_base::reuse_address(BindOpts.bReuse_Address), error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
-		return false;
-	}
-
-	const tcp::endpoint endpoint = BindOpts.Address.IsEmpty() ?
-								tcp::endpoint(BindOpts.Protocol == EProtocolType::V4
-												? tcp::v4()
-												: tcp::v6(),
-												BindOpts.Port) :
-								tcp::endpoint(make_address(TCHAR_TO_UTF8(*BindOpts.Address)), BindOpts.Port);
-
-	net.acceptor.bind(endpoint, error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
-		return false;
-	}
-
-	net.acceptor.listen(Backlog, error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
-		return false;
-	}
-
-	asio::post(thread_pool(), [this]{ run_context_thread(); });
-	return true;
+	return FFacadeAccess::OpenServer<UHttpServer>(this, BindOpts, [](UHttpServer* Self, asio::ip::tcp::socket&& Socket) {
+		UHttpRemote* Remote = FHttpAccess::AdoptRemote(Self, Self->ClientSet, MoveTemp(Socket), nullptr, false);
+		if (!Remote) {
+			return;
+		}
+		TWeakObjectPtr<UHttpServer> WeakServer(Self);
+		TWeakObjectPtr<UHttpRemote> WeakRemote(Remote);
+		FHttpAccess::SetRequestHandler(Remote, [WeakServer, WeakRemote](const FHttpRequest& Request) {
+			UHttpServer* ServerPtr = WeakServer.Get();
+			UHttpRemote* RemotePtr = WeakRemote.Get();
+			if (ServerPtr && RemotePtr) {
+				ServerPtr->Route(RemotePtr, Request);
+			}
+		});
+		FHttpAccess::StartRemote(Remote);
+	});
 }
 
 void UHttpServer::Close() {
-	is_closing.Store(true);
-	if (net.acceptor.is_open()) {
-		FScopeLock lock(&mutex_error);
-		net.acceptor.close(error_code);
-		if (error_code)
-			AsyncTask(ENamedThreads::GameThread, [this]() {
-				if (!is_being_destroyed)
-					OnError.Broadcast(FErrorCode(error_code));
-			});
-	}
-	if (net.clients.Num()) {
-		FScopeLock lock(&mutex_error);
-		for (const auto &client : net.clients) {
-			if (client)
-				client->Close();
+	FFacadeAccess::CloseServer(this);
+	TArray<UHttpRemote*> Remotes = ClientSet.Array();
+	ClientSet.Empty();
+	for (UHttpRemote* Remote : Remotes) {
+		if (IsValid(Remote)) {
+			Remote->Close();
 		}
-		net.clients.Empty();
-		net.clients.Shrink();
 	}
-	net.context.stop();
-	net.context.restart();
-	net.acceptor = tcp::acceptor(net.context);
-	AsyncTask(ENamedThreads::GameThread, [this]() {
-		if (!is_being_destroyed)
-			OnClose.Broadcast();
-	});
-	is_closing.Store(false);
 }
 
-void UHttpServer::run_context_thread() {
-	FScopeLock lock(&mutex_io);
-	error_code.clear();
-	if (IsGarbageCollecting()) return;
-	UHttpRemote* remote_ptr = NewObject<UHttpRemote>();
-	remote_ptr->Construct(net.context, IdleTimeoutSeconds);
-	net.acceptor.async_accept(remote_ptr->get_socket(), std::bind(&UHttpServer::accept, this, asio::placeholders::error, remote_ptr));
-	net.context.run();
-	if (!is_closing.Load())
-		Close();
-}
+void UHttpServer::Route(UHttpRemote* Remote, const FHttpRequest& Request) {
+	FHttpAccess::PrepareResponse(Remote, Request);
 
-void UHttpServer::accept(const asio::error_code& error, UHttpRemote* remote) {
-	if (error) {
-		FScopeLock lock(&mutex_error);
-		remote->Close();
-		remote->Destroy();
-		error_code = error;
-		if (net.acceptor.is_open() && !IsGarbageCollecting()) {
-			UHttpRemote* remote_ptr = NewObject<UHttpRemote>();
-			remote_ptr->Construct(net.context, IdleTimeoutSeconds);
-			net.acceptor.async_accept(remote_ptr->get_socket(), std::bind(&UHttpServer::accept, this, asio::placeholders::error, remote_ptr));
-		}
+	if (Request.Method == ERequestMethod::UNKNOWN) {
+		Remote->Headers.Status_Code = 405;
+		Remote->Headers.Status_Message = TEXT("Method Not Allowed");
+		Remote->Headers.Headers.Add(TEXT("Allow"), TEXT("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"));
+		Remote->Headers.Body = TEXT("Method not supported.");
+		Remote->Write(FDelegateHttpRemoteMessageSent());
 		return;
 	}
-	if (!IsGarbageCollecting()) {
-		remote->on_request = [this, remote](const FHttpRequest& request) {
-			read_cb(request, remote);
-		};
-		remote->on_close = [this, remote]() {
-			net.clients.Remove(remote);
-			remote->Destroy();
-		};
-		net.clients.Add(remote);
-		remote->connect();
-		if (net.acceptor.is_open()) {
-			UHttpRemote* remote_ptr = NewObject<UHttpRemote>();
-			remote_ptr->Construct(net.context, IdleTimeoutSeconds);
-			net.acceptor.async_accept(remote_ptr->get_socket(), std::bind(&UHttpServer::accept, this, asio::placeholders::error, remote_ptr));
+
+	TMap<FString, FDelegateHttpServerRequest>* MethodRoutes = nullptr;
+	switch (Request.Method) {
+	case ERequestMethod::DEL: MethodRoutes = &del_cb; break;
+	case ERequestMethod::GET: MethodRoutes = &get_cb; break;
+	case ERequestMethod::HEAD: MethodRoutes = &head_cb; break;
+	case ERequestMethod::OPTIONS: MethodRoutes = &options_cb; break;
+	case ERequestMethod::POST: MethodRoutes = &post_cb; break;
+	case ERequestMethod::PUT: MethodRoutes = &put_cb; break;
+	case ERequestMethod::PATCH: MethodRoutes = &patch_cb; break;
+	default: break;
+	}
+
+	// Copy the delegates: a handler may register routes or close the server while we iterate.
+	TArray<FDelegateHttpServerRequest> Handlers;
+	if (const FDelegateHttpServerRequest* Any = all_cb.Find(Request.Path)) {
+		Handlers.Add(*Any);
+	}
+	if (MethodRoutes) {
+		if (const FDelegateHttpServerRequest* Specific = MethodRoutes->Find(Request.Path)) {
+			Handlers.Add(*Specific);
 		}
 	}
+
+	bool bHandled = false;
+	for (const FDelegateHttpServerRequest& Handler : Handlers) {
+		if (Handler.IsBound()) {
+			bHandled = true;
+			Handler.ExecuteIfBound(Request, Remote);
+		}
+	}
+
+	if (!bHandled && IsValid(Remote)) {
+		Remote->Headers.Status_Code = 404;
+		Remote->Headers.Status_Message = TEXT("Not Found");
+		Remote->Headers.Body = TEXT("Not Found");
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
 }
 
-void UHttpServer::read_cb(const FHttpRequest& request, UHttpRemote* remote) {
-	if (is_being_destroyed) return;
-	if (all_cb.Contains(request.Path)) {
-		AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-			all_cb[request.Path].ExecuteIfBound(request, remote);
-		});
-	}
-	switch (request.Method) {
-	case ERequestMethod::DEL:
-    	if (del_cb.Contains(request.Path) && !is_being_destroyed) {
-    		AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-    			del_cb[request.Path].ExecuteIfBound(request, remote);
-			});    		
-    	}
-    	break;
-    case ERequestMethod::GET:
-        if (get_cb.Contains(request.Path)) {
-        	AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-        		get_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-        }
-        break;
-    case ERequestMethod::HEAD:
-        if (head_cb.Contains(request.Path)) {
-        	AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				head_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-        }
-        break;
-    case ERequestMethod::OPTIONS:
-        if (options_cb.Contains(request.Path)) {
-        	AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				options_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-        }
-        break;
-    case ERequestMethod::POST:
-        if (post_cb.Contains(request.Path)) {
-        	AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-        		post_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-        }
-        break;
-    case ERequestMethod::PUT:
-        if (put_cb.Contains(request.Path)) {
-        	AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-        		put_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-        	
-        }
-        break;
-    case ERequestMethod::PATCH:
-        if (patch_cb.Contains(request.Path)) {
-        	AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-        		patch_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-        }
-        break;
-    default: break;
-	}
+// ---------------------------------------------------------------------------------------------------------
+
+void UHttpServerSsl::Construct(const FSecurityContextOpts& SecOpts) {
+	Tls = IPNet::MakeTlsConfig(SecOpts, true);
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// UHttpServerSsl
 
 void UHttpServerSsl::BeginDestroy() {
-	is_being_destroyed = true;
-	if (net.acceptor.is_open())
-		Close();
-	UObject::BeginDestroy();
+	FFacadeAccess::ReleaseServer(Server);
+	ClientSet.Empty();
+	Super::BeginDestroy();
 }
 
 void UHttpServerSsl::AddToRoot() {
@@ -278,20 +186,19 @@ bool UHttpServerSsl::IsRooted() {
 }
 
 bool UHttpServerSsl::IsOpen() {
-	return net.acceptor.is_open();
+	return Server.bOpen;
 }
 
 FTcpEndpoint UHttpServerSsl::LocalEndpoint() {
-	tcp::endpoint ep = net.acceptor.local_endpoint();
-	return FTcpEndpoint(ep);
+	return Server.Local;
 }
 
 TSet<UHttpRemoteSsl*>& UHttpServerSsl::Clients() {
-	return net.ssl_clients;
+	return ClientSet;
 }
 
 FErrorCode UHttpServerSsl::GetErrorCode() {
-	return FErrorCode(error_code);
+	return Server.LastError;
 }
 
 void UHttpServerSsl::All(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
@@ -327,184 +234,90 @@ void UHttpServerSsl::Patch(const FString& Path, const FDelegateHttpServerRequest
 }
 
 bool UHttpServerSsl::Open(const FServerBindOptions& BindOpts) {
-	if (net.acceptor.is_open())
-		return false;
-
-	net.acceptor.open(BindOpts.Protocol == EProtocolType::V4 
-						  ? tcp::v4()
-						  : tcp::v6(),
-						  error_code);
-
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
+	if (!Tls || !Tls->IsValid()) {
+		if (!Tls) {
+			UE_LOG(LogAsio, Error, TEXT("InternetProtocol: UHttpServerSsl requires Construct() with a certificate and key."));
+		}
+		Server.LastError = FErrorCode(IPNet::MakeError(IPNet::EError::TlsSetupFailed));
+		OnError.Broadcast(Server.LastError);
 		return false;
 	}
-
-	net.acceptor.set_option(asio::socket_base::reuse_address(BindOpts.bReuse_Address), error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
-		return false;
-	}
-
-	const tcp::endpoint endpoint = BindOpts.Address.IsEmpty() ?
-								tcp::endpoint(BindOpts.Protocol == EProtocolType::V4
-												? tcp::v4()
-												: tcp::v6(),
-												BindOpts.Port) :
-								tcp::endpoint(make_address(TCHAR_TO_UTF8(*BindOpts.Address)), BindOpts.Port);
-
-	net.acceptor.bind(endpoint, error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
-		return false;
-	}
-
-	net.acceptor.listen(Backlog, error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
-		return false;
-	}
-
-	asio::post(thread_pool(), [this]{ run_context_thread(); });
-	return true;
+	return FFacadeAccess::OpenServer<UHttpServerSsl>(this, BindOpts, [](UHttpServerSsl* Self, asio::ip::tcp::socket&& Socket) {
+		UHttpRemoteSsl* Remote = FHttpAccess::AdoptRemote(Self, Self->ClientSet, MoveTemp(Socket), Self->Tls, true);
+		if (!Remote) {
+			return;
+		}
+		TWeakObjectPtr<UHttpServerSsl> WeakServer(Self);
+		TWeakObjectPtr<UHttpRemoteSsl> WeakRemote(Remote);
+		FHttpAccess::SetRequestHandler(Remote, [WeakServer, WeakRemote](const FHttpRequest& Request) {
+			UHttpServerSsl* ServerPtr = WeakServer.Get();
+			UHttpRemoteSsl* RemotePtr = WeakRemote.Get();
+			if (ServerPtr && RemotePtr) {
+				ServerPtr->Route(RemotePtr, Request);
+			}
+		});
+		FHttpAccess::StartRemote(Remote);
+	});
 }
 
 void UHttpServerSsl::Close() {
-	is_closing.Store(true);
-	if (net.acceptor.is_open()) {
-		FScopeLock lock(&mutex_error);
-		net.acceptor.close(error_code);
-		if (error_code)
-			AsyncTask(ENamedThreads::GameThread, [this]() {
-				if (!is_being_destroyed)
-					OnError.Broadcast(FErrorCode(error_code));
-			});
-	}
-	if (net.ssl_clients.Num()) {
-		FScopeLock lock(&mutex_error);
-		for (const auto &client : net.ssl_clients) {
-			if (client)
-				client->Close();
+	FFacadeAccess::CloseServer(this);
+	TArray<UHttpRemoteSsl*> Remotes = ClientSet.Array();
+	ClientSet.Empty();
+	for (UHttpRemoteSsl* Remote : Remotes) {
+		if (IsValid(Remote)) {
+			Remote->Close();
 		}
-		net.ssl_clients.Empty();
-		net.ssl_clients.Shrink();
 	}
-	net.context.stop();
-	net.context.restart();
-	net.acceptor = tcp::acceptor(net.context);
-	AsyncTask(ENamedThreads::GameThread, [this]() {
-		if (!is_being_destroyed)
-			OnClose.Broadcast();
-	});
-	is_closing.Store(false);
 }
 
-void UHttpServerSsl::run_context_thread() {
-	FScopeLock lock(&mutex_io);
-	error_code.clear();
-	if (IsGarbageCollecting()) return;
-	UHttpRemoteSsl* remote_ptr = NewObject<UHttpRemoteSsl>();
-	remote_ptr->Construct(net.context, net.ssl_context, IdleTimeoutSeconds);
-	net.acceptor.async_accept(remote_ptr->get_socket().lowest_layer(), std::bind(&UHttpServerSsl::accept, this, asio::placeholders::error, remote_ptr));
-	net.context.run();
-	if (!is_closing.Load())
-		Close();
-}
+void UHttpServerSsl::Route(UHttpRemoteSsl* Remote, const FHttpRequest& Request) {
+	FHttpAccess::PrepareResponse(Remote, Request);
 
-void UHttpServerSsl::accept(const asio::error_code& error, UHttpRemoteSsl* remote) {
-	if (error) {
-		FScopeLock lock(&mutex_error);
-		remote->Close();
-		remote->Destroy();
-		error_code = error;
-		if (net.acceptor.is_open() && !IsGarbageCollecting()) {
-			UHttpRemoteSsl* remote_ptr = NewObject<UHttpRemoteSsl>();
-			remote_ptr->Construct(net.context, net.ssl_context, IdleTimeoutSeconds);
-			net.acceptor.async_accept(remote_ptr->get_socket().lowest_layer(), std::bind(&UHttpServerSsl::accept, this, asio::placeholders::error, remote_ptr));
-		}
+	if (Request.Method == ERequestMethod::UNKNOWN) {
+		Remote->Headers.Status_Code = 405;
+		Remote->Headers.Status_Message = TEXT("Method Not Allowed");
+		Remote->Headers.Headers.Add(TEXT("Allow"), TEXT("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"));
+		Remote->Headers.Body = TEXT("Method not supported.");
+		Remote->Write(FDelegateHttpRemoteMessageSent());
 		return;
 	}
-	if (!IsGarbageCollecting()) {
-		remote->on_request = [this, remote](const FHttpRequest& request) {
-			read_cb(request, remote);
-		};
-		remote->on_close = [this, remote]() {
-			net.ssl_clients.Remove(remote);
-			remote->Destroy();
-		};
-		net.ssl_clients.Add(remote);
-		remote->connect();
-		if (net.acceptor.is_open()) {
-			UHttpRemoteSsl* remote_ptr = NewObject<UHttpRemoteSsl>();
-			remote_ptr->Construct(net.context, net.ssl_context, IdleTimeoutSeconds);
-			net.acceptor.async_accept(remote_ptr->get_socket().lowest_layer(), std::bind(&UHttpServerSsl::accept, this, asio::placeholders::error, remote_ptr));
-		}
-	}
-}
 
-void UHttpServerSsl::read_cb(const FHttpRequest& request, UHttpRemoteSsl* remote) {
-	if (is_being_destroyed) return;
-	if (all_cb.Contains(request.Path)) {
-		all_cb[request.Path].ExecuteIfBound(request, remote);
-	}
-	switch (request.Method) {
-	case ERequestMethod::DEL:
-		if (del_cb.Contains(request.Path)) {
-			AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				del_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-		}
-		break;
-	case ERequestMethod::GET:
-		if (get_cb.Contains(request.Path)) {
-			AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				get_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-		}
-		break;
-	case ERequestMethod::HEAD:
-		if (head_cb.Contains(request.Path)) {
-			AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				head_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-		}
-		break;
-	case ERequestMethod::OPTIONS:
-		if (options_cb.Contains(request.Path)) {
-			AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				options_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-		}
-		break;
-	case ERequestMethod::POST:
-		if (post_cb.Contains(request.Path)) {
-			AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				post_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-		}
-		break;
-	case ERequestMethod::PUT:
-		if (put_cb.Contains(request.Path)) {
-			AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				put_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-		}
-		break;
-	case ERequestMethod::PATCH:
-		if (patch_cb.Contains(request.Path)) {
-			AsyncTask(ENamedThreads::GameThread, [this, request, remote]() {
-				patch_cb[request.Path].ExecuteIfBound(request, remote);
-			});
-		}
-		break;
+	TMap<FString, FDelegateHttpServerRequestSsl>* MethodRoutes = nullptr;
+	switch (Request.Method) {
+	case ERequestMethod::DEL: MethodRoutes = &del_cb; break;
+	case ERequestMethod::GET: MethodRoutes = &get_cb; break;
+	case ERequestMethod::HEAD: MethodRoutes = &head_cb; break;
+	case ERequestMethod::OPTIONS: MethodRoutes = &options_cb; break;
+	case ERequestMethod::POST: MethodRoutes = &post_cb; break;
+	case ERequestMethod::PUT: MethodRoutes = &put_cb; break;
+	case ERequestMethod::PATCH: MethodRoutes = &patch_cb; break;
 	default: break;
+	}
+
+	// Copy the delegates: a handler may register routes or close the server while we iterate.
+	TArray<FDelegateHttpServerRequestSsl> Handlers;
+	if (const FDelegateHttpServerRequestSsl* Any = all_cb.Find(Request.Path)) {
+		Handlers.Add(*Any);
+	}
+	if (MethodRoutes) {
+		if (const FDelegateHttpServerRequestSsl* Specific = MethodRoutes->Find(Request.Path)) {
+			Handlers.Add(*Specific);
+		}
+	}
+
+	bool bHandled = false;
+	for (const FDelegateHttpServerRequestSsl& Handler : Handlers) {
+		if (Handler.IsBound()) {
+			bHandled = true;
+			Handler.ExecuteIfBound(Request, Remote);
+		}
+	}
+
+	if (!bHandled && IsValid(Remote)) {
+		Remote->Headers.Status_Code = 404;
+		Remote->Headers.Status_Message = TEXT("Not Found");
+		Remote->Headers.Body = TEXT("Not Found");
+		Remote->Write(FDelegateHttpRemoteMessageSent());
 	}
 }

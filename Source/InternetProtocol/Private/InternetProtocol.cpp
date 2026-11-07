@@ -1,25 +1,30 @@
-/** 
+/**
  * Copyright © 2025 Nathan Miguel
  */
 
 #include "InternetProtocol.h"
 #include "Modules/ModuleManager.h"
 #include "net/common.h"
+#include "net/ioservice.h"
+#include "net/tls.h"
+
+DEFINE_LOG_CATEGORY(LogAsio);
 
 #define LOCTEXT_NAMESPACE "FInternetProtocolModule"
 
 void FInternetProtocolModule::StartupModule()
 {
-	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
-	pool = MakeUnique<asio::thread_pool>(std::thread::hardware_concurrency());
+	IPNet::FIoService::Startup();
 }
 
 void FInternetProtocolModule::ShutdownModule()
 {
-	// This function may be called during shutdown to clean up your module.  For modules that support dynamic reloading,
-	// we call this function before unloading the module.
+	// Aborts every live connection and joins the I/O threads (bounded). UObjects that still exist keep
+	// their native sessions alive, but no handler runs anymore and no callback reaches the Game Thread.
+	IPNet::FIoService::Shutdown();
+	IPNet::ShutdownTls();
 }
 
 #undef LOCTEXT_NAMESPACE
-	
+
 IMPLEMENT_MODULE(FInternetProtocolModule, InternetProtocol)

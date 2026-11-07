@@ -1,16 +1,16 @@
 {
 	"FileVersion": 3,
 	"Version": 2,
-	"VersionName": "3.0.1",
+	"VersionName": "3.0.2",
 	"FriendlyName": "Internet Protocol",
 	"Description": "UDP, TCP, HTTP, Websocket and TLS conections.",
 	"Category": "Online",
 	"CreatedBy": "Nathan Miguel",
-	"CreatedByURL": "https://github.com/Cesio137",
+	"CreatedByURL": "https://github.com/nathancmiguel",
 	"DocsURL": "https://internet-protocol-documentation.vercel.app/",
 	"MarketplaceURL": "com.epicgames.launcher://ue/Fab/product/c2505541-bbb6-4d4b-8152-c6826d9a503f",
 	"FabURL": "com.epicgames.launcher://ue/Fab/product/c2505541-bbb6-4d4b-8152-c6826d9a503f",
-	"SupportURL": "https://github.com/Cesio137/InternetProtocol-Documentation/issues",
+	"SupportURL": "https://github.com/nathancmiguel/InternetProtocol-Documentation/issues",
 	"CanContainContent": true,
 	"Modules": [
 		{
@@ -20,6 +20,17 @@
 				"Win64"
 			],
 			"LoadingPhase": "PostDefault"
+		},
+		{
+			"Name": "InternetProtocolTests",
+			"Type": "Editor",
+			"PlatformAllowList": [
+				"Win64"
+			],
+			"LoadingPhase": "PostDefault"
 		}
-	]
+	],
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false
 }

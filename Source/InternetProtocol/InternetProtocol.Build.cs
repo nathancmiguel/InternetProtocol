@@ -1,4 +1,4 @@
-/** 
+/**
  * Copyright © 2025 Nathan Miguel
  */
 
@@ -19,38 +19,32 @@ public class InternetProtocol : ModuleRules
 			CppStandard = CppStandardVersion.Cpp17;
 		}
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-		PublicDefinitions.Add("ASIO_NO_EXCEPTIONS");
-		
+
+		// Asio configuration shared by every translation unit (and dependents including our headers).
+		// Keeping it here guarantees all TUs see the same Asio ABI.
+		PublicDefinitions.Add("ASIO_STANDALONE=1");
+		PublicDefinitions.Add("ASIO_NO_EXCEPTIONS=1");
+		PublicDefinitions.Add("ASIO_NO_DEPRECATED=1");
+
 		PublicIncludePaths.AddRange(
 			new string[]
 			{
-				// ... add public include paths required here ...
 				"$(PluginDir)/Source/ThirdParty/asio/Public"
 			}
 		);
-
-
-		PrivateIncludePaths.AddRange(
-			new string[]
-			{
-				// ... add other private include paths required here ...
-			}
-		);
-
 
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
 				"Core"
-				// ... add other public dependencies that you statically link with here ...
 			}
 		);
-
 
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
 				"OpenSSL",
+				"SSL",
 				"Json",
 				"JsonUtilities",
 				"Projects",
@@ -58,15 +52,6 @@ public class InternetProtocol : ModuleRules
 				"Engine",
 				"Slate",
 				"SlateCore"
-				// ... add private dependencies that you statically link with here ...	
-			}
-		);
-
-
-		DynamicallyLoadedModuleNames.AddRange(
-			new string[]
-			{
-				// ... add any modules that your module loads dynamically here ...
 			}
 		);
 	}

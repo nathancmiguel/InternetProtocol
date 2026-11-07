@@ -1,4 +1,4 @@
-﻿/** 
+/** 
  * Copyright © 2025 Nathan Miguel
  */
 
@@ -24,7 +24,6 @@ class INTERNETPROTOCOL_API UTCPServer : public UObject
 	GENERATED_BODY()
 public:
 	UTCPServer() {}
-	~UTCPServer() {}
 	
 	virtual void BeginDestroy() override;
 
@@ -71,15 +70,11 @@ public:
 	FDelegateTcpServerError OnError;
 
 private:
-	bool is_being_destroyed = false;
-	FCriticalSection mutex_io;
-	FCriticalSection mutex_error;
-	TAtomic<bool> is_closing = false;
-	tcp_server_t<UTCPRemote> net;
-	asio::error_code error_code;
-
-	void run_context_thread();
-	void accept(const asio::error_code &error, UTCPRemote* remote);
+	friend struct IPNet::FFacadeAccess;
+	FIpServerState Server;
+	UPROPERTY(Transient)
+	TSet<UTCPRemote*> ClientSet;
+	void RemoveClient(UTCPRemote* Remote) { ClientSet.Remove(Remote); }
 };
 
 UCLASS(Blueprintable, BlueprintType, Category = "IP|TCP")
@@ -88,51 +83,8 @@ class INTERNETPROTOCOL_API UTCPServerSsl : public UObject
 	GENERATED_BODY()
 public:
 	UTCPServerSsl() {}
-	~UTCPServerSsl() {}
 
-	void Construct(const FSecurityContextOpts &SecOpts) {
-		file_format_e file_format = SecOpts.File_Format == EFileFormat::asn1 ? file_format_e::asn1 : file_format_e::pem;
-		if (!SecOpts.Private_Key.IsEmpty()) {
-			const asio::const_buffer buffer(SecOpts.Private_Key.GetCharArray().GetData(), SecOpts.Private_Key.Len());
-			net.ssl_context.use_private_key(buffer, file_format);
-		}
-
-		if (!SecOpts.Cert.IsEmpty()) {
-			const asio::const_buffer buffer(SecOpts.Cert.GetCharArray().GetData(), SecOpts.Cert.Len());
-			net.ssl_context.use_certificate(buffer, file_format);
-		}
-
-		if (!SecOpts.Cert_Chain.IsEmpty()) {
-			const asio::const_buffer buffer(SecOpts.Cert_Chain.GetCharArray().GetData(), SecOpts.Cert_Chain.Len());
-			net.ssl_context.use_certificate_chain(buffer);
-		}
-
-		if (!SecOpts.RSA_Private_Key.IsEmpty()) {
-			const asio::const_buffer buffer(SecOpts.RSA_Private_Key.GetCharArray().GetData(), SecOpts.RSA_Private_Key.Len());
-			net.ssl_context.use_rsa_private_key(buffer, file_format);
-		}
-
-		if (!SecOpts.Host_Name_Verification.IsEmpty()) {
-			net.ssl_context.set_verify_callback(asio::ssl::host_name_verification(TCHAR_TO_UTF8(*SecOpts.Host_Name_Verification)));
-		}
-
-		switch (SecOpts.Verify_Mode) {
-		case EVerifyMode::None:
-			net.ssl_context.set_verify_mode(asio::ssl::verify_none);
-			break;
-		case EVerifyMode::Verify_Peer:
-			net.ssl_context.set_verify_mode(asio::ssl::verify_peer);
-			break;
-		case EVerifyMode::Verify_Fail_If_No_Peer_Cert:
-			net.ssl_context.set_verify_mode(asio::ssl::verify_fail_if_no_peer_cert);
-			break;
-		case EVerifyMode::Verify_Client_Once:
-			net.ssl_context.set_verify_mode(asio::ssl::verify_client_once);
-			break;
-		default:
-			break;
-		}
-	}
+	void Construct(const FSecurityContextOpts &SecOpts);
 
 	virtual void BeginDestroy() override;
 
@@ -179,13 +131,10 @@ public:
 	FDelegateTcpServerError OnError;
 
 private:
-	bool is_being_destroyed = false;
-	FCriticalSection mutex_io;
-	FCriticalSection mutex_error;
-	TAtomic<bool> is_closing = false;
-	tcp_server_ssl_t<UTCPRemoteSsl> net;
-	asio::error_code error_code;
-
-	void run_context_thread();
-	void accept(const asio::error_code &error, UTCPRemoteSsl* remote);
+	friend struct IPNet::FFacadeAccess;
+	FIpServerState Server;
+	UPROPERTY(Transient)
+	TSet<UTCPRemoteSsl*> ClientSet;
+	std::shared_ptr<const IPNet::FTlsConfig> Tls;
+	void RemoveClient(UTCPRemoteSsl* Remote) { ClientSet.Remove(Remote); }
 };

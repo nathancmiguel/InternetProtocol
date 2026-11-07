@@ -3,12 +3,14 @@
  */
 
 #include "udp/udpserver.h"
+#include "net/acceptor.h"
+#include "net/facade.h"
+
+using IPNet::FFacadeAccess;
 
 void UUDPServer::BeginDestroy() {
-	is_being_destroyed = true;
-	if (net.socket.is_open())
-		Close();
-	UObject::BeginDestroy();
+	FFacadeAccess::ReleaseUdp(Net);
+	Super::BeginDestroy();
 }
 
 void UUDPServer::AddToRoot() {
@@ -24,21 +26,23 @@ bool UUDPServer::IsRooted() {
 }
 
 bool UUDPServer::IsOpen() {
-	return net.socket.is_open();
+	return Net.bOpen;
 }
 
 FUdpEndpoint UUDPServer::LocalEndpoint() {
-	udp::endpoint ep = net.socket.local_endpoint();
-	return FUdpEndpoint(ep);
+	return Net.Local;
 }
 
 FUdpEndpoint UUDPServer::RemoteEndpoint() {
-	udp::endpoint ep = net.socket.remote_endpoint();
-	return FUdpEndpoint(ep);
+	// Sender of the last datagram received.
+	return Net.Remote;
 }
 
 void UUDPServer::SetRecvBufferSize(int Val) {
-	recv_buffer_size = Val < 0 ? 0 : Val;
+	recv_buffer_size = FMath::Clamp(Val, 1, 65536);
+	if (Net.Socket) {
+		Net.Socket->SetReceiveBufferSize(static_cast<size_t>(recv_buffer_size));
+	}
 }
 
 int UUDPServer::GetRecvBufferSize() {
@@ -46,150 +50,67 @@ int UUDPServer::GetRecvBufferSize() {
 }
 
 FErrorCode UUDPServer::GetErrorCode() {
-	return FErrorCode(error_code);
+	return Net.LastError;
 }
 
-bool UUDPServer::SendTo(const FString& Message, const FUdpEndpoint& Endpoint,
-	const FDelegateUdpServerMessageSent& Callback) {
-	if (!net.socket.is_open() || Message.IsEmpty())
+bool UUDPServer::SendTo(const FString& Message, const FUdpEndpoint& Endpoint, const FDelegateUdpServerMessageSent& Callback) {
+	asio::ip::udp::endpoint Target;
+	if (!Net.Socket || !Net.bOpen || Message.IsEmpty() || !Endpoint.ToNative(Target)) {
 		return false;
-
-	net.socket.async_send_to(asio::buffer(TCHAR_TO_UTF8(*Message),  Message.Len()),
-								Endpoint.Endpoint,
-								[this, Callback](const asio::error_code &ec, size_t bytes_sent) {
-									AsyncTask(ENamedThreads::GameThread, [this, ec, Callback, bytes_sent]() {
-										if (!is_being_destroyed)
-											Callback.ExecuteIfBound(FErrorCode(ec), bytes_sent);
-									});
-								});
-	return true;
+	}
+	return Net.Socket->SendTo(IPNet::ToUtf8(Message), Target, IPNet::MakeSendCallback(this, Callback));
 }
 
-bool UUDPServer::SendBufferTo(const TArray<uint8>& Buffer, const FUdpEndpoint& Endpoint,
-	const FDelegateUdpServerMessageSent& Callback) {
-	if (!net.socket.is_open() || !Buffer.Num())
+bool UUDPServer::SendBufferTo(const TArray<uint8>& Buffer, const FUdpEndpoint& Endpoint, const FDelegateUdpServerMessageSent& Callback) {
+	asio::ip::udp::endpoint Target;
+	if (!Net.Socket || !Net.bOpen || Buffer.Num() == 0 || !Endpoint.ToNative(Target)) {
 		return false;
-
-	net.socket.async_send_to(asio::buffer(Buffer.GetData(),  Buffer.Num() * sizeof(Buffer.GetTypeSize())),
-								Endpoint.Endpoint,
-								[this, Callback](const asio::error_code &ec, size_t bytes_sent) {
-									AsyncTask(ENamedThreads::GameThread, [this, Callback, ec, bytes_sent]() {
-										if (!is_being_destroyed)
-											Callback.ExecuteIfBound(FErrorCode(ec), bytes_sent);
-									});
-								});
-	return true;
+	}
+	return Net.Socket->SendTo(IPNet::FBytes(Buffer.GetData(), Buffer.GetData() + Buffer.Num()), Target, IPNet::MakeSendCallback(this, Callback));
 }
 
 bool UUDPServer::Bind(const FServerBindOptions& BindOpts) {
-	if (net.socket.is_open())
-		return false;
-
-	net.socket.open(BindOpts.Protocol == EProtocolType::V4 ? udp::v4() : udp::v6(),
-					error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
+	if (Net.Socket) {
 		return false;
 	}
-	net.socket.set_option(asio::socket_base::reuse_address(BindOpts.bReuse_Address));
-	const udp::endpoint endpoint = BindOpts.Address.IsEmpty() ?
-								udp::endpoint(BindOpts.Protocol == EProtocolType::V4
-												? udp::v4()
-												: udp::v6(),
-												BindOpts.Port) :
-								udp::endpoint(
-									make_address(TCHAR_TO_UTF8(*BindOpts.Address)),
-									BindOpts.Port
-								);
-	net.socket.bind(endpoint, error_code);
-	if (error_code) {
-		FScopeLock lock(&mutex_error);
-		if (!is_being_destroyed)
-			OnError.Broadcast(FErrorCode(error_code));
+	const uint64 Id = IPNet::NextSessionId();
+	IPNet::FUdpEvents Events = FFacadeAccess::MakeUdpEvents(this, Id,
+		[](UUDPServer* Self, const TArray<uint8>& Buffer, const asio::ip::udp::endpoint& From) {
+			const FUdpEndpoint Sender(From);
+			Self->Net.Remote = Sender;
+			Self->OnMessage.Broadcast(Buffer, Buffer.Num(), Sender);
+		});
+	std::shared_ptr<IPNet::FUdpSocket> Socket = IPNet::FUdpSocket::Create(MoveTemp(Events), static_cast<size_t>(recv_buffer_size));
+	if (!Socket) {
+		FFacadeAccess::FailImmediately(this, IPNet::EError::NotRunning);
 		return false;
 	}
 
+	asio::ip::address Address;
+	asio::error_code Ec;
+	if (!IPNet::MakeListenAddress(BindOpts.Address, BindOpts.Protocol, Address) || BindOpts.Port < 0 || BindOpts.Port > 65535) {
+		Ec = IPNet::MakeError(IPNet::EError::InvalidArgument);
+	} else {
+		Socket->Bind(asio::ip::udp::endpoint(Address, static_cast<uint16>(BindOpts.Port)), BindOpts.bReuse_Address, Ec);
+	}
+	if (Ec) {
+		Socket->Close();
+		Net.LastError = FErrorCode(Ec);
+		OnError.Broadcast(Net.LastError);
+		return false;
+	}
+
+	Net.Socket = Socket;
+	Net.SessionId = Id;
+	Net.bOpen = true;
+	Net.Local = FUdpEndpoint(Socket->BoundEndpoint());
+	Net.Remote = FUdpEndpoint();
+	Net.LastError = FErrorCode();
+	Socket->Start();
 	OnListening.Broadcast();
-	
-	asio::post(thread_pool(), [this]{ run_context_thread(); });
 	return true;
 }
 
 void UUDPServer::Close() {
-	is_closing.Store(true);
-	if (net.socket.is_open()) {
-		FScopeLock lock(&mutex_error);
-		net.socket.shutdown(udp::socket::shutdown_both, error_code);
-		if (error_code)
-			AsyncTask(ENamedThreads::GameThread, [this]() {
-				if (!is_being_destroyed)
-					OnError.Broadcast(FErrorCode(error_code));
-			});
-		net.socket.close(error_code);
-		if (error_code)
-			AsyncTask(ENamedThreads::GameThread, [this]() {
-				if (!is_being_destroyed)
-					OnError.Broadcast(FErrorCode(error_code));
-			});
-	}
-	net.context.stop();
-	net.context.restart();
-	AsyncTask(ENamedThreads::GameThread, [this]() {
-		if (!is_being_destroyed)
-			OnClose.Broadcast();
-	});
-	is_closing.Store(false);
+	FFacadeAccess::CloseUdp(Net);
 }
-
-void UUDPServer::run_context_thread() {
-	FScopeLock lock(&mutex_io);
-	error_code.clear();
-	consume_receive_buffer();
-	net.socket.async_receive_from(asio::buffer(recv_buffer.GetData(), recv_buffer.Num() * sizeof(recv_buffer.GetTypeSize())),
-								  net.remote_endpoint,
-								  [this](const asio::error_code &ec, const size_t bytes_recvd) {
-									  receive_from_cb(ec, bytes_recvd);
-								  });
-	net.context.run();
-	if (net.socket.is_open() && !is_closing.Load())
-		Close();
-}
-
-void UUDPServer::consume_receive_buffer() {
-	if (recv_buffer.Num() > 0) 
-		recv_buffer.Empty();
-
-	if (recv_buffer.GetAllocatedSize() != recv_buffer_size) {
-		recv_buffer.Shrink();
-		recv_buffer.SetNumUninitialized(recv_buffer_size);
-	}
-}
-
-void UUDPServer::receive_from_cb(const asio::error_code& error, const size_t bytes_recvd) {
-	if (error) {
-		FScopeLock lock(&mutex_error);
-		error_code = error;
-		AsyncTask(ENamedThreads::GameThread, [this]() {
-			if (!is_being_destroyed)
-				OnError.Broadcast(FErrorCode(error_code));
-		});
-		return;
-	}
-
-	const TArray<uint8> buffer(recv_buffer.GetData(), bytes_recvd);
-	AsyncTask(ENamedThreads::GameThread, [this, buffer, bytes_recvd]() {
-		if (!is_being_destroyed)
-			OnMessage.Broadcast(buffer, bytes_recvd, FUdpEndpoint(net.remote_endpoint));
-	});
-
-	consume_receive_buffer();
-	net.socket.async_receive_from(asio::buffer(recv_buffer.GetData(), recv_buffer.Num() * sizeof(recv_buffer.GetTypeSize())),
-									net.remote_endpoint,
-									[this](const asio::error_code &ec, const size_t bytes_recvd) {
-										receive_from_cb(ec, bytes_recvd);
-									});
-}
-
-

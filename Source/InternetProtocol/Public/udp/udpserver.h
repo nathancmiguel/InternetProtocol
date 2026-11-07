@@ -5,7 +5,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "net/asio.h"
+#include "net/fwd.h"
 #include "udpserver.generated.h"
 
 /**
@@ -22,8 +22,7 @@ class INTERNETPROTOCOL_API UUDPServer : public UObject
 {
 	GENERATED_BODY()
 public:
-	UUDPServer() { recv_buffer.SetNumUninitialized(recv_buffer_size); }
-	~UUDPServer() {}
+	UUDPServer() {}
 
 	virtual void BeginDestroy() override;
 
@@ -78,16 +77,7 @@ public:
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|UDP|Events")
 	FDelegateUdpServerError OnError;
 private:
-	bool is_being_destroyed = false;
-	FCriticalSection mutex_io;
-	FCriticalSection mutex_error;
-	TAtomic<bool> is_closing = false;
-	udp_server_t net;
-	asio::error_code error_code;
-	size_t recv_buffer_size = 16384;
-	TArray<uint8> recv_buffer;
-
-	void run_context_thread();
-	void consume_receive_buffer();
-	void receive_from_cb(const asio::error_code &error, const size_t bytes_recvd);
+	friend struct IPNet::FFacadeAccess;
+	FIpUdpState Net;
+	int32 recv_buffer_size = 16384;
 };

@@ -1,11 +1,11 @@
-﻿/** 
+/** 
  * Copyright © 2025 Nathan Miguel
  */
 
 #pragma once
 
 #include "CoreMinimal.h"
-#include "net/asio.h"
+#include "net/fwd.h"
 #include "httpremote.generated.h"
 
 /**
@@ -22,13 +22,8 @@ class INTERNETPROTOCOL_API UHttpRemote : public UObject
 	GENERATED_BODY()
 public:
 	UHttpRemote() {}
-	~UHttpRemote() {}
 
 	virtual void BeginDestroy() override;
-
-	void Construct(asio::io_context &io_context, const uint8 timeout = 0);
-
-	void Destroy();
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
 	FHttpResponse Headers;
@@ -45,47 +40,31 @@ public:
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
 	FErrorCode GetErrorCode();
 
-	tcp::socket &get_socket();
-
 	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
 	bool Write(const FDelegateHttpRemoteMessageSent &Callback);
 
-	bool write();
-
-	void connect();
 	
 	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
 	void Close();
 
-	std::function<void(const FHttpRequest &)> on_request;
 	
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|HTTP|Events")
 	FDelegateHttpRemote OnClose;
-
-	std::function<void()> on_close;
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|HTTP|Events")
 	FDelegateHttpRemoteError OnError;
 	
 private:
-	bool is_being_destroyed = false;
-	FCriticalSection mutex_error;
-	TAtomic<bool> is_closing = false;
-	TUniquePtr<tcp::socket> socket;
-	TUniquePtr<asio::steady_timer> idle_timer;
-	uint8 idle_timeout_seconds = 0;
-	asio::error_code error_code;
-	bool will_close = false;
-	asio::streambuf recv_buffer;
-
-	void start_idle_timer();
-	void reset_idle_timer();
-	void write_cb(const asio::error_code &error, const size_t bytes_sent,
-					  const FDelegateHttpRemoteMessageSent &callback);
-	void write_error_cb(const asio::error_code &error, const size_t bytes_sent);
-	void consume_recv_buffer();
-	void read_cb(const asio::error_code &error, const size_t bytes_recvd);
-	void read_headers(const asio::error_code &error, const std::string &path, const std::string &version);
+	friend struct IPNet::FFacadeAccess;
+	friend struct IPNet::FHttpAccess;
+	FIpStreamState Net;
+	std::shared_ptr<IPNet::FHttpServerSession> Session;
+	bool bResponsePending = false;
+	bool bWillClose = false;
+	bool bHeadRequest = false;
+	/** Set by the owning server (Game Thread). */
+	TFunction<void(const FHttpRequest&)> OnRequestNative;
+	TFunction<void()> OnClosedNative;
 };
 
 UCLASS(Blueprintable, BlueprintType, Category = "IP|HTTP")
@@ -94,13 +73,8 @@ class INTERNETPROTOCOL_API UHttpRemoteSsl : public UObject
 	GENERATED_BODY()
 public:
 	UHttpRemoteSsl() {}
-	~UHttpRemoteSsl() {}
 
 	virtual void BeginDestroy() override;
-
-	void Construct(asio::io_context &io_context, asio::ssl::context &ssl_context, const uint8 timeout = 0);
-
-	void Destroy();
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
 	FHttpResponse Headers;
@@ -117,46 +91,30 @@ public:
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
 	FErrorCode GetErrorCode();
 
-	 asio::ssl::stream<tcp::socket> &get_socket();
 
 	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
 	bool Write(const FDelegateHttpRemoteMessageSent &Callback);
 
-	bool write();
-
-	void connect();
 	
 	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
 	void Close();
 
-	std::function<void(const FHttpRequest &)> on_request;
 	
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|HTTP|Events")
 	FDelegateHttpRemote OnClose;
-
-	std::function<void()> on_close;
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|HTTP|Events")
 	FDelegateHttpRemoteError OnError;
 	
 private:
-	bool is_being_destroyed = false;
-	FCriticalSection mutex_error;
-	TAtomic<bool> is_closing = false;
-	TUniquePtr<asio::ssl::stream<tcp::socket>> ssl_socket;
-	TUniquePtr<asio::steady_timer> idle_timer;
-	uint8 idle_timeout_seconds = 0;
-	asio::error_code error_code;
-	bool will_close = false;
-	asio::streambuf recv_buffer;
-
-	void start_idle_timer();
-	void reset_idle_timer();
-	void ssl_handshake(const asio::error_code &error);
-	void write_cb(const asio::error_code &error, const size_t bytes_sent,
-					  const FDelegateHttpRemoteMessageSent &callback);
-	void write_error_cb(const asio::error_code &error, const size_t bytes_sent);
-	void consume_recv_buffer();
-	void read_cb(const asio::error_code &error, const size_t bytes_recvd);
-	void read_headers(const asio::error_code &error, const std::string &path, const std::string &version);
+	friend struct IPNet::FFacadeAccess;
+	friend struct IPNet::FHttpAccess;
+	FIpStreamState Net;
+	std::shared_ptr<IPNet::FHttpServerSession> Session;
+	bool bResponsePending = false;
+	bool bWillClose = false;
+	bool bHeadRequest = false;
+	/** Set by the owning server (Game Thread). */
+	TFunction<void(const FHttpRequest&)> OnRequestNative;
+	TFunction<void()> OnClosedNative;
 };

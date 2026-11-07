@@ -4,60 +4,52 @@
 
 #include "utils/utils.h"
 #include "net/common.h"
-#include "utils/buffer.h"
 
 void UUtilsFunctionLibrary::JoinThreads() {
-	thread_pool().join();
+	UE_LOG(LogAsio, Warning, TEXT("InternetProtocol: JoinThreads is deprecated and does nothing (threads are managed by the plugin)."));
 }
 
 void UUtilsFunctionLibrary::StopThreads() {
-	thread_pool().stop();
+	UE_LOG(LogAsio, Warning, TEXT("InternetProtocol: StopThreads is deprecated and does nothing (threads are managed by the plugin)."));
 }
 
 FString UUtilsFunctionLibrary::BufferToString(const TArray<uint8>& Value) {
-	FUTF8ToTCHAR utf8_char(reinterpret_cast<const ANSICHAR*>(Value.GetData()), Value.Num());
-	FString str(utf8_char.Length(), utf8_char.Get());
-	return str;
+	if (Value.Num() == 0) {
+		return FString();
+	}
+	const FUTF8ToTCHAR Converter(reinterpret_cast<const ANSICHAR*>(Value.GetData()), Value.Num());
+	return FString(Converter.Length(), Converter.Get());
 }
 
 TArray<uint8> UUtilsFunctionLibrary::StringToByteArray(const FString& Value) {
 	TArray<uint8> Result;
-	Result.SetNum(Value.Len());
-    
-	for (int32 i = 0; i < Value.Len(); ++i) {
-		Result[i] = static_cast<uint8>(Value[i] & 0xFF);
+	if (Value.IsEmpty()) {
+		return Result;
 	}
-    
+	const FTCHARToUTF8 Converter(*Value, Value.Len());
+	Result.Append(reinterpret_cast<const uint8*>(Converter.Get()), Converter.Length());
 	return Result;
 }
 
 TArray<FString> UUtilsFunctionLibrary::SplitString(const FString& Str, const FString& Delimiter) {
 	TArray<FString> Tokens;
-    
 	if (Str.IsEmpty()) {
 		return Tokens;
 	}
-    
-	int32 StartIndex = 0;
-	int32 CurrentIndex = 0;
-	std::string str = TCHAR_TO_UTF8(*Str);
-	trim_whitespace(str);
-	FString trimmed_str(str.c_str());
-    
-	while (CurrentIndex < Str.Len()) {
-		if (trimmed_str[CurrentIndex] == Delimiter[0]) {
-			FString Token = trimmed_str.Mid(StartIndex, CurrentIndex - StartIndex);
-			Tokens.Add(Token);
-			StartIndex = CurrentIndex + 1;
+	if (Delimiter.IsEmpty()) {
+		Tokens.Add(Str);
+		return Tokens;
+	}
+	// Empty tokens between consecutive delimiters are kept (previous behaviour).
+	int32 Start = 0;
+	for (;;) {
+		const int32 Found = Str.Find(Delimiter, ESearchCase::CaseSensitive, ESearchDir::FromStart, Start);
+		if (Found == INDEX_NONE) {
+			Tokens.Add(Str.Mid(Start));
+			break;
 		}
-		CurrentIndex++;
+		Tokens.Add(Str.Mid(Start, Found - Start));
+		Start = Found + Delimiter.Len();
 	}
-    
-	if (StartIndex <= Str.Len()) {
-		FString LastToken = trimmed_str.Mid(StartIndex);
-		Tokens.Add(LastToken);
-	}
-    
 	return Tokens;
-
 }

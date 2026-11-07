@@ -5,10 +5,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "net/asio.h"
+#include "net/fwd.h"
 #include "udpclient.generated.h"
-
-using namespace asio::ip;
 
 /**
  * 
@@ -24,10 +22,7 @@ class INTERNETPROTOCOL_API UUDPClient: public UObject
 {
 	GENERATED_BODY()
 public:
-	UUDPClient() {
-		recv_buffer.SetNumUninitialized(recv_buffer_size);
-	};
-	~UUDPClient() {}
+	UUDPClient() {}
 
 	virtual void BeginDestroy() override;
 
@@ -83,18 +78,7 @@ public:
 	FDelegateUdpClientError OnError;
 
 private:
-	bool is_being_destroyed = false;
-	FCriticalSection mutex_io;
-	FCriticalSection mutex_error;
-	TAtomic<bool> is_closing = false;
-	udp_client_t net;
-	asio::error_code error_code;
-	size_t recv_buffer_size = 16384;
-	TArray<uint8> recv_buffer;
-
-	void run_context_thread();
-	void resolve(const asio::error_code &error, const udp::resolver::results_type &results);
-	void conn(const asio::error_code &error);
-	void consume_recv_buffer();
-	void receive_from_cb(const asio::error_code &error, const size_t bytes_recvd);
+	friend struct IPNet::FFacadeAccess;
+	FIpUdpState Net;
+	int32 recv_buffer_size = 16384;
 };
