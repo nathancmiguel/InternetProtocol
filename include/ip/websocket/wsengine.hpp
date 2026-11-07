@@ -67,6 +67,8 @@ namespace internetprotocol {
 
             /// Starts the closing handshake. `wait` => wait (bounded) for the peer's CLOSE before dropping TCP.
             void close(uint16_t code, std::string reason, bool wait) {
+                // Reserved / out-of-range codes (0, 1004-1006, 1015, ...) must never be sent on the wire.
+                if (!is_valid_close_code(code)) code = 1000;
                 asio::post(ex_, [self = shared_from_this(), code, reason = std::move(reason), wait] {
                     if (self->state() != OPEN) return;
                     self->local_code_ = code;
@@ -91,6 +93,7 @@ namespace internetprotocol {
             /// Feed raw bytes (strand only).
             void on_data(const uint8_t *p, std::size_t n) {
                 if (failed_ || peer_closed_) return;
+                parser_.set_max_frame(settings_->max_message_bytes.load(std::memory_order_relaxed));
                 const uint16_t err = parser_.feed(p, n, [this](ws_frame &&f) {
                     if (!failed_ && !peer_closed_) handle_frame(std::move(f));
                 });

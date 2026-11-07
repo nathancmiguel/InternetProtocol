@@ -364,7 +364,187 @@ static void test_websocket_invalid_peer() {
     server.close();
 }
 
+// ------------------------------------------------------------ regressions
+static void test_parser_limits() {
+    std::error_code ec;
+    // Chunked body followed by an endless stream of trailers must hit the header limit.
+    http_limits_t lim;
+    lim.max_header_bytes = 4096;
+    http_parser p(http_parser::kind::request, lim);
+    std::string raw = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n";
+    for (int i = 0; i < 1000; ++i) raw += "X-T" + std::to_string(i) + ": v\r\n";
+    p.feed(reinterpret_cast<const uint8_t *>(raw.data()), raw.size(), ec);
+    CHECK(ec == errc::message_too_big);
+
+    // Head split across many tiny chunks is still parsed.
+    http_parser q(http_parser::kind::request);
+    ec.clear();
+    const std::string req = "\r\nGET /x HTTP/1.1\r\nHost: h\r\n\r\nNEXT";
+    size_t used = 0;
+    for (size_t i = 0; i < req.size() && !q.done(); ++i)
+        used += q.feed(reinterpret_cast<const uint8_t *>(req.data()) + i, 1, ec);
+    CHECK(!ec && q.done() && q.request().path == "/x" && used == req.size() - 4);
+
+    // A frame header announcing 16 MiB is accepted without the payload (reservation is capped internally).
+    ws_frame_parser wp(32u << 20, false);
+    const uint8_t hdr[] = {0x82, 127, 0, 0, 0, 0, 0x01, 0, 0, 0};
+    size_t cap = 0;
+    CHECK(wp.feed(hdr, sizeof(hdr), [&](ws_frame &&f) { cap = f.payload.capacity(); }) == 0);
+    CHECK(cap == 0); // no frame completed
+}
+
+static void test_udp_lifecycle() {
+    {   // destroyed while resolving: must not leak a socket / receive loop
+        udp_client_c c;
+        CHECK(c.connect({"localhost", "9", v4}));
+    }
+    {   // close() cancels the pending connect
+        udp_client_c c;
+        std::atomic<bool> connected{false};
+        c.on_connected = [&] { connected = true; };
+        CHECK(c.connect({"localhost", "9", v4}));
+        c.close();
+        std::this_thread::sleep_for(200ms);
+        CHECK(!connected && !c.is_open());
+    }
+    // quick close -> bind cycles must leave exactly one working receive loop
+    udp_server_c server;
+    std::atomic<int> closes{0};
+    server.on_close = [&] { ++closes; };
+    for (int i = 0; i < 20; ++i) {
+        CHECK(server.bind({"127.0.0.1", 0, v4, true}));
+        server.close();
+    }
+    CHECK(server.bind({"127.0.0.1", 0, v4, true}));
+    std::promise<std::string> got;
+    server.on_message_received = [&](const std::vector<uint8_t> &b, size_t n, const udp::endpoint &) {
+        try { got.set_value(std::string(b.begin(), b.begin() + n)); } catch (...) {}
+    };
+    udp_client_c client;
+    client.on_connected = [&] { client.send("alive"); };
+    CHECK(client.connect({"127.0.0.1", std::to_string(server.local_endpoint().port()), v4}));
+    auto f = got.get_future();
+    CHECK(wait(f) && f.get() == "alive");
+    CHECK(server.is_open());
+    for (int i = 0; i < 50 && closes < 20; ++i) std::this_thread::sleep_for(10ms);
+    CHECK(closes == 20);
+    client.close();
+    server.close();
+}
+
+static void test_http_double_write() {
+    http_server_c server;
+    std::atomic<int> second_ok{-1};
+    server.get("/twice", [&](const http_request_t &, const std::shared_ptr<http_remote_c> &r) {
+        r->response.body = "first";
+        r->write();
+        r->response.body = "second";
+        second_ok = r->write() ? 1 : 0;
+    });
+    server.get("/next", [](const http_request_t &, const std::shared_ptr<http_remote_c> &r) {
+        r->response.body = "next";
+        r->write();
+    });
+    CHECK(server.open({"127.0.0.1", 0, v4, true}));
+    http_client_c client;
+    client.set_host({"127.0.0.1", port_of(server.local_endpoint()), v4});
+    std::promise<std::string> p1, p2;
+    http_request_t a; a.path = "/twice";
+    http_request_t b; b.path = "/next";
+    client.request(a, [&](const asio::error_code &, const http_response_t &r) { p1.set_value(r.body); });
+    client.request(b, [&](const asio::error_code &, const http_response_t &r) { p2.set_value(r.body); });
+    auto f1 = p1.get_future(), f2 = p2.get_future();
+    CHECK(wait(f1) && f1.get() == "first");
+    CHECK(wait(f2) && f2.get() == "next"); // stream not corrupted by the 2nd write
+    CHECK(second_ok == 0);
+    client.close();
+    server.close();
+}
+
+static void test_ws_handshake_failures() {
+    {   // server accepts TCP and closes without answering the upgrade
+        tcp_server_c tcp;
+        tcp.on_client_accepted = [](const std::shared_ptr<tcp_remote_c> &c) { c->close(); };
+        CHECK(tcp.open({"127.0.0.1", 0, v4, true}));
+        ws_client_c ws;
+        std::promise<std::error_code> p;
+        ws.on_error = [&](const asio::error_code &ec) { try { p.set_value(ec); } catch (...) {} };
+        CHECK(ws.connect({"127.0.0.1", port_of(tcp.local_endpoint()), v4}));
+        auto f = p.get_future();
+        CHECK(wait(f) && f.get() == errc::handshake_failed);
+        tcp.close();
+    }
+    {   // server never answers: bounded by connect_timeout
+        tcp_server_c tcp;
+        CHECK(tcp.open({"127.0.0.1", 0, v4, true}));
+        ws_client_c ws;
+        ws.options().connect_timeout = 300ms;
+        std::promise<std::error_code> p;
+        ws.on_error = [&](const asio::error_code &ec) { try { p.set_value(ec); } catch (...) {} };
+        CHECK(ws.connect({"127.0.0.1", port_of(tcp.local_endpoint()), v4}));
+        auto f = p.get_future();
+        CHECK(wait(f) && f.get() == errc::timeout);
+        tcp.close();
+    }
+}
+
+static void test_tcp_close_semantics() {
+    tcp_server_c server;
+    const std::string big(4 << 20, 'b');
+    std::atomic<long long> close_ms{-1};
+    server.on_client_accepted = [&](const std::shared_ptr<tcp_remote_c> &c) {
+        c->on_message_received = [&, w = std::weak_ptr<tcp_remote_c>(c)](const std::vector<uint8_t> &, size_t) {
+            if (auto s = w.lock()) {
+                s->write(big);
+                s->close(); // graceful: everything queued must still arrive
+            }
+        };
+    };
+    CHECK(server.open({"127.0.0.1", 0, v4, true}));
+    tcp_client_c client;
+    std::atomic<size_t> received{0};
+    std::promise<void> closed;
+    client.on_connected = [&] { client.write("go"); };
+    client.on_message_received = [&](const std::vector<uint8_t> &, size_t n) { received += n; };
+    client.on_close = [&] { try { closed.set_value(); } catch (...) {} };
+    CHECK(client.connect({"127.0.0.1", port_of(server.local_endpoint()), v4}));
+    auto fc = closed.get_future();
+    CHECK(wait(fc));
+    CHECK(received == big.size());
+
+    // abort() on an open client fires on_close
+    tcp_client_c c2;
+    std::promise<void> up, down;
+    c2.on_connected = [&] { up.set_value(); };
+    c2.on_close = [&] { try { down.set_value(); } catch (...) {} };
+    CHECK(c2.connect({"127.0.0.1", port_of(server.local_endpoint()), v4}));
+    auto fu = up.get_future();
+    CHECK(wait(fu));
+    c2.abort();
+    auto fd = down.get_future();
+    CHECK(wait(fd));
+
+    // server.close() from inside an I/O handler returns promptly
+    tcp_client_c c3;
+    std::promise<void> done;
+    server.on_client_accepted = [&](const std::shared_ptr<tcp_remote_c> &) {
+        const auto t0 = steady_clock::now();
+        server.close();
+        close_ms = std::chrono::duration_cast<milliseconds>(steady_clock::now() - t0).count();
+        done.set_value();
+    };
+    CHECK(c3.connect({"127.0.0.1", port_of(server.local_endpoint()), v4}));
+    auto fdn = done.get_future();
+    CHECK(wait(fdn));
+    CHECK(close_ms >= 0 && close_ms < 500);
+}
+
 int main() {
+    test_parser_limits();
+    test_udp_lifecycle();
+    test_http_double_write();
+    test_ws_handshake_failures();
+    test_tcp_close_semantics();
     test_utils();
     test_handshake();
     test_http_parser();

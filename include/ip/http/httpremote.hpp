@@ -32,15 +32,16 @@ namespace internetprotocol {
         http_response_t &headers() { return response; }
 
         /// Sends `response` and (if the client asked for it) closes the connection afterwards.
+        /// Exactly one response per request: further calls return false (a second response would corrupt the stream).
         bool write(const write_callback &callback = nullptr) {
+            if (responded_.exchange(true)) return false;
             if (!this->conn_->is_open()) return false;
             http_response_t res = response;
             if (will_close_) res.headers["Connection"] = "close";
             else if (!find_header(res.headers, "connection") && request_version_ == "1.0") res.headers["Connection"] = "keep-alive";
-            const std::string payload = prepare_response(res, head_request_);
             const bool close_after = will_close_;
             if (close_after) dead_.store(true);
-            const bool ok = this->conn_->write(std::string_view(payload), callback);
+            const bool ok = this->conn_->write_string(prepare_response(res, head_request_), callback);
             if (ok && close_after) this->conn_->close();
             auto self = this->shared_from_this();
             asio::post(this->conn_->get_executor(), [self] {
@@ -66,11 +67,16 @@ namespace internetprotocol {
                     if (ec) { s->set_error(ec); s->on_error(ec); }
                     s->on_close();
                     if (s->internal_on_closed) s->internal_on_closed();
+                    // Break `remote->on_xxx = [remote] {...}` cycles once the connection is over.
+                    s->on_request.reset();
+                    s->on_close.reset();
+                    s->on_error.reset();
                 });
             this->conn_->start();
         }
 
     private:
+        std::atomic<bool> responded_{true}; // no request pending yet
         http_limits_t limits_;
         http_parser parser_;
         std::string pending_;
@@ -124,12 +130,14 @@ namespace internetprotocol {
             response.body = status_text(status);
             response.headers["Content-Type"] = "text/plain";
             busy_ = true;
+            responded_.store(false);
             write();
             this->conn_->close();
         }
 
         void dispatch() {
             http_request_t &req = parser_.request();
+            responded_.store(false);
             response = {};
             response.status_code = 200;
             response.status_message = "OK";

@@ -89,8 +89,11 @@ namespace internetprotocol {
               on_message_received(*msg_),
               on_close(core_->on_close),
               on_error(core_->on_error) {
-            core_->data_hook = [m = msg_](const uint8_t *p, std::size_t n) {
-                if (*m) (*m)(std::vector<uint8_t>(p, p + n), n);
+            // Each connection gets its own copy of this hook (and of `buf`, reused across reads on its strand).
+            core_->data_hook = [m = msg_, buf = std::vector<uint8_t>()](const uint8_t *p, std::size_t n) mutable {
+                if (!*m) return;
+                buf.assign(p, p + n);
+                (*m)(buf, n);
             };
         }
 

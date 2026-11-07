@@ -143,6 +143,11 @@ namespace internetprotocol {
 
         void reset() { hdr_.clear(); in_payload_ = false; cur_ = {}; got_ = 0; }
 
+        /// Applies from the next frame header on.
+        void set_max_frame(size_t bytes) noexcept { max_frame_ = bytes; }
+
+        static constexpr size_t max_initial_reserve = 64u * 1024u;
+
         template<typename OnFrame>
         uint16_t feed(const uint8_t *d, size_t n, OnFrame &&on_frame) {
             size_t i = 0;
@@ -157,13 +162,14 @@ namespace internetprotocol {
                     }
                     continue;
                 }
-                const size_t take = std::min(n - i, static_cast<size_t>(len_ - got_));
+                const size_t take = static_cast<size_t>(std::min<uint64_t>(n - i, len_ - got_));
+                const size_t base = cur_.payload.size();
                 cur_.payload.insert(cur_.payload.end(), d + i, d + i + take);
+                if (cur_.masked) // unmask while the bytes are hot in cache
+                    for (size_t k = base; k < base + take; ++k) cur_.payload[k] ^= key_[k & 3];
                 got_ += take;
                 i += take;
                 if (got_ == len_) {
-                    if (cur_.masked)
-                        for (size_t k = 0; k < cur_.payload.size(); ++k) cur_.payload[k] ^= key_[k & 3];
                     on_frame(std::move(cur_));
                     reset();
                 }
@@ -217,7 +223,8 @@ namespace internetprotocol {
             got_ = 0;
             in_payload_ = len > 0;
             cur_.payload.clear();
-            cur_.payload.reserve(static_cast<size_t>(len));
+            // The length is peer controlled: never pre-allocate more than a modest amount before the bytes arrive.
+            cur_.payload.reserve(static_cast<size_t>(std::min<uint64_t>(len, max_initial_reserve)));
             return 0;
         }
     };

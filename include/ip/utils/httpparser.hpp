@@ -30,6 +30,7 @@ namespace internetprotocol {
             phase_ = phase::head;
             head_.clear();
             remaining_ = 0;
+            trailer_bytes_ = 0;
             line_.clear();
             request_ = {};
             response_ = {};
@@ -82,6 +83,7 @@ namespace internetprotocol {
         std::string head_;
         std::string line_;
         uint64_t remaining_ = 0;
+        size_t trailer_bytes_ = 0;
         bool head_response_ = false;
         http_request_t request_;
         http_response_t response_;
@@ -96,20 +98,25 @@ namespace internetprotocol {
         }
 
         size_t feed_head(const uint8_t *d, size_t n, std::error_code &ec) {
-            // Append byte-wise until CRLFCRLF; leading CRLFs before a message are tolerated (RFC 9112 §2.2).
+            // Leading CRLFs before a message are tolerated (RFC 9112 §2.2).
             size_t i = 0;
-            for (; i < n; ++i) {
-                const char c = static_cast<char>(d[i]);
-                if (head_.empty() && (c == '\r' || c == '\n')) continue;
-                head_.push_back(c);
-                if (head_.size() > limits_.max_header_bytes) { ec = errc::message_too_big; return i + 1; }
-                if (head_.size() >= 4 && head_.compare(head_.size() - 4, 4, "\r\n\r\n") == 0) {
-                    ++i;
-                    parse_head(ec);
-                    return i;
-                }
+            if (head_.empty())
+                while (i < n && (d[i] == '\r' || d[i] == '\n')) ++i;
+            if (i == n) return n;
+            // Append the whole chunk (bounded by the limit) and search CRLFCRLF only in the new region.
+            const size_t old = head_.size();
+            const size_t take = std::min(n - i, limits_.max_header_bytes + 1 - old);
+            head_.append(reinterpret_cast<const char *>(d + i), take);
+            const size_t pos = head_.find("\r\n\r\n", old >= 3 ? old - 3 : 0);
+            if (pos == std::string::npos) {
+                if (head_.size() > limits_.max_header_bytes) ec = errc::message_too_big;
+                return i + take;
             }
-            return i;
+            const size_t end = pos + 4;
+            if (end > limits_.max_header_bytes) { ec = errc::message_too_big; return i + take; }
+            head_.resize(end); // bytes past the head belong to the body / next message
+            parse_head(ec);
+            return i + (end - old);
         }
 
         void parse_head(std::error_code &ec) {
@@ -127,8 +134,9 @@ namespace internetprotocol {
                 detail::append_header(hdrs(), line);
                 pos = eol + 2;
             }
-            head_.clear();
-            head_.shrink_to_fit();
+            // Keep the buffer for the next keep-alive request unless an unusually large head inflated it.
+            if (head_.capacity() > 8192) std::string().swap(head_);
+            else head_.clear();
             decide_body(ec);
         }
 
@@ -263,7 +271,9 @@ namespace internetprotocol {
                 } else if (phase_ == phase::chunk_crlf) {
                     if (!l.empty()) { ec = errc::protocol_error; return i; }
                     phase_ = phase::chunk_size;
-                } else { // trailers
+                } else { // trailers: bounded by the header limit (otherwise unlimited lines could be appended)
+                    trailer_bytes_ += l.size() + 2;
+                    if (trailer_bytes_ > limits_.max_header_bytes) { ec = errc::message_too_big; return i; }
                     if (l.empty()) phase_ = phase::done;
                     else detail::append_header(hdrs(), l);
                 }

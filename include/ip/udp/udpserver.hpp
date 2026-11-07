@@ -53,9 +53,9 @@ namespace internetprotocol {
 
         /// Enables sending to broadcast addresses such as `address_v4::broadcast()`.
         bool set_broadcast(bool enable) {
-            std::error_code ec;
-            core_->socket().set_option(asio::socket_base::broadcast(enable), ec);
-            return !ec;
+            return !core_->with_socket([&](udp::socket &s, std::error_code &ec) {
+                s.set_option(asio::socket_base::broadcast(enable), ec);
+            });
         }
 
         /// Joins a multicast group on the default interface (or on `interface_address`). Call after bind().
@@ -69,10 +69,10 @@ namespace internetprotocol {
 
         /// Multicast TTL / hop limit and local loopback of outgoing multicast datagrams.
         bool set_multicast_options(unsigned ttl = 1, bool loopback = true) {
-            std::error_code ec;
-            core_->socket().set_option(asio::ip::multicast::hops(ttl), ec);
-            if (ec) { core_->report(ec); return false; }
-            core_->socket().set_option(asio::ip::multicast::enable_loopback(loopback), ec);
+            const auto ec = core_->with_socket([&](udp::socket &s, std::error_code &e) {
+                s.set_option(asio::ip::multicast::hops(static_cast<int>(ttl)), e);
+                if (!e) s.set_option(asio::ip::multicast::enable_loopback(loopback), e);
+            });
             if (ec) { core_->report(ec); return false; }
             return true;
         }
@@ -82,21 +82,35 @@ namespace internetprotocol {
             if (core_->is_open()) return false;
             std::error_code ec;
             udp::socket s(core_->executor());
-            const auto proto = bind_opts.protocol == v6 ? udp::v6() : udp::v4();
-            s.open(proto, ec);
-            if (ec) { core_->report(ec); return false; }
-            s.set_option(asio::socket_base::reuse_address(bind_opts.reuse_address), ec);
-            if (ec) { core_->report(ec); return false; }
-            udp::endpoint ep(proto, bind_opts.port);
+            udp::endpoint ep;
+            bool dual_stack = false;
             if (!bind_opts.address.empty()) {
                 const auto addr = make_address(bind_opts.address, ec);
                 if (ec) { core_->report(ec); return false; }
                 ep = udp::endpoint(addr, bind_opts.port);
+            } else if (bind_opts.protocol == unspecified) {
+                ep = udp::endpoint(udp::v6(), bind_opts.port); // dual-stack (IPv6 + IPv4-mapped)
+                dual_stack = true;
+            } else {
+                ep = udp::endpoint(bind_opts.protocol == v6 ? udp::v6() : udp::v4(), bind_opts.port);
             }
+            s.open(ep.protocol(), ec);
+            if (ec && dual_stack) { // no IPv6 on this host
+                ep = udp::endpoint(udp::v4(), bind_opts.port);
+                dual_stack = false;
+                ec.clear();
+                s.open(ep.protocol(), ec);
+            }
+            if (ec) { core_->report(ec); return false; }
+            if (dual_stack) {
+                std::error_code ig;
+                s.set_option(asio::ip::v6_only(false), ig);
+            }
+            s.set_option(asio::socket_base::reuse_address(bind_opts.reuse_address), ec);
+            if (ec) { core_->report(ec); return false; }
             s.bind(ep, ec);
             if (ec) { core_->report(ec); return false; }
             const udp::endpoint local = s.local_endpoint(ec);
-            // Keep a reference socket for option changes before activation moves it.
             return core_->activate(std::move(s), local, udp::endpoint());
         }
 
@@ -117,11 +131,15 @@ namespace internetprotocol {
             if (addr.is_v4()) {
                 const auto ifa = iface.empty() ? address_v4::any() : asio::ip::make_address_v4(iface, ec);
                 if (ec) { core_->report(ec); return false; }
-                if (join) core_->socket().set_option(asio::ip::multicast::join_group(addr.to_v4(), ifa), ec);
-                else core_->socket().set_option(asio::ip::multicast::leave_group(addr.to_v4(), ifa), ec);
+                ec = core_->with_socket([&](udp::socket &s, std::error_code &e) {
+                    if (join) s.set_option(asio::ip::multicast::join_group(addr.to_v4(), ifa), e);
+                    else s.set_option(asio::ip::multicast::leave_group(addr.to_v4(), ifa), e);
+                });
             } else {
-                if (join) core_->socket().set_option(asio::ip::multicast::join_group(addr), ec);
-                else core_->socket().set_option(asio::ip::multicast::leave_group(addr), ec);
+                ec = core_->with_socket([&](udp::socket &s, std::error_code &e) {
+                    if (join) s.set_option(asio::ip::multicast::join_group(addr), e);
+                    else s.set_option(asio::ip::multicast::leave_group(addr), e);
+                });
             }
             if (ec) { core_->report(ec); return false; }
             return true;

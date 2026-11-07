@@ -19,7 +19,7 @@ namespace internetprotocol {
 
         /// Sends text/bytes. Returns false if the connection is closed, the data is empty or the queue is full.
         bool write(const std::string &message, const write_callback &callback = nullptr) {
-            return this->conn_->write(std::string_view(message), callback);
+            return this->conn_->write_string(std::string(message), callback);
         }
 
         bool write_buffer(const std::vector<uint8_t> &buffer, const write_callback &callback = nullptr) {
@@ -38,10 +38,12 @@ namespace internetprotocol {
         /// Internal: begins reading. Called by the server after on_client_accepted.
         void start() {
             this->conn_->set_handlers(
-                [w = this->weak_from_this()](const uint8_t *p, std::size_t n) {
+                // The buffer is reused (keeps its capacity) across reads: handlers run serialised on the strand.
+                [w = this->weak_from_this(), buf = std::vector<uint8_t>()](const uint8_t *p, std::size_t n) mutable {
                     auto s = w.lock();
                     if (!s || !s->on_message_received) return;
-                    s->on_message_received(std::vector<uint8_t>(p, p + n), n);
+                    buf.assign(p, p + n);
+                    s->on_message_received(buf, n);
                 },
                 [w = this->weak_from_this()](const std::error_code &ec) {
                     auto s = w.lock();
@@ -49,8 +51,17 @@ namespace internetprotocol {
                     if (ec) { s->set_error(ec); s->on_error(ec); }
                     s->on_close();
                     if (s->internal_on_closed) s->internal_on_closed();
+                    s->release_events();
                 });
             this->conn_->start();
+        }
+
+    private:
+        /// Drops user handlers once the connection is over: breaks `remote->on_xxx = [remote] {...}` cycles.
+        void release_events() {
+            on_message_received.reset();
+            on_close.reset();
+            on_error.reset();
         }
     };
 

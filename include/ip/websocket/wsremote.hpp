@@ -140,7 +140,7 @@ namespace internetprotocol {
             res.headers["Upgrade"] = "websocket";
             res.headers["Connection"] = "Upgrade";
             res.headers["Sec-WebSocket-Accept"] = generate_accept_key(trim_whitespace(*find_header(req.headers, "sec-websocket-key")));
-            if (!this->conn_->write(std::string_view(prepare_response(res)))) return;
+            if (!this->conn_->write_string(prepare_response(res))) return;
 
             typename detail::ws_engine::hooks h;
             auto c = this->conn_;
@@ -171,18 +171,34 @@ namespace internetprotocol {
             res.headers["Connection"] = "close";
             res.headers["Content-Type"] = "text/plain";
             if (status == 426) res.headers["Sec-WebSocket-Version"] = "13";
-            this->conn_->write(std::string_view(prepare_response(res)));
+            {
+                std::lock_guard l(m_);
+                handshaking_ = false; // ignore whatever the peer sends while the rejection is flushed
+            }
+            this->conn_->write_string(prepare_response(res));
             this->conn_->close();
         }
 
         void on_closed(const std::error_code &ec) {
             auto e = engine();
+            {
+                std::lock_guard l(m_);
+                handshaking_ = false;
+            }
             if (ec) { this->set_error(ec); on_error(ec); }
             if (e) {
                 const auto st = e->on_transport_closed();
                 on_close(st.first, st.second);
             }
             if (this->internal_on_closed) this->internal_on_closed();
+            // Break `remote->on_xxx = [remote] {...}` cycles once the connection is over.
+            on_connected.reset();
+            on_unexpected_handshake.reset();
+            on_message_received.reset();
+            on_ping.reset();
+            on_pong.reset();
+            on_close.reset();
+            on_error.reset();
         }
     };
 

@@ -135,9 +135,8 @@ namespace internetprotocol {
                 }
                 uint16_t port = 0;
                 try { port = static_cast<uint16_t>(std::stoul(b.port)); } catch (...) {}
-                const std::string payload = prepare_request(req, b.address, port);
                 arm_timer(id);
-                if (!link->write(reinterpret_cast<const uint8_t *>(payload.data()), payload.size()))
+                if (!link->write_string(prepare_request(req, b.address, port)))
                     fail_front(make_error_code(errc::not_connected), id);
             }
 
@@ -154,7 +153,12 @@ namespace internetprotocol {
                 t->async_wait([w = this->weak_from_this(), id, t](const std::error_code &ec) {
                     if (ec) return;
                     if (auto s = w.lock()) {
-                        if (s->fail_front(make_error_code(errc::timeout), id)) s->link->abort();
+                        // Drop the connection BEFORE starting the next request: the late response of the timed-out
+                        // request must never be read as the answer to the next one. on_closed() resumes the queue.
+                        if (s->fail_front(make_error_code(errc::timeout), id, false)) {
+                            s->link->abort();
+                            s->pump();
+                        }
                     }
                 });
             }
@@ -165,7 +169,7 @@ namespace internetprotocol {
             }
 
             /// Completes the front request with an error. `id` guards against stale timers (0 = any).
-            bool fail_front(const std::error_code &ec, std::uint64_t id = 0) {
+            bool fail_front(const std::error_code &ec, std::uint64_t id = 0, bool resume = true) {
                 item it;
                 {
                     std::lock_guard l(m_);
@@ -177,7 +181,7 @@ namespace internetprotocol {
                     cancel_timer_locked();
                 }
                 finish(it.cb, ec, {});
-                pump();
+                if (resume) pump();
                 return true;
             }
 
@@ -240,8 +244,10 @@ namespace internetprotocol {
                 bool complete = false, retry = false, reconnect = false;
                 {
                     std::lock_guard l(m_);
-                    if (!inflight_) return;
-                    if (!sent_) { reconnect = true; }
+                    if (!inflight_) {
+                        if (q_.empty()) return;
+                        retry = true; // queued requests waiting for a fresh connection: pump() below
+                    } else if (!sent_) { reconnect = true; }
                     else {
                         ec = last_ec_ ? last_ec_ : make_error_code(errc::closed_by_peer);
                         std::error_code eof_ec;
@@ -313,8 +319,7 @@ namespace internetprotocol {
 
         /// Queues a request. The callback receives the parsed response or an error (timeout, connection closed, ...).
         void request(const http_request_t &req, const response_callback &response_cb) {
-            if (!state_->link->is_open())
-                state_->link->options().idle_timeout = std::chrono::seconds(idle_timeout_seconds);
+            state_->link->set_idle_timeout(std::chrono::seconds(idle_timeout_seconds)); // used by the next connect
             state_->request(req, response_cb);
         }
 

@@ -74,49 +74,44 @@ namespace internetprotocol {
             return clients_.size();
         }
 
+        /// `protocol = unspecified` with an empty address listens dual-stack (IPv6 + IPv4-mapped) when available.
         bool open(const server_bind_options_t &b) {
             std::error_code ec;
             {
-                std::lock_guard l(m_);
-                if (listening_.load()) return false;
+                std::unique_lock al(acc_m_);
+                {
+                    std::lock_guard l(m_);
+                    if (listening_.load()) return false;
 #ifdef IP_ENABLE_SSL
-                if constexpr (is_ssl_stream_v<Stream>) {
-                    if (!ssl_ctx_) ec = make_error_code(errc::tls_configuration);
-                    else ec = tls_ec_;
-                }
+                    if constexpr (is_ssl_stream_v<Stream>) {
+                        if (!ssl_ctx_) ec = make_error_code(errc::tls_configuration);
+                        else ec = tls_ec_;
+                    }
 #endif
+                }
+                if (ec) { al.unlock(); return report(ec); }
+                runtime::instance().start();
+                ec = open_locked(b);
+                if (ec) {
+                    std::error_code ig;
+                    acceptor_.close(ig);
+                    al.unlock();
+                    return report(ec);
+                }
+                {
+                    std::lock_guard l(m_);
+                    local_ = acceptor_.local_endpoint(ec);
+                    ec_.clear();
+                }
+                listening_.store(true, std::memory_order_release);
             }
-            if (ec) return report(ec);
-            runtime::instance().start();
-
-            const auto proto = b.protocol == v6 ? tcp::v6() : tcp::v4();
-            acceptor_.open(proto, ec);
-            if (ec) return report(ec);
-            acceptor_.set_option(asio::socket_base::reuse_address(b.reuse_address), ec);
-            if (ec) return fail_open(ec);
-            tcp::endpoint ep(proto, b.port);
-            if (!b.address.empty()) {
-                const auto addr = make_address(b.address, ec);
-                if (ec) return fail_open(ec);
-                ep = tcp::endpoint(addr, b.port);
-            }
-            acceptor_.bind(ep, ec);
-            if (ec) return fail_open(ec);
-            acceptor_.listen(backlog, ec);
-            if (ec) return fail_open(ec);
-            {
-                std::lock_guard l(m_);
-                local_ = acceptor_.local_endpoint(ec);
-                ec_.clear();
-            }
-            listening_.store(true, std::memory_order_release);
             on_listening();
             auto self = this->shared_from_this();
             asio::post(strand_, [self] { self->do_accept(); });
             return true;
         }
 
-        /// Stops listening and gracefully closes every client. Blocks (briefly) until the acceptor is closed.
+        /// Stops listening and gracefully closes every client. Never blocks on the I/O threads.
         void close() {
             std::vector<remote_ptr> rs;
             {
@@ -150,6 +145,8 @@ namespace internetprotocol {
         server_options_t opts_;
         strand_t strand_;
         tcp::acceptor acceptor_;
+        std::mutex acc_m_; // serialises every acceptor_ call (open / async_accept initiation / close)
+        std::atomic<std::size_t> pending_{0}; // accepted, not yet activated (TLS handshake in progress)
         mutable std::mutex m_;
         std::unordered_map<Remote *, remote_ptr> clients_;
         tcp::endpoint local_;
@@ -169,26 +166,45 @@ namespace internetprotocol {
             return false;
         }
 
-        bool fail_open(const std::error_code &ec) {
-            std::error_code ig;
-            acceptor_.close(ig);
-            return report(ec);
+        /// acc_m_ held. Opens, configures, binds and listens.
+        std::error_code open_locked(const server_bind_options_t &b) {
+            std::error_code ec;
+            tcp::endpoint ep;
+            bool dual_stack = false;
+            if (!b.address.empty()) {
+                const auto addr = make_address(b.address, ec);
+                if (ec) return ec;
+                ep = tcp::endpoint(addr, b.port);
+            } else if (b.protocol == unspecified) {
+                ep = tcp::endpoint(tcp::v6(), b.port);
+                dual_stack = true;
+            } else {
+                ep = tcp::endpoint(b.protocol == v6 ? tcp::v6() : tcp::v4(), b.port);
+            }
+            acceptor_.open(ep.protocol(), ec);
+            if (ec && dual_stack) { // no IPv6 on this host: fall back to IPv4
+                ep = tcp::endpoint(tcp::v4(), b.port);
+                dual_stack = false;
+                ec.clear();
+                acceptor_.open(ep.protocol(), ec);
+            }
+            if (ec) return ec;
+            if (dual_stack) {
+                std::error_code ig;
+                acceptor_.set_option(asio::ip::v6_only(false), ig);
+            }
+            acceptor_.set_option(asio::socket_base::reuse_address(b.reuse_address), ec);
+            if (ec) return ec;
+            acceptor_.bind(ep, ec);
+            if (ec) return ec;
+            acceptor_.listen(backlog, ec);
+            return ec;
         }
 
         void close_acceptor() {
+            std::lock_guard al(acc_m_);
             std::error_code ig;
-            if (strand_.running_in_this_thread()) {
-                acceptor_.close(ig);
-                return;
-            }
-            auto p = std::make_shared<std::promise<void>>();
-            auto f = p->get_future();
-            asio::post(strand_, [this, p] {
-                std::error_code e;
-                acceptor_.close(e);
-                p->set_value();
-            });
-            if (f.wait_for(std::chrono::seconds(2)) != std::future_status::ready) acceptor_.close(ig); // runtime stopped
+            acceptor_.close(ig); // pending async_accept completes with operation_aborted
         }
 
         Stream make_stream(const strand_t &s) {
@@ -202,7 +218,8 @@ namespace internetprotocol {
         }
 
         void do_accept() {
-            if (!acceptor_.is_open()) return;
+            std::lock_guard al(acc_m_);
+            if (!listening_.load(std::memory_order_acquire) || !acceptor_.is_open()) return;
             connection_options co;
             co.read_buffer_size = opts_.read_buffer_size;
             co.max_write_queue_bytes = opts_.max_write_queue_bytes;
@@ -231,10 +248,11 @@ namespace internetprotocol {
                 return;
             }
             do_accept();
-            if (opts_.max_connections && client_count() >= opts_.max_connections) {
+            if (opts_.max_connections && client_count() + pending_.load() >= opts_.max_connections) {
                 conn->discard();
                 return;
             }
+            pending_.fetch_add(1);
             asio::post(conn->get_executor(), [self = this->shared_from_this(), conn] { self->setup(conn); });
         }
 
@@ -253,6 +271,7 @@ namespace internetprotocol {
                                                [self, conn, timer](const std::error_code &e) {
                                                    timer->cancel();
                                                    if (e) {
+                                                       self->pending_.fetch_sub(1);
                                                        conn->discard();
                                                        self->report(e);
                                                        return;
@@ -266,10 +285,12 @@ namespace internetprotocol {
         }
 
         void activate(const std::shared_ptr<conn_t> &conn) {
-            remote_ptr remote = factory_(conn);
+            remote_ptr remote;
             {
                 std::lock_guard l(m_);
+                pending_.fetch_sub(1);
                 if (!listening_.load()) { conn->discard(); return; }
+                remote = factory_(conn);
                 clients_.emplace(remote.get(), remote);
             }
             remote->internal_on_closed = [w = this->weak_from_this(), raw = remote.get()] {

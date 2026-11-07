@@ -45,7 +45,20 @@ namespace internetprotocol {
         }
 #endif
 
+        /// Configure before connect(); not synchronised with a running connect/reconnect.
         client_options_t &options() { return opts_; }
+
+        /// Thread-safe copy of the current options.
+        client_options_t options_snapshot() const {
+            std::lock_guard l(m_);
+            return opts_;
+        }
+
+        /// Thread-safe update of the idle timeout used by the next (re)connect.
+        void set_idle_timeout(milliseconds t) {
+            std::lock_guard l(m_);
+            opts_.idle_timeout = t;
+        }
 
         bool is_open() const {
             std::lock_guard l(m_);
@@ -110,6 +123,12 @@ namespace internetprotocol {
         bool write(const uint8_t *data, std::size_t n, typename conn_t::write_callback cb = nullptr) {
             auto c = open_connection();
             return c && c->write(data, n, std::move(cb));
+        }
+
+        /// Queues a string without an extra copy.
+        bool write_string(std::string &&data, typename conn_t::write_callback cb = nullptr) {
+            auto c = open_connection();
+            return c && c->write_string(std::move(data), std::move(cb));
         }
 
         /// Graceful close: queued data is flushed first. Cancels reconnection.
@@ -207,13 +226,15 @@ namespace internetprotocol {
         void terminate(bool hard) {
             std::shared_ptr<conn_t> c;
             std::shared_ptr<asio::steady_timer> t;
-            bool was_open;
+            bool was_open, notify;
             {
                 std::lock_guard l(m_);
                 user_closed_ = true;
+                if (!hard && state_ == st::closing) return; // graceful close already in progress
                 t = std::move(reconnect_timer_);
                 c = conn_;
                 was_open = state_ == st::open;
+                notify = was_open || state_ == st::closing;
                 if (!was_open || hard) {
                     conn_.reset();
                     state_ = st::closed;
@@ -223,8 +244,12 @@ namespace internetprotocol {
             }
             if (t) t->cancel();
             if (!c) return;
-            if (hard) c->abort();
-            else if (was_open) c->close();
+            if (hard) {
+                c->abort();
+                // The connection was detached above, so on_conn_closed() will ignore it: notify here
+                // (no-op after shutdown(), which already released the events).
+                if (notify) on_close();
+            } else if (was_open) c->close();
             else c->discard();
         }
 
@@ -233,6 +258,7 @@ namespace internetprotocol {
             client_bind_options_t b;
             {
                 std::lock_guard l(m_);
+                if (user_closed_) return;
                 o = opts_;
                 b = bind_;
             }

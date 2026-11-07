@@ -56,6 +56,20 @@ namespace internetprotocol {
                 return link->connect(b);
             }
 
+            /// Ends the handshake phase. Returns true if it was still running (caller reports the outcome).
+            bool end_handshake() {
+                std::shared_ptr<asio::steady_timer> t;
+                bool was;
+                {
+                    std::lock_guard l(m_);
+                    was = handshaking_;
+                    handshaking_ = false;
+                    t = std::move(hs_timer_);
+                }
+                if (t) asio::post(t->get_executor(), [t] { t->cancel(); }); // timers are not thread-safe
+                return was;
+            }
+
             void shutdown() {
                 on_connected.reset();
                 on_unexpected_handshake.reset();
@@ -74,11 +88,38 @@ namespace internetprotocol {
             http_request_t sent_;
             http_parser resp_parser_;
             std::shared_ptr<ws_engine> eng_;
+            std::shared_ptr<asio::steady_timer> hs_timer_;
+            std::uint64_t hs_seq_ = 0;
             bool handshaking_ = false;
+
+            void arm_handshake_timer(std::uint64_t seq) {
+                const auto timeout = link->options_snapshot().connect_timeout;
+                auto ex = link->executor();
+                if (timeout.count() <= 0 || !ex) return;
+                auto t = std::make_shared<asio::steady_timer>(*ex);
+                {
+                    std::lock_guard l(m_);
+                    if (seq != hs_seq_ || !handshaking_) return;
+                    hs_timer_ = t;
+                }
+                t->expires_after(timeout);
+                t->async_wait([w = this->weak_from_this(), seq](const std::error_code &ec) {
+                    auto s = w.lock();
+                    if (ec || !s) return;
+                    {
+                        std::lock_guard l(s->m_);
+                        if (seq != s->hs_seq_ || !s->handshaking_) return;
+                    }
+                    s->end_handshake();
+                    s->on_error(make_error_code(errc::timeout));
+                    s->link->disconnect(true);
+                });
+            }
 
             void send_handshake() {
                 http_request_t req;
                 client_bind_options_t b;
+                std::uint64_t seq;
                 {
                     std::lock_guard l(m_);
                     req = hs_req_;
@@ -86,6 +127,7 @@ namespace internetprotocol {
                     resp_parser_.reset();
                     eng_.reset();
                     handshaking_ = true;
+                    seq = ++hs_seq_;
                 }
                 req.method = GET;
                 if (req.path.empty()) req.path = "/";
@@ -95,15 +137,18 @@ namespace internetprotocol {
                 req.headers["Sec-WebSocket-Version"] = "13";
                 uint16_t port = 0;
                 try { port = static_cast<uint16_t>(std::stoul(b.port)); } catch (...) {}
-                const std::string payload = prepare_request(req, b.address, port);
+                std::string payload = prepare_request(req, b.address, port);
                 {
                     std::lock_guard l(m_);
                     sent_ = req;
                 }
-                if (!link->write(reinterpret_cast<const uint8_t *>(payload.data()), payload.size())) {
+                if (!link->write_string(std::move(payload))) {
+                    end_handshake();
                     on_error(make_error_code(errc::not_connected));
                     link->disconnect(true);
+                    return;
                 }
+                arm_handshake_timer(seq); // bounded wait for the server's 101
             }
 
             void on_data(const uint8_t *p, std::size_t n) {
@@ -121,18 +166,20 @@ namespace internetprotocol {
                     sent = sent_;
                 }
                 if (ec) {
+                    end_handshake();
                     on_error(ec);
                     link->disconnect(true);
                     return;
                 }
                 if (!validate_handshake_response(sent, res)) {
+                    end_handshake();
                     on_unexpected_handshake(res);
                     on_error(make_error_code(errc::handshake_failed));
                     link->disconnect(true);
                     return;
                 }
                 auto ex = link->executor();
-                if (!ex) return;
+                if (!ex || !end_handshake()) return; // link gone, or the handshake already timed out
                 ws_engine::hooks h;
                 auto lk = link;
                 h.send = [lk](std::vector<uint8_t> &&d, ws_engine::write_cb cb) { return lk->write(std::move(d), std::move(cb)); };
@@ -146,7 +193,6 @@ namespace internetprotocol {
                 {
                     std::lock_guard l(m_);
                     eng_ = engine;
-                    handshaking_ = false;
                 }
                 on_connected(res);
                 engine->start_heartbeat();
@@ -154,13 +200,17 @@ namespace internetprotocol {
             }
 
             void on_link_closed() {
+                const bool was_handshaking = end_handshake();
                 std::shared_ptr<ws_engine> e;
                 {
                     std::lock_guard l(m_);
                     e = std::move(eng_);
-                    handshaking_ = false;
                 }
-                if (!e) return; // never reached OPEN: the error was already reported
+                if (!e) {
+                    // Closed by the server before (or instead of) answering the upgrade: report it.
+                    if (was_handshaking) on_error(make_error_code(errc::handshake_failed));
+                    return;
+                }
                 const auto st = e->on_transport_closed();
                 on_close(st.first, st.second);
             }
@@ -247,14 +297,14 @@ namespace internetprotocol {
         void end(const uint16_t code = 1000, const std::string &reason = "") {
             state_->link->cancel_reconnect();
             if (auto e = state_->engine()) e->close(code, reason, true);
-            else state_->link->close();
+            else { state_->end_handshake(); state_->link->close(); }
         }
 
         /// Sends CLOSE, flushes and closes TCP without waiting. Cancels reconnection.
         void close(const uint16_t code = 1000, const std::string &reason = "") {
             state_->link->cancel_reconnect();
             if (auto e = state_->engine()) e->close(code, reason, false);
-            else state_->link->close();
+            else { state_->end_handshake(); state_->link->close(); }
         }
 
         event<void(const http_response_t &)> &on_connected;
