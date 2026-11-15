@@ -85,3 +85,7 @@ UJavaScriptObjectNotation* UInternetProtocolSubsystem::CreateJson() {
 	UJavaScriptObjectNotation* json = NewObject<UJavaScriptObjectNotation>();
 	return json;
 }
+
+URTMPServer* UInternetProtocolSubsystem::CreateRTMPServer() {
+	return NewObject<URTMPServer>();
+}

@@ -14,6 +14,7 @@
 #include "websocket/wsserver.h"
 #include "websocket/wsclient.h"
 #include "json/json.h"
+#include "rtmp/rtmpserver.h"
 #include "Subsystems/WorldSubsystem.h"
 
 #include "ipsubsystem.generated.h"
@@ -71,6 +72,9 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category="IP|Subsystem")
 	UJavaScriptObjectNotation* CreateJson();
+
+	UFUNCTION(BlueprintCallable, Category="IP|Subsystem")
+	URTMPServer* CreateRTMPServer();
 private:
 	
 };
