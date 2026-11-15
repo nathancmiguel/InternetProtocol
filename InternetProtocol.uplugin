@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
-	"VersionName": "3.0.2",
+	"Version": 3,
+	"VersionName": "3.1.0",
 	"FriendlyName": "Internet Protocol",
-	"Description": "UDP, TCP, HTTP, Websocket and TLS conections.",
+	"Description": "UDP, TCP, HTTP, Websocket, RTMP and TLS connections, plus RTMP audio/video receive and publish.",
 	"Category": "Online",
 	"CreatedBy": "Nathan Miguel",
 	"CreatedByURL": "https://github.com/nathancmiguel",
@@ -22,12 +22,30 @@
 			"LoadingPhase": "PostDefault"
 		},
 		{
+			"Name": "InternetProtocolMedia",
+			"Type": "Runtime",
+			"PlatformAllowList": [
+				"Win64"
+			],
+			"LoadingPhase": "PostDefault"
+		},
+		{
 			"Name": "InternetProtocolTests",
 			"Type": "Editor",
 			"PlatformAllowList": [
 				"Win64"
 			],
 			"LoadingPhase": "PostDefault"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ElectraCodecs",
+			"Enabled": true
+		},
+		{
+			"Name": "ElectraUtil",
+			"Enabled": true
 		}
 	],
 	"IsBetaVersion": false,
