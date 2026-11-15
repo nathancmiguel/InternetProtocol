@@ -67,6 +67,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
 	void SetAllowedStreamKeys(const TArray<FString>& StreamKeys);
 
+	/** Enables RTMPS (RTMP over TLS) for the next Open. Requires a certificate and private key. */
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
+	void SetTlsOptions(const FSecurityContextOpts& SecOpts);
+
+	/** Disables RTMPS for the next Open. */
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
+	void ClearTlsOptions();
+
 	UPROPERTY(BlueprintAssignable, Category = "IP|RTMP|Events")
 	FDelegateRtmpServer OnListening;
 
@@ -90,4 +98,5 @@ private:
 	FTcpEndpoint Local;
 	FErrorCode LastError;
 	TArray<FString> AllowedKeys;
+	std::shared_ptr<const IPNet::FTlsConfig> Tls;
 };

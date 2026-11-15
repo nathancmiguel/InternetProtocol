@@ -466,6 +466,10 @@ namespace IPNet::Rtmp {
 				OnClosed();
 			}
 		};
+		if (Tls && !Tls->IsValid()) {
+			OutError = MakeError(EError::TlsSetupFailed);
+			return false;
+		}
 		Acceptor = FTcpAcceptor::Create(MoveTemp(Events));
 		if (!Acceptor) {
 			OutError = MakeError(EError::NotRunning);
@@ -552,7 +556,8 @@ namespace IPNet::Rtmp {
 		FTransportOptions Options;
 		// A publisher sends media continuously; 30 s of silence (or a stalled handshake) means it is gone.
 		Options.IdleTimeout = std::chrono::seconds(30);
-		std::shared_ptr<FTransport> Transport = MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events), Options);
+		std::shared_ptr<FTransport> Transport = Tls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events), Options)
+		                                            : MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events), Options);
 		if (!Transport) {
 			return;
 		}

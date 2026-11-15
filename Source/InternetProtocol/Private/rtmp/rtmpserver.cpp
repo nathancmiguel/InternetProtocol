@@ -53,6 +53,14 @@ void URTMPServer::SetAllowedStreamKeys(const TArray<FString>& StreamKeys) {
 	}
 }
 
+void URTMPServer::SetTlsOptions(const FSecurityContextOpts& SecOpts) {
+	Tls = MakeTlsConfig(SecOpts, true);
+}
+
+void URTMPServer::ClearTlsOptions() {
+	Tls.reset();
+}
+
 bool URTMPServer::Open(const FServerBindOptions& BindOpts) {
 	if (Core) {
 		return false;
@@ -105,6 +113,7 @@ bool URTMPServer::Open(const FServerBindOptions& BindOpts) {
 	}
 	std::shared_ptr<FRtmpServerCore> NewCore = FRtmpServerCore::Create(MoveTemp(Callbacks));
 	NewCore->SetAllowedStreamNames(AllowedKeys);
+	NewCore->SetTls(Tls);
 	if (!Ec) {
 		NewCore->Open(asio::ip::tcp::endpoint(Address, static_cast<uint16>(BindOpts.Port)), BindOpts.bReuse_Address, Backlog, Ec);
 	}

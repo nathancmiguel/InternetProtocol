@@ -9,6 +9,7 @@
 #include "rtmp/rtmpchunk.h"
 #include "rtmp/rtmphandshake.h"
 #include "net/acceptor.h"
+#include "net/tls.h"
 #include "net/transport.h"
 #include "HAL/CriticalSection.h"
 #include <functional>
@@ -114,6 +115,9 @@ namespace IPNet::Rtmp {
 		uint16 GetPort() const { return Port; }
 		asio::ip::tcp::endpoint GetLocalEndpoint() const;
 
+		/** rtmps:// ingest: call before Open. Null = plain RTMP. */
+		void SetTls(std::shared_ptr<const FTlsConfig> InTls) { Tls = MoveTemp(InTls); }
+
 		void SetAllowedStreamNames(TArray<FString> Names);
 		bool IsStreamNameAllowed(const FString& Name) const;
 
@@ -127,6 +131,7 @@ namespace IPNet::Rtmp {
 
 		FRtmpServerCallbacks Callbacks;
 		std::shared_ptr<FTcpAcceptor> Acceptor;
+		std::shared_ptr<const FTlsConfig> Tls;
 		uint16 Port = 0;
 		mutable FCriticalSection Lock;
 		TArray<FString> AllowedNames;
