@@ -25,6 +25,8 @@ public class InternetProtocolMedia : ModuleRules
 			"ElectraCodecFactory",
 			"ElectraSamples",
 			"AudioMixer",
+			// InternetProtocol public headers pull Asio's header-only SSL code: it must link OpenSSL here too.
+			"OpenSSL",
 		});
 	}
 }

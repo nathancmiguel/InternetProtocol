@@ -33,17 +33,18 @@ public class InternetProtocol : ModuleRules
 			}
 		);
 
+		// Public headers include asio/ssl.hpp, so dependents need the OpenSSL include paths too.
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"Core"
+				"Core",
+				"OpenSSL"
 			}
 		);
 
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"OpenSSL",
 				"SSL",
 				"Json",
 				"JsonUtilities",
