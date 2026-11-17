@@ -62,9 +62,20 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "RTMP Example")
 	TObjectPtr<UAudioComponent> SyncBeep;
 
-	/** Opens an RTMP server on Port and plays App/StreamKey on the screen. */
+	/**
+	 * Opens an RTMP server on Port and plays App/StreamKey on the screen. A non-empty ViewKey also lets RTMP players
+	 * (VLC, ffplay, OBS) watch it at rtmp://<this machine>:Port/App/ViewKey.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "RTMP Example")
-	bool StartReceiving(int32 Port, const FString& App, const FString& StreamKey, EIPRtmpLatencyMode Mode, int32 LatencyMs);
+	bool StartReceiving(int32 Port, const FString& App, const FString& StreamKey, EIPRtmpLatencyMode Mode, int32 LatencyMs, const FString& ViewKey = TEXT(""));
+
+	/** Plays a stream from an RTMP server on the screen (Url = rtmp(s)://host[:port]/app). */
+	UFUNCTION(BlueprintCallable, Category = "RTMP Example")
+	bool StartPulling(const FString& Url, const FString& StreamKey, EIPRtmpLatencyMode Mode, int32 LatencyMs);
+
+	/** Clients watching the local server (0 when it is closed). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "RTMP Example")
+	int32 GetViewerCount() const;
 
 	UFUNCTION(BlueprintCallable, Category = "RTMP Example")
 	void StopReceiving();
@@ -117,6 +128,7 @@ private:
 	void HandlePublisherError(const FString& Message);
 
 	void SetupBeep();
+	void BindScreen();
 	void ApplyInputMode();
 
 	UPROPERTY(Transient)

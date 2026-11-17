@@ -44,6 +44,8 @@ private:
 	UFUNCTION()
 	void OnStopReceive();
 	UFUNCTION()
+	void OnStartPull();
+	UFUNCTION()
 	void OnStartPublish();
 	UFUNCTION()
 	void OnStopPublish();
@@ -61,6 +63,9 @@ private:
 	UPROPERTY(Transient) TObjectPtr<UTextBlock> ReceiveStatus;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock> ReceiveStats;
 	UPROPERTY(Transient) TObjectPtr<UTextBlock> ReceiveHint;
+	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> ReceiveViewKey;
+	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> PullUrl;
+	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> PullKey;
 
 	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> PublishUrl;
 	UPROPERTY(Transient) TObjectPtr<UEditableTextBox> PublishKey;

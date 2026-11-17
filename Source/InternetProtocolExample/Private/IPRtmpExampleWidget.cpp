@@ -142,6 +142,7 @@ void UIPRtmpExampleWidget::BuildTree() {
 	ReceiveKey = AddField(Receive, TEXT("Stream key"), TEXT("demo"), true);
 	ReceiveMode = AddCombo(Receive, TEXT("Latency mode"), {TEXT("LowLatency"), TEXT("Smooth")}, 0);
 	ReceiveLatency = AddField(Receive, TEXT("Target latency (ms, 0 = default)"), TEXT("0"));
+	ReceiveViewKey = AddField(Receive, TEXT("View key for VLC (empty = off)"), TEXT(""), true);
 	{
 		UHorizontalBox* Buttons = WidgetTree->ConstructWidget<UHorizontalBox>();
 		Receive->AddChild(Buttons);
@@ -151,6 +152,18 @@ void UIPRtmpExampleWidget::BuildTree() {
 	ReceiveStatus = AddText(Receive, TEXT("Idle"), 12);
 	ReceiveStats = AddText(Receive, TEXT(""), 10, Muted);
 	ReceiveHint = AddText(Receive, TEXT(""), 10, Muted);
+
+	// ---- Pull ----
+	UVerticalBox* Pull = AddSection(Column, TEXT("Play from an RTMP server (server -> screen)"));
+	PullUrl = AddField(Pull, TEXT("Server URL"), TEXT("rtmp://127.0.0.1:1936/live"));
+	PullKey = AddField(Pull, TEXT("Stream / view key"), TEXT(""), true);
+	{
+		UHorizontalBox* Buttons = WidgetTree->ConstructWidget<UHorizontalBox>();
+		Pull->AddChild(Buttons);
+		AddButton(Buttons, TEXT("Play from server"))->OnClicked.AddDynamic(this, &UIPRtmpExampleWidget::OnStartPull);
+		AddButton(Buttons, TEXT("Stop"))->OnClicked.AddDynamic(this, &UIPRtmpExampleWidget::OnStopReceive);
+	}
+	AddText(Pull, TEXT("Uses the latency mode above. Status and stats are shown in the Receive section."), 10, Muted);
 
 	// ---- Publish ----
 	UVerticalBox* Publish = AddSection(Column, TEXT("Publish (Unreal -> RTMP server)"));
@@ -184,12 +197,27 @@ void UIPRtmpExampleWidget::OnStartReceive() {
 	const int32 Port = IntField(ReceivePort, 1935);
 	const FString App = ReceiveApp->GetText().ToString().TrimStartAndEnd();
 	const EIPRtmpLatencyMode Mode = ReceiveMode->GetSelectedIndex() == 1 ? EIPRtmpLatencyMode::Smooth : EIPRtmpLatencyMode::LowLatency;
-	if (Example->StartReceiving(Port, App, ReceiveKey->GetText().ToString().TrimStartAndEnd(), Mode, IntField(ReceiveLatency, 0))) {
-		// The key is shown masked; type it yourself in OBS/ffmpeg.
-		ReceiveHint->SetText(FText::FromString(FString::Printf(
+	const bool bViewers = !ReceiveViewKey->GetText().IsEmpty();
+	if (Example->StartReceiving(Port, App, ReceiveKey->GetText().ToString().TrimStartAndEnd(), Mode, IntField(ReceiveLatency, 0),
+	                            ReceiveViewKey->GetText().ToString().TrimStartAndEnd())) {
+		// Keys are shown masked; type them yourself in OBS/VLC.
+		FString Hint = FString::Printf(
 			TEXT("OBS: Server rtmp://<this machine>:%d/%s , Stream Key = the key above\nffmpeg: ffmpeg -re -i video.mp4 -c:v libx264 -c:a aac -f flv rtmp://<this machine>:%d/%s/<key>"),
-			Port, *App, Port, *App)));
+			Port, *App, Port, *App);
+		if (bViewers) {
+			Hint += FString::Printf(TEXT("\nVLC / ffplay: rtmp://<this machine>:%d/%s/<view key>"), Port, *App);
+		}
+		ReceiveHint->SetText(FText::FromString(Hint));
 	}
+}
+
+void UIPRtmpExampleWidget::OnStartPull() {
+	if (!Example) {
+		return;
+	}
+	const EIPRtmpLatencyMode Mode = ReceiveMode->GetSelectedIndex() == 1 ? EIPRtmpLatencyMode::Smooth : EIPRtmpLatencyMode::LowLatency;
+	Example->StartPulling(PullUrl->GetText().ToString().TrimStartAndEnd(), PullKey->GetText().ToString().TrimStartAndEnd(), Mode, IntField(ReceiveLatency, 0));
+	ReceiveHint->SetText(FText::GetEmpty());
 }
 
 void UIPRtmpExampleWidget::OnStopReceive() {
@@ -236,10 +264,14 @@ void UIPRtmpExampleWidget::NativeTick(const FGeometry& Geometry, float DeltaTime
 	PublishStatus->SetText(FText::FromString(Example->GetPublisherStatus()));
 
 	const FIPRtmpReceiverStats Rx = Example->GetReceiverStats();
-	ReceiveStats->SetText(Rx.VideoDecoder.IsEmpty() && Rx.AudioDecoder.IsEmpty() ? FText::GetEmpty() : FText::FromString(FString::Printf(
+	FString RxText = Rx.VideoDecoder.IsEmpty() && Rx.AudioDecoder.IsEmpty() ? FString() : FString::Printf(
 		TEXT("%dx%d  %.1f fps  %.0f kbit/s  buffer %.0f ms\ndropped video %lld  audio %lld  rebuffers %d\n%s | %s  %d Hz %d ch"),
 		Rx.Width, Rx.Height, Rx.Fps, Rx.BitrateKbps, Rx.BufferedMs, Rx.DroppedVideoFrames, Rx.DroppedAudioFrames, Rx.Rebuffers,
-		*Rx.VideoDecoder, *Rx.AudioDecoder, Rx.AudioSampleRate, Rx.AudioChannels)));
+		*Rx.VideoDecoder, *Rx.AudioDecoder, Rx.AudioSampleRate, Rx.AudioChannels);
+	if (Example->IsReceiving()) {
+		RxText += FString::Printf(TEXT("%sviewers: %d"), RxText.IsEmpty() ? TEXT("") : TEXT("\n"), Example->GetViewerCount());
+	}
+	ReceiveStats->SetText(FText::FromString(RxText));
 
 	const FIPRtmpPublisherStats Tx = Example->GetPublisherStats();
 	PublishStats->SetText(Tx.State == EIPRtmpPublisherState::Idle ? FText::GetEmpty() : FText::FromString(FString::Printf(

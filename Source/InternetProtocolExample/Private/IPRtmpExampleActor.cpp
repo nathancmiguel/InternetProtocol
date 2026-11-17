@@ -163,10 +163,17 @@ void AIPRtmpExampleActor::Tick(float DeltaSeconds) {
 	}
 }
 
-bool AIPRtmpExampleActor::StartReceiving(int32 Port, const FString& App, const FString& StreamKey, EIPRtmpLatencyMode Mode, int32 LatencyMs) {
+bool AIPRtmpExampleActor::StartReceiving(int32 Port, const FString& App, const FString& StreamKey, EIPRtmpLatencyMode Mode, int32 LatencyMs, const FString& ViewKey) {
 	StopReceiving();
 	if (!Server) {
 		Server = NewObject<URTMPServer>(this);
+	}
+	Server->ClearPlaybackKeys();
+	const bool bServeViewers = !ViewKey.IsEmpty() && Server->SetPlaybackKey(App, StreamKey, ViewKey);
+	Server->SetPlaybackEnabled(bServeViewers, 0);
+	if (!ViewKey.IsEmpty() && !bServeViewers) {
+		ReceiverStatus = TEXT("The view key must differ from the stream key");
+		return false;
 	}
 	FServerBindOptions Bind;
 	Bind.Address = TEXT("0.0.0.0");
@@ -179,6 +186,22 @@ bool AIPRtmpExampleActor::StartReceiving(int32 Port, const FString& App, const F
 		Server->Close();
 		return false;
 	}
+	BindScreen();
+	ReceiverStatus = FString::Printf(TEXT("Waiting for a publisher on rtmp://<this machine>:%d/%s/***"), Port, *App);
+	return true;
+}
+
+bool AIPRtmpExampleActor::StartPulling(const FString& Url, const FString& StreamKey, EIPRtmpLatencyMode Mode, int32 LatencyMs) {
+	StopReceiving();
+	if (!Receiver->StartPull(Url, StreamKey, Mode, LatencyMs)) {
+		return false;
+	}
+	BindScreen();
+	ReceiverStatus = TEXT("Connecting to the RTMP server...");
+	return true;
+}
+
+void AIPRtmpExampleActor::BindScreen() {
 	if (ScreenMID) {
 		ScreenMID->SetTextureParameterValue(ScreenTextureParameter, Receiver->GetVideoTexture());
 	}
@@ -186,8 +209,10 @@ bool AIPRtmpExampleActor::StartReceiving(int32 Port, const FString& App, const F
 		// Spatialized at the screen.
 		Sound->AttachToComponent(Screen, FAttachmentTransformRules::KeepRelativeTransform);
 	}
-	ReceiverStatus = FString::Printf(TEXT("Waiting for a publisher on rtmp://<this machine>:%d/%s/***"), Port, *App);
-	return true;
+}
+
+int32 AIPRtmpExampleActor::GetViewerCount() const {
+	return Server && Server->IsOpen() ? Server->GetViewerCount(FString()) : 0;
 }
 
 void AIPRtmpExampleActor::StopReceiving() {
@@ -276,7 +301,7 @@ void AIPRtmpExampleActor::HandleReceiverStarted() {
 }
 
 void AIPRtmpExampleActor::HandleReceiverEnded() {
-	ReceiverStatus = IsReceiving() ? TEXT("Publisher left, waiting for the next one") : TEXT("Idle");
+	ReceiverStatus = Receiver && Receiver->IsActive() ? TEXT("Stream ended, waiting for it to come back") : TEXT("Idle");
 }
 
 void AIPRtmpExampleActor::HandleReceiverError(const FString& Message) {
