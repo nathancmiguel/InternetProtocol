@@ -46,6 +46,18 @@
 		{
 			"Name": "ElectraUtil",
 			"Enabled": true
+		},
+		{
+			"Name": "AVCodecsCore",
+			"Enabled": true
+		},
+		{
+			"Name": "NVCodecs",
+			"Enabled": true
+		},
+		{
+			"Name": "AMFCodecs",
+			"Enabled": true
 		}
 	],
 	"IsBetaVersion": false,

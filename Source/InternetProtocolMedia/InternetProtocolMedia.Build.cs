@@ -4,7 +4,7 @@
 
 using UnrealBuildTool;
 
-/** RTMP audio/video receive (Electra decoders + Media Framework) and publish. Win64 only. */
+/** RTMP audio/video receive (Electra decoders + Media Framework) and publish (AVCodecs H.264 + Media Foundation AAC). Win64 only. */
 public class InternetProtocolMedia : ModuleRules
 {
 	public InternetProtocolMedia(ReadOnlyTargetRules Target) : base(Target)
@@ -25,8 +25,14 @@ public class InternetProtocolMedia : ModuleRules
 			"ElectraCodecFactory",
 			"ElectraSamples",
 			"AudioMixer",
+			// Publishing: AVCodecs (Experimental) hardware H.264 encoders, fed with RHI textures.
+			"AVCodecsCore",
+			"AVCodecsCoreRHI",
 			// InternetProtocol public headers pull Asio's header-only SSL code: it must link OpenSSL here too.
 			"OpenSSL",
 		});
+
+		// Media Foundation AAC encoder (Windows).
+		PublicSystemLibraries.AddRange(new string[] { "mfplat.lib", "mfuuid.lib", "wmcodecdspuuid.lib" });
 	}
 }

@@ -11,6 +11,6 @@ public class InternetProtocolTests : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		bUseRTTI = true;
-		PrivateDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InternetProtocol", "InternetProtocolMedia", "MediaAssets", "OpenSSL" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InternetProtocol", "InternetProtocolMedia", "MediaAssets", "OpenSSL", "RHI", "RenderCore" });
 	}
 }
