@@ -8,6 +8,7 @@
 #include "HAL/PlatformTime.h"
 #include "Modules/ModuleManager.h"
 #include "Player/IPRtmpPipeline.h"
+#include "Publish/IPPublishPipeline.h"
 #include "Player/IPRtmpPlayerFactory.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogIPMedia, Log, All);
@@ -42,16 +43,17 @@ void FInternetProtocolMediaModule::ShutdownModule()
 		GPlayerFactory.Reset();
 	}
 
-	// Decode threads stop on their own once their player is closed; at engine exit give them a bounded
+	// Decode/encode threads stop on their own once their player/publisher is closed; at engine exit give them a bounded
 	// moment so they do not run while the module is unloaded.
 	const double Deadline = FPlatformTime::Seconds() + 2.0;
-	while (IPMedia::FRtmpPipeline::GetRunningThreads() > 0 && FPlatformTime::Seconds() < Deadline)
+	auto Running = []() { return IPMedia::FRtmpPipeline::GetRunningThreads() + IPMedia::FPublishPipeline::GetRunningThreads(); };
+	while (Running() > 0 && FPlatformTime::Seconds() < Deadline)
 	{
 		FPlatformProcess::SleepNoStats(0.005f);
 	}
-	if (IPMedia::FRtmpPipeline::GetRunningThreads() > 0)
+	if (Running() > 0)
 	{
-		UE_LOG(LogIPMedia, Warning, TEXT("InternetProtocolMedia: %d decode thread(s) still running at shutdown."), IPMedia::FRtmpPipeline::GetRunningThreads());
+		UE_LOG(LogIPMedia, Warning, TEXT("InternetProtocolMedia: %d decode/encode thread(s) still running at shutdown."), Running());
 	}
 }
 
