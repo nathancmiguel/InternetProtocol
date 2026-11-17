@@ -18,6 +18,9 @@ public class InternetProtocolMedia : ModuleRules
 		{
 			"RHI",
 			"RenderCore",
+			"Renderer",
+			"Slate",
+			"SlateCore",
 			"Media",
 			"MediaUtils",
 			"ElectraBase",
