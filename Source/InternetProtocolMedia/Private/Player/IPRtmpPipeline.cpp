@@ -14,8 +14,16 @@ namespace IPMedia {
 	namespace {
 		constexpr int32 MaxInputItems = 600;
 		constexpr int64 MaxInputBytes = 48 * 1024 * 1024;
-		constexpr int32 MaxPendingVideo = 90;
+		/** Decoded video frames kept ahead of presentation: each pins a decoder output surface (see header). */
+		constexpr int32 MaxDecodedVideo = 6;
 		constexpr int32 MaxPendingAudio = 600;
+		/** Encoded packets kept in the jitter buffer (bounded independently of the latency target). */
+		constexpr int32 MaxEncodedVideo = 1800;
+		constexpr int32 MaxEncodedAudio = 3000;
+		/** How far ahead of the playout position audio packets are decoded. */
+		const FTimespan AudioDecodeLead = FTimespan::FromMilliseconds(250);
+		/** A video packet this far behind the position is skipped together with the rest of its GOP. */
+		const FTimespan VideoSkipThreshold = FTimespan::FromMilliseconds(400);
 		constexpr int64 DiscontinuityMs = 1000;
 		constexpr uint8 CodecH264 = 7;
 		constexpr uint8 CodecAac = 10;
@@ -171,13 +179,17 @@ namespace IPMedia {
 				Process(Input);
 			}
 			Batch.Reset();
-			PumpOutputs();
 			const double Now = FPlatformTime::Seconds();
+			UpdateClock(Now);
+			DecodeDue(Now);
+			PumpOutputs();
 			Release(Now);
 			UpdateStats(Now);
 		}
 		// Decoders are closed on the thread that used them.
 		ResetDecoders();
+		EncodedVideo.Reset();
+		EncodedAudio.Reset();
 		PendingVideo.Reset();
 		PendingAudio.Reset();
 	}
@@ -245,15 +257,13 @@ namespace IPMedia {
 			Events.Enqueue(EMediaEvent::MediaBuffering);
 			return;
 		case FInput::EKind::Ended:
-			if (VideoDecoder.IsValid()) {
-				VideoDecoder->Drain();
-			}
+			// Buffered media is still played out; the next publish continues the timeline.
+			bAnchored = false;
+			bWaitKeyframe = true;
 			{
 				FScopeLock ScopeLock(&StatsLock);
 				Stats.bStreaming = false;
 			}
-			bAnchored = false;
-			bWaitKeyframe = true;
 			return;
 		case FInput::EKind::Packet:
 			if (Input.Packet.Type == ERtmpPacketType::Video) {
@@ -294,7 +304,7 @@ namespace IPMedia {
 		}
 		bWaitKeyframe = false;
 
-		// Frame duration from metadata, else from consecutive timestamps.
+		// Frame duration from consecutive timestamps, else from metadata.
 		if (bHaveLast[0] && Packet.DtsMs > LastVideoDtsMs && Packet.DtsMs - LastVideoDtsMs < 200) {
 			LastVideoFrameMs = Packet.DtsMs - LastVideoDtsMs;
 		} else if (MetadataFps > 1.0) {
@@ -302,35 +312,22 @@ namespace IPMedia {
 		}
 		LastVideoDtsMs = Packet.DtsMs;
 
-		FIPAccessUnit Unit;
-		Unit.Data = Packet.Payload->GetData();
-		Unit.Size = Packet.Payload->Num();
-		Unit.Dts = MapTime(Packet.DtsMs, 0);
-		Unit.Pts = Unit.Dts + FTimespan::FromMilliseconds(Packet.CtsMs);
-		Unit.Duration = FTimespan::FromMilliseconds(static_cast<double>(FMath::Max<int64>(LastVideoFrameMs, 1)));
-		Unit.bKeyframe = Packet.bKeyframe;
-
-		for (int32 Attempt = 0; Attempt < 200 && !bStop.load(); ++Attempt) {
-			const EIPDecodeResult Result = VideoDecoder->Decode(Unit);
-			if (Result == EIPDecodeResult::Ok) {
-				return;
+		FEncoded Encoded;
+		Encoded.Data = Packet.Payload;
+		Encoded.Dts = MapTime(Packet.DtsMs, 0);
+		Encoded.Pts = Encoded.Dts + FTimespan::FromMilliseconds(Packet.CtsMs);
+		Encoded.Duration = FTimespan::FromMilliseconds(static_cast<double>(FMath::Max<int64>(LastVideoFrameMs, 1)));
+		Encoded.bKeyframe = Packet.bKeyframe;
+		if (EncodedVideo.Num() >= MaxEncodedVideo) {
+			// Far more than any latency target: start over at the next keyframe.
+			{
+				FScopeLock ScopeLock(&StatsLock);
+				Stats.DroppedVideoFrames += EncodedVideo.Num();
 			}
-			if (Result == EIPDecodeResult::Error) {
-				ReportError(FString::Printf(TEXT("video decode failed: %s"), *VideoDecoder->GetLastError()));
-				// Recreate on the next sequence header / keyframe.
-				VideoDecoder->Close();
-				VideoDecoder.Reset();
-				bVideoConfigured = false;
-				bWaitKeyframe = true;
-				return;
-			}
-			// Busy: the decoder needs its outputs to be taken first.
-			PumpOutputs();
-			Release(FPlatformTime::Seconds());
-			FPlatformProcess::SleepNoStats(0.001f);
+			EncodedVideo.Reset();
+			bSkipToKeyframe = true;
 		}
-		FScopeLock ScopeLock(&StatsLock);
-		++Stats.DroppedVideoFrames;
+		EncodedVideo.Add(MoveTemp(Encoded));
 	}
 
 	void FRtmpPipeline::ProcessAudio(const FRtmpMediaPacket& Packet) {
@@ -372,27 +369,129 @@ namespace IPMedia {
 		if (bHasVideoTrack && bWaitKeyframe) {
 			return;
 		}
-		FIPAccessUnit Unit;
-		Unit.Data = Packet.Payload->GetData();
-		Unit.Size = Packet.Payload->Num();
-		Unit.Dts = MapTime(Packet.DtsMs, 1);
-		Unit.Pts = Unit.Dts;
-		Unit.Duration = FTimespan::FromSeconds(1024.0 / AudioSampleRate);
-		Unit.bKeyframe = true;
-		for (int32 Attempt = 0; Attempt < 200 && !bStop.load(); ++Attempt) {
-			const EIPDecodeResult Result = AudioDecoder->Decode(Unit);
-			if (Result == EIPDecodeResult::Ok) {
-				return;
+		FEncoded Encoded;
+		Encoded.Data = Packet.Payload;
+		Encoded.Dts = MapTime(Packet.DtsMs, 1);
+		Encoded.Pts = Encoded.Dts;
+		Encoded.Duration = FTimespan::FromSeconds(1024.0 / AudioSampleRate);
+		Encoded.bKeyframe = true;
+		if (EncodedAudio.Num() >= MaxEncodedAudio) {
+			EncodedAudio.RemoveAt(0);
+			FScopeLock ScopeLock(&StatsLock);
+			++Stats.DroppedAudioFrames;
+		}
+		EncodedAudio.Add(MoveTemp(Encoded));
+	}
+
+	void FRtmpPipeline::UpdateClock(double Now) {
+		if (bPaused.load()) {
+			bWasPaused = true;
+			return;
+		}
+		if (bWasPaused) {
+			// Live streams cannot resume where they paused: rebuffer from the current data.
+			bWasPaused = false;
+			Clock.Reset();
+		}
+		// Audio is the master track when present (the sound component drives the A/V clock). Buffered media is
+		// everything not yet presented: decoded samples plus encoded packets.
+		bool bHasPending = false;
+		FTimespan Earliest = FTimespan::MaxValue(), Latest = FTimespan::MinValue();
+		auto Consider = [&](FTimespan Pts) {
+			bHasPending = true;
+			Earliest = FMath::Min(Earliest, Pts);
+			Latest = FMath::Max(Latest, Pts);
+		};
+		if (bHasAudioTrack) {
+			if (PendingAudio.Num()) { Consider(PendingAudio[0].Pts); Consider(PendingAudio.Last().Pts); }
+			if (EncodedAudio.Num()) { Consider(EncodedAudio[0].Pts); Consider(EncodedAudio.Last().Pts); }
+		} else {
+			if (PendingVideo.Num()) { Consider(PendingVideo[0].Pts); Consider(PendingVideo.Last().Pts); }
+			if (EncodedVideo.Num()) { Consider(EncodedVideo[0].Pts); Consider(EncodedVideo.Last().Pts); }
+		}
+		const bool bWasPlaying = Clock.IsPlaying();
+		const int32 RebuffersBefore = Clock.GetRebufferCount();
+		Clock.Update(Now, bHasPending, bHasPending ? Earliest : FTimespan(), bHasPending ? Latest : FTimespan());
+		if (!bWasPlaying && Clock.IsPlaying()) {
+			Events.Enqueue(EMediaEvent::MediaBufferingComplete);
+		} else if (Clock.GetRebufferCount() != RebuffersBefore) {
+			Events.Enqueue(EMediaEvent::MediaBuffering);
+		}
+		if (Clock.IsPlaying()) {
+			PositionTicks.store(Clock.GetPosition(Now).GetTicks());
+		}
+	}
+
+	void FRtmpPipeline::DecodeDue(double Now) {
+		if (!Clock.IsPlaying()) {
+			return;
+		}
+		const FTimespan Position = Clock.GetPosition(Now);
+
+		// Video: skip what can no longer be shown (catch-up after a stall), restarting at a keyframe.
+		while (EncodedVideo.Num() > 0 && (bSkipToKeyframe || EncodedVideo[0].Pts + VideoSkipThreshold < Position)) {
+			if (EncodedVideo[0].bKeyframe && EncodedVideo[0].Pts + VideoSkipThreshold >= Position) {
+				bSkipToKeyframe = false;
+				break;
 			}
+			bSkipToKeyframe = true;
+			EncodedVideo.RemoveAt(0, EAllowShrinking::No);
+			FScopeLock ScopeLock(&StatsLock);
+			++Stats.DroppedVideoFrames;
+		}
+		// Video is fed as long as few decoded frames wait: the decoder holds a whole reorder window (up to 16 frames
+		// for H.264) before its first output, so a time-based lead would starve it. Decoded frames stay bounded.
+		while (VideoDecoder.IsValid() && bVideoConfigured && !bSkipToKeyframe && EncodedVideo.Num() > 0 &&
+		       PendingVideo.Num() < MaxDecodedVideo) {
+			const FEncoded& Front = EncodedVideo[0];
+			FIPAccessUnit Unit;
+			Unit.Data = Front.Data->GetData();
+			Unit.Size = Front.Data->Num();
+			Unit.Dts = Front.Dts;
+			Unit.Pts = Front.Pts;
+			Unit.Duration = Front.Duration;
+			Unit.bKeyframe = Front.bKeyframe;
+			const EIPDecodeResult Result = VideoDecoder->Decode(Unit);
+			if (Result == EIPDecodeResult::Busy) {
+				// Retried on the next loop iteration, once outputs have been taken.
+				break;
+			}
+			EncodedVideo.RemoveAt(0, EAllowShrinking::No);
+			if (Result == EIPDecodeResult::Error) {
+				ReportError(FString::Printf(TEXT("video decode failed: %s"), *VideoDecoder->GetLastError()));
+				bSkipToKeyframe = true;
+				break;
+			}
+			PumpOutputs();
+		}
+
+		while (AudioDecoder.IsValid() && bAudioConfigured && EncodedAudio.Num() > 0 && EncodedAudio[0].Pts <= Position + AudioDecodeLead) {
+			const FEncoded& Front = EncodedAudio[0];
+			if (Front.Pts + Front.Duration < Position) {
+				// Too late to be heard: do not even decode it.
+				EncodedAudio.RemoveAt(0, EAllowShrinking::No);
+				FScopeLock ScopeLock(&StatsLock);
+				++Stats.DroppedAudioFrames;
+				continue;
+			}
+			FIPAccessUnit Unit;
+			Unit.Data = Front.Data->GetData();
+			Unit.Size = Front.Data->Num();
+			Unit.Dts = Front.Dts;
+			Unit.Pts = Front.Pts;
+			Unit.Duration = Front.Duration;
+			Unit.bKeyframe = true;
+			const EIPDecodeResult Result = AudioDecoder->Decode(Unit);
+			if (Result == EIPDecodeResult::Busy) {
+				break;
+			}
+			EncodedAudio.RemoveAt(0, EAllowShrinking::No);
 			if (Result == EIPDecodeResult::Error) {
 				ReportError(FString::Printf(TEXT("audio decode failed: %s"), *AudioDecoder->GetLastError()));
 				FScopeLock ScopeLock(&StatsLock);
 				++Stats.DroppedAudioFrames;
-				return;
 			}
 			PumpOutputs();
-			Release(FPlatformTime::Seconds());
-			FPlatformProcess::SleepNoStats(0.001f);
 		}
 	}
 
@@ -400,16 +499,14 @@ namespace IPMedia {
 		if (VideoDecoder.IsValid()) {
 			TSharedPtr<IMediaTextureSample, ESPMode::ThreadSafe> Sample;
 			FIntPoint Dim;
+			bool bAdded = false;
 			while (VideoDecoder->GetOutput(Sample, Dim)) {
-				const FTimespan Pts = Sample->GetTime().Time;
-				PendingVideo.Add(FDecodedVideo{Sample, Pts, Sample->GetDuration(), Dim});
+				PendingVideo.Add(FDecodedVideo{Sample, Sample->GetTime().Time, Sample->GetDuration(), Dim});
 				Sample.Reset();
+				bAdded = true;
 			}
-			PendingVideo.StableSort([](const FDecodedVideo& A, const FDecodedVideo& B) { return A.Pts < B.Pts; });
-			while (PendingVideo.Num() > MaxPendingVideo) {
-				PendingVideo.RemoveAt(0);
-				FScopeLock ScopeLock(&StatsLock);
-				++Stats.DroppedVideoFrames;
+			if (bAdded) {
+				PendingVideo.StableSort([](const FDecodedVideo& A, const FDecodedVideo& B) { return A.Pts < B.Pts; });
 			}
 		}
 		if (AudioDecoder.IsValid()) {
@@ -427,37 +524,10 @@ namespace IPMedia {
 	}
 
 	void FRtmpPipeline::Release(double Now) {
-		if (bPaused.load()) {
-			bWasPaused = true;
+		if (!Clock.IsPlaying() || bPaused.load()) {
 			return;
 		}
-		if (bWasPaused) {
-			// Live streams cannot resume where they paused: rebuffer from the current data.
-			bWasPaused = false;
-			Clock.Reset();
-		}
-
-		// Audio is the master track when present (the sound component drives the A/V clock).
 		const bool bAudioMaster = bHasAudioTrack;
-		const bool bHasPending = bAudioMaster ? PendingAudio.Num() > 0 : PendingVideo.Num() > 0;
-		FTimespan Earliest, Latest;
-		if (bHasPending) {
-			Earliest = bAudioMaster ? PendingAudio[0].Pts : PendingVideo[0].Pts;
-			Latest = bAudioMaster ? PendingAudio.Last().Pts : PendingVideo.Last().Pts;
-		}
-		const bool bWasPlaying = Clock.IsPlaying();
-		const int32 RebuffersBefore = Clock.GetRebufferCount();
-		Clock.Update(Now, bHasPending, Earliest, Latest);
-		if (!bWasPlaying && Clock.IsPlaying()) {
-			Events.Enqueue(EMediaEvent::MediaBufferingComplete);
-		} else if (Clock.GetRebufferCount() != RebuffersBefore) {
-			Events.Enqueue(EMediaEvent::MediaBuffering);
-		}
-		if (!Clock.IsPlaying()) {
-			return;
-		}
-		PositionTicks.store(Clock.GetPosition(Now).GetTicks());
-
 		int64 DroppedAudio = 0, DroppedVideo = 0;
 		while (PendingAudio.Num() > 0) {
 			const FDecodedAudio& Front = PendingAudio[0];
@@ -525,11 +595,14 @@ namespace IPMedia {
 			BytesAtWindowStart = Bytes;
 			StatsWindowStart = Now;
 		}
-		const TArray<FDecodedAudio>& AudioQueue = PendingAudio;
 		Stats.BufferedMs = 0.0f;
 		if (Clock.IsPlaying()) {
-			const FTimespan Newest = bHasAudioTrack ? (AudioQueue.Num() ? AudioQueue.Last().Pts : FTimespan::Zero())
-			                                        : (PendingVideo.Num() ? PendingVideo.Last().Pts : FTimespan::Zero());
+			FTimespan Newest = FTimespan::Zero();
+			if (bHasAudioTrack) {
+				Newest = EncodedAudio.Num() ? EncodedAudio.Last().Pts : (PendingAudio.Num() ? PendingAudio.Last().Pts : FTimespan::Zero());
+			} else {
+				Newest = EncodedVideo.Num() ? EncodedVideo.Last().Pts : (PendingVideo.Num() ? PendingVideo.Last().Pts : FTimespan::Zero());
+			}
 			Stats.BufferedMs = FMath::Max(0.0f, static_cast<float>((Newest - Clock.GetPosition(Now)).GetTotalMilliseconds()));
 		}
 		Stats.Rebuffers = Clock.GetRebufferCount();

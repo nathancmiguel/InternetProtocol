@@ -19,7 +19,7 @@ namespace IPMedia {
 
 	FRtmpMediaPlayer::FRtmpMediaPlayer(IMediaEventSink& InEventSink) : EventSink(InEventSink) {
 		// Few queued video frames (they are released just in time), enough audio blocks for the sound component.
-		Samples = MakeShared<FMediaSamples, ESPMode::ThreadSafe>(128, 8);
+		Samples = MakeShared<FMediaSamples, ESPMode::ThreadSafe>(128, 4);
 	}
 
 	FRtmpMediaPlayer::~FRtmpMediaPlayer() {
@@ -106,6 +106,9 @@ namespace IPMedia {
 	bool FRtmpMediaPlayer::GetPlayerFeatureFlag(EFeatureFlag Flag) const {
 		switch (Flag) {
 		case EFeatureFlag::UsePlaybackTimingV2:
+		// The pipeline releases each frame at its presentation time (live playout clock): the facade shows the
+		// newest one instead of re-timing frames with its own estimate.
+		case EFeatureFlag::AlwaysPullNewestVideoFrame:
 		case EFeatureFlag::UseRealtimeWithVideoOnly:
 		case EFeatureFlag::PlayerUsesInternalFlushOnSeek:
 		case EFeatureFlag::IsTrackSwitchSeamless:

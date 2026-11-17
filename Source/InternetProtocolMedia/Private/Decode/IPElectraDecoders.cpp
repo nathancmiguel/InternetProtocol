@@ -48,6 +48,36 @@ namespace IPMedia {
 			FTimespan Pts;
 			FTimespan Duration;
 		};
+
+		/**
+		 * avcC record -> SPS/PPS as an Annex-B byte stream (00 00 00 01 + NAL). The Windows H.264 decoder expects
+		 * this in the "csd" option and prepends it to every IDR frame; "dcr" (the avcC) is used by the bitstream
+		 * processor to convert AVCC lengths. Returns an empty array if the record is malformed.
+		 */
+		TArray<uint8> AvcCToAnnexBParameterSets(const TArray<uint8>& Record) {
+			TArray<uint8> Out;
+			if (Record.Num() < 7 || Record[0] != 1) {
+				return Out;
+			}
+			int32 Pos = 5;
+			auto CopySets = [&](int32 Count) {
+				for (int32 Index = 0; Index < Count; ++Index) {
+					if (Record.Num() - Pos < 2) return false;
+					const int32 Length = (Record[Pos] << 8) | Record[Pos + 1];
+					Pos += 2;
+					if (Length <= 0 || Record.Num() - Pos < Length) return false;
+					const uint8 StartCode[] = {0, 0, 0, 1};
+					Out.Append(StartCode, 4);
+					Out.Append(Record.GetData() + Pos, Length);
+					Pos += Length;
+				}
+				return true;
+			};
+			if (!CopySets(Record[Pos++] & 0x1F) || Pos >= Record.Num() || !CopySets(Record[Pos++])) {
+				Out.Reset();
+			}
+			return Out;
+		}
 	}
 
 	// -----------------------------------------------------------------------------------------------------
@@ -64,8 +94,14 @@ namespace IPMedia {
 			if (Decoder.IsValid() && AvcDecoderConfig == CurrentConfig) {
 				return true;
 			}
+			const TArray<uint8> ParameterSets = AvcCToAnnexBParameterSets(AvcDecoderConfig);
+			if (ParameterSets.Num() == 0) {
+				LastError = TEXT("malformed H.264 decoder configuration record (avcC)");
+				return false;
+			}
 			TMap<FString, FVariant> NewCsd;
 			NewCsd.Add(TEXT("dcr"), FVariant(AvcDecoderConfig));
+			NewCsd.Add(TEXT("csd"), FVariant(ParameterSets));
 			if (Decoder.IsValid() && Decoder->IsCompatibleWith(NewCsd) == IElectraDecoder::ECSDCompatibility::Compatible) {
 				CurrentConfig = AvcDecoderConfig;
 				Csd = MoveTemp(NewCsd);
@@ -97,7 +133,7 @@ namespace IPMedia {
 			}
 
 			TMap<FString, FVariant> Config;
-			Config.Add(TEXT("max_output_buffers"), FVariant(static_cast<uint32>(8)));
+			Config.Add(TEXT("max_output_buffers"), FVariant(static_cast<uint32>(20)));
 			Config.Add(TEXT("max_width"), FVariant(static_cast<uint32>(FMath::Max(Width, 16))));
 			Config.Add(TEXT("max_height"), FVariant(static_cast<uint32>(FMath::Max(Height, 16))));
 

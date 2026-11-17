@@ -19,8 +19,12 @@
  * Receive pipeline of one iprtmp:// player:
  *
  *   network strand: IRtmpMediaSink -> bounded input queue (copy/enqueue only, never blocks)
- *   decode thread:  decoders (Electra) -> pending decoded samples -> FPlayoutClock -> FMediaSamples
+ *   decode thread:  encoded jitter buffer -> FPlayoutClock -> just-in-time decode -> FMediaSamples
  *   game thread:    the player polls events/stats; the Media Framework pulls samples
+ *
+ * The jitter buffer holds ENCODED packets. Video is decoded only shortly before presentation and only a few
+ * decoded frames are kept, because every decoded frame pins one of the decoder's limited output surfaces:
+ * buffering decoded frames would starve the hardware decoder.
  *
  * The decode thread owns the decoders and keeps the pipeline alive (shared reference) until it exits, so
  * Stop() never blocks the Game Thread. Timestamps are re-based onto a continuous player timeline: a new
@@ -63,6 +67,14 @@ namespace IPMedia {
 			FRtmpStreamInfo Info;
 		};
 
+		struct FEncoded {
+			TSharedPtr<const TArray<uint8>, ESPMode::ThreadSafe> Data;
+			FTimespan Dts;
+			FTimespan Pts;
+			FTimespan Duration;
+			bool bKeyframe = false;
+		};
+
 		struct FDecodedVideo {
 			TSharedPtr<IMediaTextureSample, ESPMode::ThreadSafe> Sample;
 			FTimespan Pts;
@@ -80,6 +92,8 @@ namespace IPMedia {
 		void Process(FInput& Input);
 		void ProcessVideo(const FRtmpMediaPacket& Packet);
 		void ProcessAudio(const FRtmpMediaPacket& Packet);
+		void UpdateClock(double Now);
+		void DecodeDue(double Now);
 		void PumpOutputs();
 		void Release(double Now);
 		void UpdateStats(double Now);
@@ -113,6 +127,9 @@ namespace IPMedia {
 		int32 MetadataHeight = 0;
 		int64 LastVideoDtsMs = 0;
 		int64 LastVideoFrameMs = 33;
+		TArray<FEncoded> EncodedVideo;
+		TArray<FEncoded> EncodedAudio;
+		bool bSkipToKeyframe = false;
 		TArray<FDecodedVideo> PendingVideo;
 		TArray<FDecodedAudio> PendingAudio;
 		bool bHasAudioTrack = false;
