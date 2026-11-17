@@ -11,6 +11,7 @@
 #include "MediaSamples.h"
 #include "Player/IPPlayoutClock.h"
 #include "rtmp/rtmpmedia.h"
+#include "rtmp/rtmpplay.h"
 #include "Containers/Queue.h"
 #include "HAL/CriticalSection.h"
 #include <atomic>
@@ -40,6 +41,8 @@ namespace IPMedia {
 
 		/** Game Thread. Registers the sink and makes sure the port is listened on. */
 		bool Start(FString& OutError);
+		/** Game Thread. Pull mode: plays Url (rtmp:// or rtmps://) from an RTMP server. */
+		bool StartPull(const FString& Url, const FString& StreamKey, FString& OutError);
 		/** Game Thread, non-blocking. */
 		void Stop();
 		void SetPaused(bool bInPaused) { bPaused.store(bInPaused); }
@@ -100,6 +103,7 @@ namespace IPMedia {
 		FTimespan MapTime(int64 StreamMs, int32 TypeIndex);
 		void ReportError(const FString& Message);
 		void ResetDecoders();
+		void StartThread();
 
 		const uint16 Port;
 		const FString App;
@@ -144,6 +148,7 @@ namespace IPMedia {
 		// Cross-thread.
 		int64 SinkHandle = 0;
 		int64 PortHandle = 0;
+		TSharedPtr<IRtmpPlaySession, ESPMode::ThreadSafe> PlaySession;
 		std::atomic<bool> bStop{false};
 		std::atomic<bool> bPaused{false};
 		std::atomic<int64> PositionTicks{0};

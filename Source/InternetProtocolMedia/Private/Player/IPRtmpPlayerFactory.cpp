@@ -11,6 +11,9 @@
 
 namespace IPMedia {
 	bool FRtmpPlayerFactory::CanPlayUrl(const FString& Url, const IMediaOptions* Options, TArray<FText>* OutWarnings, TArray<FText>* OutErrors) const {
+		if (IsPullUrl(Url)) {
+			return true;
+		}
 		if (!Url.StartsWith(TEXT("iprtmp://"), ESearchCase::IgnoreCase)) {
 			return false;
 		}
@@ -58,8 +61,12 @@ namespace IPMedia {
 
 const FName UIPRtmpMediaSource::LatencyModeOption(TEXT("IPRtmp.LatencyMode"));
 const FName UIPRtmpMediaSource::LatencyMsOption(TEXT("IPRtmp.LatencyMs"));
+const FName UIPRtmpMediaSource::StreamKeyOption(TEXT("IPRtmp.StreamKey"));
 
 bool UIPRtmpMediaSource::Validate() const {
+	if (IPMedia::IsPullUrl(StreamUrl)) {
+		return true;
+	}
 	uint16 Port;
 	FString App, Key, Error;
 	return IPMedia::ParseIpRtmpUrl(StreamUrl, Port, App, Key, Error);
@@ -80,6 +87,9 @@ int64 UIPRtmpMediaSource::GetMediaOption(const FName& Key, int64 DefaultValue) c
 }
 
 FString UIPRtmpMediaSource::GetMediaOption(const FName& Key, const FString& DefaultValue) const {
+	if (Key == StreamKeyOption) {
+		return StreamKey;
+	}
 	return Super::GetMediaOption(Key, DefaultValue);
 }
 
@@ -92,7 +102,7 @@ FText UIPRtmpMediaSource::GetMediaOption(const FName& Key, const FText& DefaultV
 }
 
 bool UIPRtmpMediaSource::HasMediaOption(const FName& Key) const {
-	return Key == LatencyModeOption || Key == LatencyMsOption || Super::HasMediaOption(Key);
+	return Key == LatencyModeOption || Key == LatencyMsOption || Key == StreamKeyOption || Super::HasMediaOption(Key);
 }
 
 #undef LOCTEXT_NAMESPACE

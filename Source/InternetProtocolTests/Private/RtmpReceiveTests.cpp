@@ -119,4 +119,66 @@ bool FIPRtmpReceiveFfmpegTest::RunTest(const FString& Parameters) {
 	return true;
 }
 
+/**
+ * Pull: FFmpeg publishes to a URTMPServer with playback enabled; UIPRtmpReceiver plays it back over rtmp://
+ * with a view key (IRtmpPlaySession), exactly as it would from MediaMTX or nginx-rtmp.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPRtmpReceivePullTest, "InternetProtocol.Media.ReceivePull", ReceiveTestFlags)
+bool FIPRtmpReceivePullTest::RunTest(const FString& Parameters) {
+	const FString Ffmpeg = FindFfmpeg();
+	if (Ffmpeg.IsEmpty()) {
+		AddWarning(TEXT("ffmpeg not found in PATH: pull receive test skipped."));
+		return true;
+	}
+	URTMPServer* Server = NewObject<URTMPServer>();
+	Server->AddToRoot();
+	Server->SetPlaybackEnabled(true, 0);
+	Server->SetPlaybackKey(TEXT("live"), TEXT("pubkey"), TEXT("viewkey"));
+	FServerBindOptions Bind;
+	Bind.Address = TEXT("127.0.0.1");
+	Bind.Port = 0;
+	if (!TestTrue(TEXT("RTMP server opens"), Server->Open(Bind))) {
+		Server->RemoveFromRoot();
+		return false;
+	}
+	const int32 Port = Server->LocalEndpoint().Port;
+
+	const FString Args = FString::Printf(
+		TEXT("-hide_banner -loglevel error -re -f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 ")
+		TEXT("-t 10 -c:v libx264 -preset ultrafast -g 30 -bf 2 -pix_fmt yuv420p -c:a aac -b:a 128k -f flv rtmp://127.0.0.1:%d/live/pubkey"), Port);
+	TSharedRef<FProcHandle> Process = MakeShared<FProcHandle>(FPlatformProcess::CreateProc(*Ffmpeg, *Args, true, true, true, nullptr, 0, nullptr, nullptr));
+	if (!TestTrue(TEXT("ffmpeg started"), Process->IsValid())) {
+		return false;
+	}
+
+	UIPRtmpReceiver* Receiver = NewObject<UIPRtmpReceiver>();
+	Receiver->AddToRoot();
+	TestTrue(TEXT("Receiver starts pulling"), Receiver->StartPull(FString::Printf(TEXT("rtmp://127.0.0.1:%d/live"), Port), TEXT("viewkey"),
+		EIPRtmpLatencyMode::LowLatency, 300));
+
+	Wait(this, TEXT("pulled 640x360 video and 48 kHz audio decoded"), [Receiver]() {
+		const FIPRtmpReceiverStats Stats = Receiver->GetStats();
+		return Stats.Width == 640 && Stats.Height == 360 && Stats.Fps > 20.0f && Stats.AudioSampleRate == 48000;
+	}, 20.0);
+	Then([this, Receiver, Server]() {
+		const FIPRtmpReceiverStats Stats = Receiver->GetStats();
+		AddInfo(FString::Printf(TEXT("Pull: %s | %s | %.1f fps | %.0f kbit/s | buffered %.0f ms | dropped V%lld A%lld"),
+			*Stats.VideoDecoder, *Stats.AudioDecoder, Stats.Fps, Stats.BitrateKbps, Stats.BufferedMs, Stats.DroppedVideoFrames, Stats.DroppedAudioFrames));
+		TestTrue(TEXT("Receiver reports streaming"), Receiver->IsStreaming());
+		TestEqual(TEXT("Server counts the pulling receiver as a viewer"), Server->GetViewerCount(TEXT("live")), 1);
+	});
+	Wait(this, TEXT("stream end after ffmpeg exits"), [Receiver]() { return !Receiver->IsStreaming(); }, 25.0);
+	Then([Receiver, Server, Process]() {
+		if (FPlatformProcess::IsProcRunning(*Process)) {
+			FPlatformProcess::TerminateProc(*Process);
+		}
+		FPlatformProcess::CloseProc(*Process);
+		Receiver->Stop();
+		Receiver->RemoveFromRoot();
+		Server->Close();
+		Server->RemoveFromRoot();
+	});
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

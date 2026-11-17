@@ -41,9 +41,24 @@ namespace IPMedia {
 		return true;
 	}
 
-	/** URL safe to log: the stream key is replaced by ***. */
+	/** rtmp:// or rtmps://: the player connects to that server and plays the stream (pull). */
+	inline bool IsPullUrl(const FString& Url) {
+		return Url.StartsWith(TEXT("rtmp://"), ESearchCase::IgnoreCase) || Url.StartsWith(TEXT("rtmps://"), ESearchCase::IgnoreCase);
+	}
+
+	/** iprtmp:// (receive what is published to this machine) or rtmp(s):// (pull from a server). */
+	inline bool IsSupportedUrl(const FString& Url) {
+		return IsPullUrl(Url) || Url.StartsWith(TEXT("iprtmp://"), ESearchCase::IgnoreCase);
+	}
+
+	/** URL safe to log: the stream key (last path segment) is replaced by ***. */
 	inline FString MaskIpRtmpUrl(const FString& Url) {
+		const int32 SchemeEnd = Url.Find(TEXT("://"));
+		const int32 PathStart = SchemeEnd == INDEX_NONE ? INDEX_NONE : Url.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromStart, SchemeEnd + 3);
 		int32 Slash;
-		return Url.FindLastChar(TEXT('/'), Slash) && Slash > 9 ? Url.Left(Slash + 1) + TEXT("***") : FString(TEXT("iprtmp://***"));
+		if (PathStart == INDEX_NONE || !Url.FindLastChar(TEXT('/'), Slash) || Slash <= PathStart) {
+			return SchemeEnd == INDEX_NONE ? FString(TEXT("***")) : Url.Left(SchemeEnd + 3) + TEXT("***");
+		}
+		return Url.Left(Slash + 1) + TEXT("***");
 	}
 }

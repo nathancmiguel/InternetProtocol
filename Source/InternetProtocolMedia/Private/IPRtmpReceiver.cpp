@@ -30,15 +30,20 @@ namespace {
 }
 
 bool UIPRtmpReceiver::StartUrl(const FString& Url, EIPRtmpLatencyMode LatencyMode, int32 LatencyMs) {
+	return StartPull(Url, FString(), LatencyMode, LatencyMs);
+}
+
+bool UIPRtmpReceiver::StartPull(const FString& Url, const FString& StreamKey, EIPRtmpLatencyMode LatencyMode, int32 LatencyMs) {
 	Stop();
 	uint16 Port;
 	FString App, Key, Error;
-	if (!IPMedia::ParseIpRtmpUrl(Url, Port, App, Key, Error)) {
+	if (!IPMedia::IsPullUrl(Url) && !IPMedia::ParseIpRtmpUrl(Url, Port, App, Key, Error)) {
 		OnError.Broadcast(Error);
 		return false;
 	}
 
 	Source = NewObject<UIPRtmpMediaSource>(this);
+	Source->SetStreamKey(StreamKey);
 	Source->StreamUrl = Url;
 	Source->LatencyMode = LatencyMode;
 	Source->LatencyMs = FMath::Max(LatencyMs, 0);

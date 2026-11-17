@@ -32,9 +32,10 @@ namespace IPMedia {
 
 	bool FRtmpMediaPlayer::Open(const FString& InUrl, const IMediaOptions* Options) {
 		Close();
+		const bool bPull = IsPullUrl(InUrl);
 		uint16 Port = 0;
 		FString App, Key, Error;
-		if (!ParseIpRtmpUrl(InUrl, Port, App, Key, Error)) {
+		if (!bPull && !ParseIpRtmpUrl(InUrl, Port, App, Key, Error)) {
 			UE_LOG(LogIPRtmpPlayer, Error, TEXT("Cannot open %s: %s"), *MaskIpRtmpUrl(InUrl), *Error);
 			EventSink.ReceiveMediaEvent(EMediaEvent::MediaOpenFailed);
 			return false;
@@ -51,7 +52,8 @@ namespace IPMedia {
 		                                              : FPlayoutSettings::Smooth(LatencyMs > 0 ? static_cast<int32>(LatencyMs) : 1000);
 
 		Pipeline = MakeShared<FRtmpPipeline, ESPMode::ThreadSafe>(Port, App, Key, Settings, Samples.ToSharedRef());
-		if (!Pipeline->Start(Error)) {
+		const FString PullKey = Options ? Options->GetMediaOption(UIPRtmpMediaSource::StreamKeyOption, FString()) : FString();
+		if (bPull ? !Pipeline->StartPull(InUrl, PullKey, Error) : !Pipeline->Start(Error)) {
 			UE_LOG(LogIPRtmpPlayer, Error, TEXT("Cannot open %s: %s"), *MaskIpRtmpUrl(InUrl), *Error);
 			Pipeline.Reset();
 			EventSink.ReceiveMediaEvent(EMediaEvent::MediaOpenFailed);
@@ -60,7 +62,7 @@ namespace IPMedia {
 		Url = InUrl;
 		State = EMediaState::Stopped;
 		Rate = 0.0f;
-		UE_LOG(LogIPRtmpPlayer, Log, TEXT("Waiting for RTMP publisher on %s"), *MaskIpRtmpUrl(InUrl));
+		UE_LOG(LogIPRtmpPlayer, Log, TEXT("%s %s"), bPull ? TEXT("Playing RTMP stream from") : TEXT("Waiting for RTMP publisher on"), *MaskIpRtmpUrl(InUrl));
 		EventSink.ReceiveMediaEvent(EMediaEvent::MediaConnecting);
 		EventSink.ReceiveMediaEvent(EMediaEvent::TracksChanged);
 		EventSink.ReceiveMediaEvent(EMediaEvent::MediaOpened);

@@ -83,13 +83,34 @@ namespace IPMedia {
 			return false;
 		}
 		SinkHandle = FRtmpIngestHub::RegisterSink(Port, App, Key, AsShared());
+		StartThread();
+		return true;
+	}
+
+	bool FRtmpPipeline::StartPull(const FString& Url, const FString& StreamKey, FString& OutError) {
+		TWeakPtr<FRtmpPipeline, ESPMode::ThreadSafe> Weak = AsShared();
+		FRtmpPlayCallbacks Callbacks;
+		Callbacks.OnError = [Weak](const FString& Message) {
+			if (TSharedPtr<FRtmpPipeline, ESPMode::ThreadSafe> Self = Weak.Pin()) {
+				Self->ReportError(Message);
+			}
+		};
+		PlaySession = IRtmpPlaySession::Create(Url, StreamKey, FRtmpPlayOptions(), AsShared(), MoveTemp(Callbacks), OutError);
+		if (!PlaySession.IsValid()) {
+			return false;
+		}
+		StartThread();
+		PlaySession->Start();
+		return true;
+	}
+
+	void FRtmpPipeline::StartThread() {
 		GRunningThreads.fetch_add(1);
 		TSharedRef<FRtmpPipeline, ESPMode::ThreadSafe> Self = AsShared();
 		Async(EAsyncExecution::Thread, [Self]() {
 			Self->ThreadMain();
 			GRunningThreads.fetch_sub(1);
 		});
-		return true;
 	}
 
 	void FRtmpPipeline::Stop() {
@@ -100,6 +121,11 @@ namespace IPMedia {
 		if (PortHandle) {
 			FRtmpIngestHub::ReleasePort(PortHandle);
 			PortHandle = 0;
+		}
+		if (PlaySession.IsValid()) {
+			// Non-blocking: closes the connection on the network strand.
+			PlaySession->Stop();
+			PlaySession.Reset();
 		}
 		bStop.store(true);
 		if (WakeEvent) {

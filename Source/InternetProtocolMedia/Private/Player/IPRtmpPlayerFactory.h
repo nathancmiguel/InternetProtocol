@@ -8,7 +8,7 @@
 #include "IMediaPlayerFactory.h"
 
 namespace IPMedia {
-	/** Registers the iprtmp:// scheme with the Media Framework. */
+	/** Registers the iprtmp://, rtmp:// and rtmps:// schemes with the Media Framework. */
 	class FRtmpPlayerFactory final : public IMediaPlayerFactory {
 	public:
 		virtual bool CanPlayUrl(const FString& Url, const IMediaOptions* Options, TArray<FText>* OutWarnings, TArray<FText>* OutErrors) const override;

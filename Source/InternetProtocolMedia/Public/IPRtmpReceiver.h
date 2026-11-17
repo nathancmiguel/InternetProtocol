@@ -36,11 +36,22 @@ class INTERNETPROTOCOLMEDIA_API UIPRtmpReceiver : public UObject, public FTickab
 	GENERATED_BODY()
 public:
 	/**
-	 * Starts receiving iprtmp://host:port/app/key. The port is served by a URTMPServer opened on it or by an
-	 * internal listener. LatencyMs = 0 uses the default of the mode (150 / 1000 ms).
+	 * Starts receiving:
+	 *  - iprtmp://host:port/app/key: a stream published to this machine. The port is served by a URTMPServer
+	 *    opened on it or by an internal listener.
+	 *  - rtmp://host[:port]/app/key or rtmps://...: plays the stream from that RTMP server (MediaMTX, nginx-rtmp,
+	 *    a URTMPServer with playback enabled...). Reconnects with backoff if the connection drops.
+	 * LatencyMs = 0 uses the default of the mode (150 / 1000 ms).
 	 */
 	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
 	bool StartUrl(const FString& Url, EIPRtmpLatencyMode LatencyMode = EIPRtmpLatencyMode::Smooth, int32 LatencyMs = 0);
+
+	/**
+	 * Plays a stream from an RTMP server: Url = rtmp(s)://host[:port]/app, StreamKey kept in memory only (not part of
+	 * the URL, never logged). Server refusals (unknown key, TLS errors...) are reported through OnError.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
+	bool StartPull(const FString& Url, const FString& StreamKey, EIPRtmpLatencyMode LatencyMode = EIPRtmpLatencyMode::Smooth, int32 LatencyMs = 0);
 
 	/** Receives the stream published to Server with the given app and stream key. */
 	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")

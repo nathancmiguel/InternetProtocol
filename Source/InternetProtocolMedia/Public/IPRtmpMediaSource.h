@@ -10,13 +10,14 @@
 #include "IPRtmpMediaSource.generated.h"
 
 /**
- * Media source for an RTMP stream published to this machine (OBS, FFmpeg, another Unreal instance...).
- * Works with UMediaPlayer, UMediaTexture, UMediaSoundComponent and Media Plate.
+ * Media source for an RTMP stream. Works with UMediaPlayer, UMediaTexture, UMediaSoundComponent and Media Plate.
  *
- * Url: iprtmp://0.0.0.0:1935/<app>/<stream key>. The port is served by a URTMPServer opened on it or, when
- * none exists, by an internal listener on all interfaces.
+ * Url:
+ *  - iprtmp://0.0.0.0:1935/<app>/<stream key>: a stream published to this machine (OBS, FFmpeg, another Unreal).
+ *    The port is served by a URTMPServer opened on it or, when none exists, by an internal listener.
+ *  - rtmp://host[:port]/<app>[/<key>] or rtmps://...: plays the stream from that RTMP server (pull).
  *
- * The stream key is part of the URL: avoid saving it in versioned assets; set the URL at runtime instead.
+ * Keys in the URL end up in saved assets: prefer setting the URL at runtime, or SetStreamKey (memory only).
  */
 UCLASS(BlueprintType, hidecategories = (Overrides, Playback))
 class INTERNETPROTOCOLMEDIA_API UIPRtmpMediaSource : public UBaseMediaSource
@@ -35,6 +36,11 @@ public:
 
 	static const FName LatencyModeOption;
 	static const FName LatencyMsOption;
+	static const FName StreamKeyOption;
+
+	/** Stream key for rtmp(s):// URLs, kept in memory only (never saved). Empty = last path segment of the URL. */
+	UFUNCTION(BlueprintCallable, Category = "RTMP")
+	void SetStreamKey(const FString& InStreamKey) { StreamKey = InStreamKey; }
 
 	virtual FString GetUrl() const override { return StreamUrl; }
 	virtual bool Validate() const override;
@@ -46,4 +52,7 @@ public:
 	virtual double GetMediaOption(const FName& Key, double DefaultValue) const override;
 	virtual FText GetMediaOption(const FName& Key, const FText& DefaultValue) const override;
 	virtual bool HasMediaOption(const FName& Key) const override;
+
+private:
+	FString StreamKey;
 };
