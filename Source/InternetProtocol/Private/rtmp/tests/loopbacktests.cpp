@@ -8,6 +8,7 @@
 
 #include "rtmp/rtmpmedia.h"
 #include "rtmp/rtmppublish.h"
+#include "rtmp/rtmpplay.h"
 #include "rtmp/rtmpserver.h"
 #include "rtmp/flv.h"
 #include "HAL/PlatformTime.h"
@@ -292,6 +293,188 @@ bool FIPRtmpRejectTest::RunTest(const FString& Parameters) {
 	Wait(this, TEXT("publish refused without reconnecting"), [Publisher]() { return Publisher->GetState() == ERtmpPublishState::Failed; });
 	Then([this, Publisher, Server]() {
 		TestEqual(TEXT("No reconnection for a refused key"), Publisher->GetStats().ReconnectAttempts, 0);
+		Server->Close();
+		Server->RemoveFromRoot();
+	});
+	return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Pull: IRtmpPublishSession -> URTMPServer (playback enabled) -> IRtmpPlaySession
+
+namespace {
+	void SendTestGop(const TSharedPtr<IRtmpPublishSession, ESPMode::ThreadSafe>& Publisher, int64 BaseMs) {
+		Publisher->SetVideoConfig(FakeAvcC());
+		Publisher->SetAudioConfig(TArray<uint8>({0x11, 0x90}));
+		for (int32 Frame = 0; Frame < 6; ++Frame) {
+			Publisher->SendVideo(BaseMs + Frame * 33, Frame == 0 ? 0 : 66, Frame == 0, FakeFrame(Frame == 0 ? 50000 : 3000, Frame == 0 ? 0x65 : 0x41));
+		}
+		for (int32 Frame = 0; Frame < 10; ++Frame) {
+			Publisher->SendAudio(BaseMs + Frame * 21, TArray<uint8>({0x21, 0x10, static_cast<uint8>(Frame)}));
+		}
+	}
+
+	TSharedPtr<IRtmpPublishSession, ESPMode::ThreadSafe> MakeTestPublisher(const FString& Url, const FString& Cert) {
+		FRtmpPublishOptions Options;
+		Options.Width = 1280;
+		Options.Height = 720;
+		Options.FrameRate = 30;
+		Options.Tls.CA_Cert = Cert;
+		Options.Tls.bUseSystemRootCertificates = false;
+		FString Error;
+		return IRtmpPublishSession::Create(Url, TEXT("secret-key"), Options, FRtmpPublishCallbacks(), Error);
+	}
+
+	void RunPull(FAutomationTestBase* Test, bool bTls) {
+		FString Cert, Key;
+		if (bTls && !MakeCertificate(Cert, Key)) {
+			Test->AddError(TEXT("Could not create a test certificate"));
+			return;
+		}
+		URTMPServer* Server = NewObject<URTMPServer>();
+		Server->AddToRoot();
+		Server->SetPlaybackEnabled(true, 0);
+		Test->TestTrue(TEXT("View key set"), Server->SetPlaybackKey(TEXT("live"), TEXT("secret-key"), TEXT("watch-key")));
+		if (bTls) {
+			FSecurityContextOpts ServerTls;
+			ServerTls.Cert = Cert;
+			ServerTls.Private_Key = Key;
+			ServerTls.Verify_Mode = EVerifyMode::None;
+			Server->SetTlsOptions(ServerTls);
+		}
+		FServerBindOptions Bind;
+		Bind.Address = TEXT("127.0.0.1");
+		Bind.Port = 0;
+		if (!Test->TestTrue(TEXT("Server opens"), Server->Open(Bind))) {
+			Server->RemoveFromRoot();
+			return;
+		}
+		const uint16 Port = static_cast<uint16>(Server->LocalEndpoint().Port);
+		const FString Base = FString::Printf(TEXT("%s://%s:%u/live"), bTls ? TEXT("rtmps") : TEXT("rtmp"), bTls ? TEXT("localhost") : TEXT("127.0.0.1"), Port);
+
+		TSharedPtr<IRtmpPublishSession, ESPMode::ThreadSafe> Publisher = MakeTestPublisher(Base, Cert);
+		if (!Test->TestTrue(TEXT("Publisher created"), Publisher.IsValid())) {
+			return;
+		}
+		Publisher->Start();
+
+		TSharedRef<FTestSink, ESPMode::ThreadSafe> Sink = MakeShared<FTestSink, ESPMode::ThreadSafe>();
+		FRtmpPlayOptions PlayOptions;
+		PlayOptions.Tls.CA_Cert = Cert;
+		PlayOptions.Tls.bUseSystemRootCertificates = false;
+		FString Error;
+		TSharedPtr<IRtmpPlaySession, ESPMode::ThreadSafe> Viewer = IRtmpPlaySession::Create(Base + TEXT("/watch-key"), FString(), PlayOptions, Sink, FRtmpPlayCallbacks(), Error);
+		if (!Test->TestTrue(TEXT("Play session created"), Viewer.IsValid())) {
+			Test->AddError(Error);
+			return;
+		}
+
+		Wait(Test, TEXT("publishing"), [Publisher]() { return Publisher->GetState() == ERtmpPublishState::Publishing; });
+		Then([Viewer]() { Viewer->Start(); });
+		// The viewer is attached once it got the stream start (metadata): only then send media, so it sees all of it.
+		Wait(Test, TEXT("viewer playing and attached"), [Viewer, Sink]() {
+			FScopeLock ScopeLock(&Sink->Lock);
+			return Viewer->GetState() == ERtmpPlayState::Playing && Sink->Started == 1;
+		});
+		Then([Publisher]() { SendTestGop(Publisher, 1000); });
+		Wait(Test, TEXT("viewer received the GOP"), [Sink]() {
+			return Sink->Count(ERtmpPacketType::Video, false) >= 6 && Sink->Count(ERtmpPacketType::Audio, false) >= 10;
+		});
+		Then([Test, Sink, Server]() {
+			FScopeLock ScopeLock(&Sink->Lock);
+			Test->TestEqual(TEXT("Server counts the viewer"), Server->GetViewerCount(TEXT("live")), 1);
+			Test->TestTrue(TEXT("Metadata forwarded"), Sink->StartedInfo.Width == 1280.0);
+			Test->TestTrue(TEXT("Stream key not exposed in the stream info"), Sink->StartedInfo.StreamName.IsEmpty());
+			int32 VideoIndex = 0;
+			int64 FirstDts = -1, LastDts = -1;
+			bool bSawVideoHeader = false, bSawAudioHeader = false;
+			for (const FRtmpMediaPacket& Packet : Sink->Packets) {
+				if (Packet.bSequenceHeader) {
+					(Packet.Type == ERtmpPacketType::Video ? bSawVideoHeader : bSawAudioHeader) = true;
+					continue;
+				}
+				if (Packet.Type != ERtmpPacketType::Video) {
+					continue;
+				}
+				Test->TestEqual(TEXT("Keyframe first"), Packet.bKeyframe, VideoIndex == 0);
+				Test->TestEqual(TEXT("Composition time kept"), Packet.CtsMs, VideoIndex == 0 ? 0 : 66);
+				Test->TestEqual(TEXT("Payload size kept"), Packet.Payload->Num(), VideoIndex == 0 ? 50004 : 3004);
+				Test->TestTrue(TEXT("DTS monotonic"), Packet.DtsMs > LastDts);
+				FirstDts = FirstDts < 0 ? Packet.DtsMs : FirstDts;
+				LastDts = Packet.DtsMs;
+				++VideoIndex;
+			}
+			Test->TestTrue(TEXT("Viewer timeline starts near 0"), FirstDts >= 0 && FirstDts < 100);
+			Test->TestEqual(TEXT("Frame spacing kept"), LastDts - FirstDts, static_cast<int64>(5 * 33));
+			Test->TestTrue(TEXT("avcC forwarded"), bSawVideoHeader);
+			Test->TestTrue(TEXT("AudioSpecificConfig forwarded"), bSawAudioHeader);
+		});
+		// Publisher leaves: the viewer stays connected and sees the stream end.
+		Then([Publisher]() { Publisher->Stop(); });
+		Wait(Test, TEXT("viewer sees the stream end"), [Sink]() {
+			FScopeLock ScopeLock(&Sink->Lock);
+			return Sink->Ended == 1;
+		});
+		// A new publisher on the same key: the viewer gets a new stream without reconnecting.
+		TSharedRef<TSharedPtr<IRtmpPublishSession, ESPMode::ThreadSafe>> Second = MakeShared<TSharedPtr<IRtmpPublishSession, ESPMode::ThreadSafe>>();
+		Then([Second, Base, Cert]() {
+			*Second = MakeTestPublisher(Base, Cert);
+			(*Second)->Start();
+		});
+		Wait(Test, TEXT("second publisher"), [Second]() { return (*Second)->GetState() == ERtmpPublishState::Publishing; });
+		Wait(Test, TEXT("viewer sees the new stream"), [Sink]() {
+			FScopeLock ScopeLock(&Sink->Lock);
+			return Sink->Started == 2;
+		});
+		Then([Test, Viewer, Second]() {
+			Test->TestEqual(TEXT("Viewer did not reconnect"), Viewer->GetStats().ReconnectAttempts, 0);
+			Viewer->Stop();
+			(*Second)->Stop();
+		});
+		Wait(Test, TEXT("viewer stopped"), [Viewer]() { return Viewer->GetState() == ERtmpPlayState::Stopped; });
+		Wait(Test, TEXT("viewer released on the server"), [Server]() { return Server->GetViewerCount(TEXT("live")) == 0; });
+		Then([Server]() {
+			Server->Close();
+			Server->RemoveFromRoot();
+		});
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPRtmpPullTest, "InternetProtocol.RTMP.Pull.Plain", RtmpTestFlags)
+bool FIPRtmpPullTest::RunTest(const FString& Parameters) {
+	RunPull(this, false);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPRtmpsPullTest, "InternetProtocol.RTMP.Pull.Tls", RtmpTestFlags)
+bool FIPRtmpsPullTest::RunTest(const FString& Parameters) {
+	RunPull(this, true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPRtmpPullNotFoundTest, "InternetProtocol.RTMP.Pull.NotFound", RtmpTestFlags)
+bool FIPRtmpPullNotFoundTest::RunTest(const FString& Parameters) {
+	URTMPServer* Server = NewObject<URTMPServer>();
+	Server->AddToRoot();
+	Server->SetPlaybackEnabled(true, 0);
+	FServerBindOptions Bind;
+	Bind.Address = TEXT("127.0.0.1");
+	Bind.Port = 0;
+	if (!TestTrue(TEXT("Server opens"), Server->Open(Bind))) {
+		Server->RemoveFromRoot();
+		return false;
+	}
+	FString Error;
+	TSharedPtr<IRtmpPlaySession, ESPMode::ThreadSafe> Viewer = IRtmpPlaySession::Create(
+		FString::Printf(TEXT("rtmp://127.0.0.1:%d/live/no-such-key"), Server->LocalEndpoint().Port), FString(), FRtmpPlayOptions(),
+		MakeShared<FTestSink, ESPMode::ThreadSafe>(), FRtmpPlayCallbacks(), Error);
+	if (!TestTrue(TEXT("Play session created"), Viewer.IsValid())) {
+		return false;
+	}
+	Viewer->Start();
+	Wait(this, TEXT("unknown key refused without reconnecting"), [Viewer]() { return Viewer->GetState() == ERtmpPlayState::Failed; });
+	Then([this, Viewer, Server]() {
+		TestEqual(TEXT("No reconnection for an unknown key"), Viewer->GetStats().ReconnectAttempts, 0);
 		Server->Close();
 		Server->RemoveFromRoot();
 	});
