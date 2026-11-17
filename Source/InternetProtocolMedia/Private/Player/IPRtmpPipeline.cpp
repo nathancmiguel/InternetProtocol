@@ -22,8 +22,12 @@ namespace IPMedia {
 		constexpr int32 MaxEncodedAudio = 3000;
 		/** How far ahead of the playout position audio packets are decoded. */
 		const FTimespan AudioDecodeLead = FTimespan::FromMilliseconds(250);
-		/** A video packet this far behind the position is skipped together with the rest of its GOP. */
-		const FTimespan VideoSkipThreshold = FTimespan::FromMilliseconds(400);
+		/**
+		 * A video packet this far behind the position is skipped together with the rest of its GOP. Smaller delays
+		 * (e.g. after a catch-up jump) are decoded anyway, faster than real time, and only the late pictures are
+		 * dropped: skipping to the next keyframe would lose up to a whole GOP for a short burst.
+		 */
+		const FTimespan VideoSkipThreshold = FTimespan::FromMilliseconds(2000);
 		constexpr int64 DiscontinuityMs = 1000;
 		constexpr uint8 CodecH264 = 7;
 		constexpr uint8 CodecAac = 10;
