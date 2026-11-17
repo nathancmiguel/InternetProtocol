@@ -6,6 +6,7 @@
 #include "rtmp/flv.h"
 #include "net/errors.h"
 #include "net/ioservice.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/ScopeLock.h"
 
 namespace IPNet::Rtmp {
@@ -13,6 +14,38 @@ namespace IPNet::Rtmp {
 		constexpr uint32 ServerWindowAck = 2500000;
 		constexpr uint32 ServerChunkSize = 4096;
 		constexpr uint32 PublishStreamId = 1;
+		/** Send queue bound per viewer: past half of it P-frames are dropped, audio only when full. */
+		constexpr int64 ViewerMaxQueued = 8 * 1024 * 1024;
+
+		/**
+		 * Hub sink of one viewer. Called on the publisher's strand: only re-posts to the viewer's own strand
+		 * (the packet payload is shared, never copied).
+		 */
+		class FViewerSink final : public IRtmpMediaSink {
+		public:
+			explicit FViewerSink(std::weak_ptr<FRtmpServerSession> InSession) : Session(MoveTemp(InSession)) {}
+
+			virtual void OnStreamStarted(const FRtmpStreamInfo& Info) override {
+				if (std::shared_ptr<FRtmpServerSession> Strong = Session.lock()) {
+					Strong->PostViewerStarted(Info);
+				}
+			}
+
+			virtual void OnMediaPacket(const FRtmpMediaPacket& Packet) override {
+				if (std::shared_ptr<FRtmpServerSession> Strong = Session.lock()) {
+					Strong->PostViewerPacket(Packet);
+				}
+			}
+
+			virtual void OnStreamEnded() override {
+				if (std::shared_ptr<FRtmpServerSession> Strong = Session.lock()) {
+					Strong->PostViewerEnded();
+				}
+			}
+
+		private:
+			std::weak_ptr<FRtmpServerSession> Session;
+		};
 
 		/** "key?token=..." -> "key" (query parameters are not part of the stream identity). */
 		std::string StripQuery(const std::string& Name) {
@@ -215,11 +248,20 @@ namespace IPNet::Rtmp {
 		} else if (Name == "publish") {
 			// publish(transaction, null, name, type)
 			const std::string StreamArg = Values.size() > 3 && Values[3].IsString() ? Values[3].String : std::string();
+			if (bPlaying) {
+				SendStatus(StreamId, "error", "NetStream.Publish.BadName", "This connection is playing.");
+				return;
+			}
 			Publish(StreamArg, Transaction, StreamId);
 		} else if (Name == "deleteStream" || Name == "closeStream") {
 			StopPublishing();
-		} else if (Name == "play" || Name == "play2") {
-			SendStatus(StreamId, "error", "NetStream.Play.Failed", "This server only accepts publishing.");
+			StopPlaying();
+		} else if (Name == "play") {
+			// play(transaction, null, name, start, duration, reset)
+			const std::string StreamArg = Values.size() > 3 && Values[3].IsString() ? Values[3].String : std::string();
+			Play(StreamArg, StreamId);
+		} else if (Name == "play2") {
+			SendStatus(StreamId, "error", "NetStream.Play.Failed", "play2 is not supported.");
 		} else if (Name == "_checkbw" || Name == "getStreamLength") {
 			SendCommand(0, {FAmf0Value::MakeString("_result"), FAmf0Value::MakeNumber(Transaction), FAmf0Value::MakeNull(), FAmf0Value::MakeNumber(0)});
 		}
@@ -423,7 +465,237 @@ namespace IPNet::Rtmp {
 
 	void FRtmpServerSession::OnClosed() {
 		StopPublishing();
+		StopPlaying();
 	}
+
+	// ---------------------------------------------------------------------------------------------------------
+	// Playback (this session is a viewer)
+
+	void FRtmpServerSession::Play(const std::string& Name, uint32 StreamId) {
+		if (bPlaying || bPublishing) {
+			SendStatus(StreamId, "error", "NetStream.Play.Failed", "This connection is already active.");
+			return;
+		}
+		std::shared_ptr<FRtmpServerCore> StrongCore = Core.lock();
+		const FString FApp = ToFString(App);
+		if (!StrongCore || !StrongCore->IsPlaybackEnabled()) {
+			UE_LOG(LogAsio, Warning, TEXT("InternetProtocol RTMP: play on app '%s' from %s refused (playback disabled)."), *FApp, *RemoteEndpoint.Address);
+			SendStatus(StreamId, "error", "NetStream.Play.Failed", "Playback is disabled on this server.");
+			Fail(TEXT("playback disabled"));
+			return;
+		}
+		// The client sends a view key; it maps to the (secret) published stream key. Neither is logged.
+		FString Stream;
+		if (!StrongCore->ResolvePlayback(FApp, ToFString(StripQuery(Name)), Stream)) {
+			UE_LOG(LogAsio, Warning, TEXT("InternetProtocol RTMP: play on app '%s' from %s refused (unknown view key)."), *FApp, *RemoteEndpoint.Address);
+			SendStatus(StreamId, "error", "NetStream.Play.StreamNotFound", "Stream not found.");
+			Fail(TEXT("unknown view key"));
+			return;
+		}
+		if (!StrongCore->AddViewer(FApp, Stream)) {
+			SendStatus(StreamId, "error", "NetStream.Play.Failed", "Too many viewers.");
+			Fail(TEXT("viewer limit reached"));
+			return;
+		}
+		bPlaying = true;
+		PlayStreamName = Stream;
+		bViewerDropUntilKeyframe = true;
+		ViewerBaseDts = -1;
+		ViewerTimelineOffset = 0;
+		ViewerLastTs = 0;
+
+		SendMessage(MakeUserControl(EUserControl::StreamBegin, PublishStreamId));
+		SendStatus(PublishStreamId, "status", "NetStream.Play.Reset", "Playing and resetting.");
+		SendStatus(PublishStreamId, "status", "NetStream.Play.Start", "Started playing.");
+		FRtmpMessage Access;
+		Access.Csid = Csid::Data;
+		Access.Type = EMessageType::DataAmf0;
+		Access.StreamId = PublishStreamId;
+		Amf0Encode(FAmf0Value::MakeString("|RtmpSampleAccess"), Access.Payload);
+		Amf0Encode(FAmf0Value::MakeBoolean(true), Access.Payload);
+		Amf0Encode(FAmf0Value::MakeBoolean(true), Access.Payload);
+		SendMessage(Access);
+
+		UE_LOG(LogAsio, Log, TEXT("InternetProtocol RTMP: play started on app '%s' from %s."), *FApp, *RemoteEndpoint.Address);
+		StrongCore->NotifyPlayStarted(FApp, RemoteEndpoint);
+		// If the stream is live the hub attaches this viewer right away (headers first, video from the next
+		// keyframe); otherwise as soon as it is published.
+		ViewerSinkHandle = FRtmpIngestHub::RegisterSink(Port, FApp, Stream, MakeShared<FViewerSink, ESPMode::ThreadSafe>(weak_from_this()));
+		ScheduleKeepAlive();
+	}
+
+	void FRtmpServerSession::StopPlaying() {
+		if (!bPlaying) {
+			return;
+		}
+		bPlaying = false;
+		if (ViewerSinkHandle != 0) {
+			FRtmpIngestHub::UnregisterSink(ViewerSinkHandle);
+			ViewerSinkHandle = 0;
+		}
+		if (KeepAlive) {
+			KeepAlive->cancel();
+		}
+		if (std::shared_ptr<FRtmpServerCore> StrongCore = Core.lock()) {
+			const FString FApp = ToFString(App);
+			StrongCore->RemoveViewer(FApp, PlayStreamName);
+			StrongCore->NotifyPlayEnded(FApp, RemoteEndpoint);
+		}
+		PlayStreamName.Reset();
+	}
+
+	void FRtmpServerSession::ScheduleKeepAlive() {
+		// A viewer sends nothing while no stream is published: ping it so the idle timeout does not close it.
+		std::shared_ptr<FIoCore> Io = FIoService::Get();
+		if (!Io) {
+			return;
+		}
+		if (!KeepAlive) {
+			KeepAlive = std::make_shared<asio::steady_timer>(Io->Context);
+		}
+		KeepAlive->expires_after(std::chrono::seconds(10));
+		KeepAlive->async_wait([Weak = weak_from_this()](const asio::error_code& Ec) {
+			if (Ec) {
+				return;
+			}
+			std::shared_ptr<FRtmpServerSession> Self = Weak.lock();
+			std::shared_ptr<FTransport> Strong = Self ? Self->Transport.lock() : nullptr;
+			if (!Strong) {
+				return;
+			}
+			Strong->Post([Self]() {
+				if (Self->bPlaying) {
+					Self->SendMessage(MakeUserControl(EUserControl::PingRequest, static_cast<uint32>(FPlatformTime::Seconds() * 1000.0)));
+					Self->ScheduleKeepAlive();
+				}
+			});
+		});
+	}
+
+	void FRtmpServerSession::PostViewerStarted(const FRtmpStreamInfo& StreamInfo) {
+		if (std::shared_ptr<FTransport> Strong = Transport.lock()) {
+			Strong->Post([Self = shared_from_this(), StreamInfo]() { Self->OnViewerStarted(StreamInfo); });
+		}
+	}
+
+	void FRtmpServerSession::PostViewerPacket(const FRtmpMediaPacket& Packet) {
+		if (std::shared_ptr<FTransport> Strong = Transport.lock()) {
+			Strong->Post([Self = shared_from_this(), Packet]() { Self->OnViewerPacket(Packet); });
+		}
+	}
+
+	void FRtmpServerSession::PostViewerEnded() {
+		if (std::shared_ptr<FTransport> Strong = Transport.lock()) {
+			Strong->Post([Self = shared_from_this()]() { Self->OnViewerEnded(); });
+		}
+	}
+
+	void FRtmpServerSession::OnViewerStarted(const FRtmpStreamInfo& StreamInfo) {
+		if (!bPlaying) {
+			return;
+		}
+		SendStatus(PublishStreamId, "status", "NetStream.Play.PublishNotify", "Stream published.");
+		SendMetadata(StreamInfo);
+		// A new publish continues the viewer's timeline (players dislike timestamps going backwards).
+		ViewerBaseDts = -1;
+		ViewerTimelineOffset = ViewerLastTs;
+		bViewerDropUntilKeyframe = true;
+	}
+
+	void FRtmpServerSession::OnViewerEnded() {
+		if (bPlaying) {
+			SendStatus(PublishStreamId, "status", "NetStream.Play.UnpublishNotify", "Stream unpublished.");
+		}
+	}
+
+	void FRtmpServerSession::SendMetadata(const FRtmpStreamInfo& StreamInfo) {
+		FAmf0Value Meta = FAmf0Value::MakeEcmaArray();
+		auto AddNumber = [&Meta](const char* Key, double Value) {
+			if (Value > 0.0) {
+				Meta.Add(Key, FAmf0Value::MakeNumber(Value));
+			}
+		};
+		AddNumber("width", StreamInfo.Width);
+		AddNumber("height", StreamInfo.Height);
+		AddNumber("framerate", StreamInfo.FrameRate);
+		AddNumber("videodatarate", StreamInfo.VideoDataRateKbps);
+		AddNumber("videocodecid", Flv::CodecH264);
+		AddNumber("audiosamplerate", StreamInfo.AudioSampleRate);
+		AddNumber("audiochannels", StreamInfo.AudioChannels);
+		AddNumber("audiocodecid", Flv::SoundFormatAac);
+		Meta.Add("encoder", FAmf0Value::MakeString("InternetProtocol (Unreal Engine)"));
+		FRtmpMessage Message;
+		Message.Csid = Csid::Data;
+		Message.Type = EMessageType::DataAmf0;
+		Message.StreamId = PublishStreamId;
+		Amf0Encode(FAmf0Value::MakeString("onMetaData"), Message.Payload);
+		Amf0Encode(Meta, Message.Payload);
+		SendMessage(Message);
+	}
+
+	void FRtmpServerSession::OnViewerPacket(const FRtmpMediaPacket& Packet) {
+		if (!bPlaying || !Packet.Payload.IsValid()) {
+			return;
+		}
+		const bool bVideo = Packet.Type == ERtmpPacketType::Video;
+		// Only H.264 / AAC are re-muxed (what the rest of the plugin supports).
+		if (bVideo ? Packet.Codec != Flv::CodecH264 : Packet.Codec != Flv::SoundFormatAac) {
+			return;
+		}
+		int64 Timestamp = ViewerLastTs;
+		if (!Packet.bSequenceHeader) {
+			// The viewer timeline starts at 0 when it joins (players handle that better than a large first timestamp).
+			if (ViewerBaseDts < 0) {
+				ViewerBaseDts = Packet.DtsMs;
+			}
+			Timestamp = FMath::Max<int64>(0, Packet.DtsMs - ViewerBaseDts) + ViewerTimelineOffset;
+			const int64 Size = Packet.Payload->Num() + 32;
+			const int64 Queued = ViewerInFlight.load();
+			if (bVideo) {
+				// Same congestion policy as the publishing client: keep keyframes while they fit, drop P-frames from
+				// half-full on, and after any drop skip to the next keyframe (a broken GOP cannot be decoded).
+				const bool bFull = Queued + Size > ViewerMaxQueued;
+				if (bFull || (!Packet.bKeyframe && (bViewerDropUntilKeyframe || Queued > ViewerMaxQueued / 2))) {
+					bViewerDropUntilKeyframe = true;
+					return;
+				}
+				bViewerDropUntilKeyframe = false;
+			} else if (Queued + Size > ViewerMaxQueued) {
+				return;
+			}
+			ViewerLastTs = FMath::Max(ViewerLastTs, Timestamp);
+		}
+		const TArray<uint8>& Data = *Packet.Payload;
+		if (bVideo) {
+			const std::vector<uint8> Tag = BuildVideoTag(Packet.bKeyframe || Packet.bSequenceHeader,
+				Packet.bSequenceHeader ? Flv::AvcSequenceHeader : Flv::AvcNalu, Packet.CtsMs, Data.GetData(), Data.Num());
+			WriteMedia(Csid::Video, EMessageType::Video, static_cast<uint32>(Timestamp), Tag);
+		} else {
+			const std::vector<uint8> Tag = BuildAacAudioTag(Packet.bSequenceHeader ? Flv::AacSequenceHeader : Flv::AacRaw, Data.GetData(), Data.Num());
+			WriteMedia(Csid::Audio, EMessageType::Audio, static_cast<uint32>(Timestamp), Tag);
+		}
+	}
+
+	void FRtmpServerSession::WriteMedia(uint32 InCsid, EMessageType Type, uint32 Timestamp, const std::vector<uint8>& Tag) {
+		std::shared_ptr<FTransport> Strong = Transport.lock();
+		if (!Strong) {
+			return;
+		}
+		std::vector<uint8> Bytes;
+		Writer.Write(InCsid, Type, PublishStreamId, Timestamp, Tag.data(), Tag.size(), Bytes);
+		const int64 Size = static_cast<int64>(Bytes.size());
+		ViewerInFlight.fetch_add(Size);
+		std::weak_ptr<FRtmpServerSession> Weak = weak_from_this();
+		const bool bQueued = Strong->Send(MoveTemp(Bytes), [Weak, Size](const asio::error_code&, size_t) {
+			if (std::shared_ptr<FRtmpServerSession> Self = Weak.lock()) {
+				Self->ViewerInFlight.fetch_sub(Size);
+			}
+		});
+		if (!bQueued) {
+			ViewerInFlight.fetch_sub(Size);
+		}
+	}
+
 
 	// ---------------------------------------------------------------------------------------------------------
 	// FRtmpServerCore
@@ -514,6 +786,79 @@ namespace IPNet::Rtmp {
 			}
 		}
 		return false;
+	}
+
+	void FRtmpServerCore::SetPlayback(bool bEnabled, int32 MaxViewers) {
+		FScopeLock ScopeLock(&Lock);
+		bPlaybackEnabled = bEnabled;
+		MaxViewersPerStream = FMath::Max(0, MaxViewers);
+	}
+
+	bool FRtmpServerCore::IsPlaybackEnabled() const {
+		FScopeLock ScopeLock(&Lock);
+		return bPlaybackEnabled;
+	}
+
+	void FRtmpServerCore::SetPlaybackKeys(TMap<FString, FString> ViewKeyToStream) {
+		FScopeLock ScopeLock(&Lock);
+		PlaybackKeys = MoveTemp(ViewKeyToStream);
+	}
+
+	bool FRtmpServerCore::ResolvePlayback(const FString& InApp, const FString& ViewKey, FString& OutStreamName) const {
+		FScopeLock ScopeLock(&Lock);
+		if (!bPlaybackEnabled || ViewKey.IsEmpty()) {
+			return false;
+		}
+		const FString* Found = PlaybackKeys.Find(MakePlaybackKey(InApp, ViewKey));
+		if (!Found) {
+			return false;
+		}
+		OutStreamName = *Found;
+		return true;
+	}
+
+	bool FRtmpServerCore::AddViewer(const FString& InApp, const FString& StreamName) {
+		FScopeLock ScopeLock(&Lock);
+		int32& Count = ViewerCounts.FindOrAdd(InApp + TEXT("|") + StreamName);
+		if (MaxViewersPerStream > 0 && Count >= MaxViewersPerStream) {
+			return false;
+		}
+		++Count;
+		return true;
+	}
+
+	void FRtmpServerCore::RemoveViewer(const FString& InApp, const FString& StreamName) {
+		FScopeLock ScopeLock(&Lock);
+		const FString Key = InApp + TEXT("|") + StreamName;
+		if (int32* Count = ViewerCounts.Find(Key)) {
+			if (--*Count <= 0) {
+				ViewerCounts.Remove(Key);
+			}
+		}
+	}
+
+	int32 FRtmpServerCore::GetViewerCount(const FString& InApp) const {
+		FScopeLock ScopeLock(&Lock);
+		const FString Prefix = InApp + TEXT("|");
+		int32 Total = 0;
+		for (const TPair<FString, int32>& Pair : ViewerCounts) {
+			if (InApp.IsEmpty() || Pair.Key.StartsWith(Prefix, ESearchCase::CaseSensitive)) {
+				Total += Pair.Value;
+			}
+		}
+		return Total;
+	}
+
+	void FRtmpServerCore::NotifyPlayStarted(const FString& InApp, const FTcpEndpoint& Remote) {
+		if (Callbacks.OnPlayStarted) {
+			Callbacks.OnPlayStarted(InApp, Remote);
+		}
+	}
+
+	void FRtmpServerCore::NotifyPlayEnded(const FString& InApp, const FTcpEndpoint& Remote) {
+		if (Callbacks.OnPlayEnded) {
+			Callbacks.OnPlayEnded(InApp, Remote);
+		}
 	}
 
 	void FRtmpServerCore::NotifyPublishStarted(const FRtmpStreamInfo& Info) {

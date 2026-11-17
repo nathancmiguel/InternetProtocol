@@ -16,14 +16,18 @@ namespace IPNet::Rtmp {
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FDelegateRtmpServer);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FDelegateRtmpServerPublish, const FString&, App, const FString&, StreamName, const FTcpEndpoint&, Remote);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FDelegateRtmpServerError, const FErrorCode&, ErrorCode);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FDelegateRtmpServerPlay, const FString&, App, const FTcpEndpoint&, Remote);
 
 /**
- * RTMP ingest server: accepts publishers (OBS, FFmpeg, ...) and makes their audio/video available to
- * receivers (InternetProtocolMedia: UIPRtmpReceiver, iprtmp:// media sources) through FRtmpIngestHub.
- * Only publishing is supported (no playback to RTMP clients).
+ * RTMP server: accepts publishers (OBS, FFmpeg, ...) and makes their audio/video available to receivers
+ * (InternetProtocolMedia: UIPRtmpReceiver, iprtmp:// media sources) through FRtmpIngestHub.
+ *
+ * Playback to RTMP clients (VLC, ffplay, OBS media source, another Unreal) is off by default. Enable it with
+ * SetPlaybackEnabled and give each stream a view key with SetPlaybackKey: viewers open
+ * rtmp://host:port/<app>/<view key>, so the publishing key is never handed out.
  *
  * StreamName in the events is the stream key sent by the publisher: treat it as a secret (it is never
- * logged by the plugin).
+ * logged by the plugin). Stream and view keys are kept in memory only (never saved properties).
  */
 UCLASS(Blueprintable, BlueprintType, Category = "IP|RTMP")
 class INTERNETPROTOCOL_API URTMPServer : public UObject
@@ -75,6 +79,33 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
 	void ClearTlsOptions();
 
+	/**
+	 * Allows RTMP clients to watch published streams (with a view key, see SetPlaybackKey). Off by default.
+	 * MaxViewersPerStream: 0 = unlimited (each viewer costs the full stream bitrate in upload). Applies immediately.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP|Playback")
+	void SetPlaybackEnabled(bool bEnabled, int32 MaxViewersPerStream = 0);
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|RTMP|Playback")
+	bool IsPlaybackEnabled() const { return bPlaybackEnabled; }
+
+	/**
+	 * Lets viewers watch App/StreamKey by opening rtmp://host:port/App/ViewKey. Returns false if ViewKey is empty
+	 * or equal to StreamKey (that would reveal the publishing key). Several view keys may map to one stream.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP|Playback")
+	bool SetPlaybackKey(const FString& App, const FString& StreamKey, const FString& ViewKey);
+
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP|Playback")
+	void RemovePlaybackKey(const FString& App, const FString& ViewKey);
+
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP|Playback")
+	void ClearPlaybackKeys();
+
+	/** Clients currently watching streams of App (empty App = all). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|RTMP|Playback")
+	int32 GetViewerCount(const FString& App) const;
+
 	UPROPERTY(BlueprintAssignable, Category = "IP|RTMP|Events")
 	FDelegateRtmpServer OnListening;
 
@@ -90,6 +121,13 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "IP|RTMP|Events")
 	FDelegateRtmpServerError OnError;
 
+	/** A client started watching a stream of App (keys are not reported). */
+	UPROPERTY(BlueprintAssignable, Category = "IP|RTMP|Events")
+	FDelegateRtmpServerPlay OnPlayStarted;
+
+	UPROPERTY(BlueprintAssignable, Category = "IP|RTMP|Events")
+	FDelegateRtmpServerPlay OnPlayEnded;
+
 private:
 	std::shared_ptr<IPNet::Rtmp::FRtmpServerCore> Core;
 	uint64 SessionId = 0;
@@ -98,5 +136,8 @@ private:
 	FTcpEndpoint Local;
 	FErrorCode LastError;
 	TArray<FString> AllowedKeys;
+	bool bPlaybackEnabled = false;
+	int32 MaxViewers = 0;
+	TMap<FString, FString> PlaybackKeys;
 	std::shared_ptr<const IPNet::FTlsConfig> Tls;
 };

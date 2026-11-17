@@ -53,6 +53,45 @@ void URTMPServer::SetAllowedStreamKeys(const TArray<FString>& StreamKeys) {
 	}
 }
 
+void URTMPServer::SetPlaybackEnabled(bool bEnabled, int32 MaxViewersPerStream) {
+	bPlaybackEnabled = bEnabled;
+	MaxViewers = FMath::Max(0, MaxViewersPerStream);
+	if (Core) {
+		Core->SetPlayback(bPlaybackEnabled, MaxViewers);
+	}
+}
+
+bool URTMPServer::SetPlaybackKey(const FString& App, const FString& StreamKey, const FString& ViewKey) {
+	if (App.IsEmpty() || StreamKey.IsEmpty() || ViewKey.IsEmpty() || ViewKey.Equals(StreamKey, ESearchCase::CaseSensitive)) {
+		// Never log the keys themselves.
+		UE_LOG(LogAsio, Warning, TEXT("InternetProtocol RTMP: SetPlaybackKey refused for app '%s' (empty key, or view key equal to the stream key)."), *App);
+		return false;
+	}
+	PlaybackKeys.Add(FRtmpServerCore::MakePlaybackKey(App, ViewKey), StreamKey);
+	if (Core) {
+		Core->SetPlaybackKeys(PlaybackKeys);
+	}
+	return true;
+}
+
+void URTMPServer::RemovePlaybackKey(const FString& App, const FString& ViewKey) {
+	PlaybackKeys.Remove(FRtmpServerCore::MakePlaybackKey(App, ViewKey));
+	if (Core) {
+		Core->SetPlaybackKeys(PlaybackKeys);
+	}
+}
+
+void URTMPServer::ClearPlaybackKeys() {
+	PlaybackKeys.Reset();
+	if (Core) {
+		Core->SetPlaybackKeys(PlaybackKeys);
+	}
+}
+
+int32 URTMPServer::GetViewerCount(const FString& App) const {
+	return Core ? Core->GetViewerCount(App) : 0;
+}
+
 void URTMPServer::SetTlsOptions(const FSecurityContextOpts& SecOpts) {
 	Tls = MakeTlsConfig(SecOpts, true);
 }
@@ -91,6 +130,20 @@ bool URTMPServer::Open(const FServerBindOptions& BindOpts) {
 			}
 		});
 	};
+	Callbacks.OnPlayStarted = [Weak, Id](const FString& App, const FTcpEndpoint& Remote) {
+		RunOnGameThread(Weak, [Id, App, Remote](URTMPServer* Self) {
+			if (Self->SessionId == Id) {
+				Self->OnPlayStarted.Broadcast(App, Remote);
+			}
+		});
+	};
+	Callbacks.OnPlayEnded = [Weak, Id](const FString& App, const FTcpEndpoint& Remote) {
+		RunOnGameThread(Weak, [Id, App, Remote](URTMPServer* Self) {
+			if (Self->SessionId == Id || Self->PendingCloseId == Id) {
+				Self->OnPlayEnded.Broadcast(App, Remote);
+			}
+		});
+	};
 	Callbacks.OnClosed = [Weak, Id]() {
 		RunOnGameThread(Weak, [Id](URTMPServer* Self) {
 			if (Self->SessionId == Id || Self->PendingCloseId == Id) {
@@ -113,6 +166,8 @@ bool URTMPServer::Open(const FServerBindOptions& BindOpts) {
 	}
 	std::shared_ptr<FRtmpServerCore> NewCore = FRtmpServerCore::Create(MoveTemp(Callbacks));
 	NewCore->SetAllowedStreamNames(AllowedKeys);
+	NewCore->SetPlayback(bPlaybackEnabled, MaxViewers);
+	NewCore->SetPlaybackKeys(PlaybackKeys);
 	NewCore->SetTls(Tls);
 	if (!Ec) {
 		NewCore->Open(asio::ip::tcp::endpoint(Address, static_cast<uint16>(BindOpts.Port)), BindOpts.bReuse_Address, Backlog, Ec);

@@ -13,15 +13,18 @@
 #include "net/tls.h"
 #include "net/transport.h"
 #include "HAL/CriticalSection.h"
+#include <atomic>
 #include <functional>
 #include <memory>
 
 /*
- * RTMP ingest server (native layer, no UObject).
+ * RTMP server (native layer, no UObject).
  * FRtmpServerCore owns the listening socket; each accepted connection gets an FRtmpServerSession that runs
  * entirely on its transport strand: handshake -> chunk stream -> commands (connect, createStream,
- * publish, ...) -> FLV demux -> IRtmpMediaSink fan-out through FRtmpIngestHub.
- * Only "publish" is supported (ingest); "play" is refused.
+ * publish / play, ...).
+ *  - publish: FLV demux -> IRtmpMediaSink fan-out through FRtmpIngestHub.
+ *  - play (only when enabled, with a view key mapped to a published stream): the session registers a sink in
+ *    the hub and re-muxes the packets to its client, with a bounded send queue (P-frames dropped first).
  */
 namespace IPNet::Rtmp {
 
@@ -31,6 +34,9 @@ namespace IPNet::Rtmp {
 		std::function<void(const FRtmpStreamInfo&)> OnPublishEnded;
 		std::function<void(const asio::error_code&)> OnError;
 		std::function<void()> OnClosed;
+		/** A client started / stopped watching (App only: keys are never reported). */
+		std::function<void(const FString& /*App*/, const FTcpEndpoint& /*Remote*/)> OnPlayStarted;
+		std::function<void(const FString& /*App*/, const FTcpEndpoint& /*Remote*/)> OnPlayEnded;
 	};
 
 	class FRtmpServerCore;
@@ -51,6 +57,11 @@ namespace IPNet::Rtmp {
 		void DetachSink(int64 Handle);
 		void Abort();
 
+		// ---- viewer side: called from the publisher's strand, re-posted to this session's strand ----
+		void PostViewerStarted(const FRtmpStreamInfo& StreamInfo);
+		void PostViewerPacket(const FRtmpMediaPacket& Packet);
+		void PostViewerEnded();
+
 	private:
 		struct FSinkEntry {
 			int64 Handle = 0;
@@ -66,6 +77,14 @@ namespace IPNet::Rtmp {
 		void HandleAggregate(const FRtmpMessage& Message);
 		void Publish(const std::string& Name, double Transaction, uint32 StreamId);
 		void StopPublishing();
+		void Play(const std::string& Name, uint32 StreamId);
+		void StopPlaying();
+		void OnViewerStarted(const FRtmpStreamInfo& StreamInfo);
+		void OnViewerPacket(const FRtmpMediaPacket& Packet);
+		void OnViewerEnded();
+		void SendMetadata(const FRtmpStreamInfo& StreamInfo);
+		void WriteMedia(uint32 InCsid, EMessageType Type, uint32 Timestamp, const std::vector<uint8>& Tag);
+		void ScheduleKeepAlive();
 		void Deliver(const FRtmpMediaPacket& Packet);
 		void SendMessage(const FRtmpMessage& Message);
 		void SendCommand(uint32 StreamId, const std::vector<FAmf0Value>& Values);
@@ -93,6 +112,17 @@ namespace IPNet::Rtmp {
 		uint64 BytesReceived = 0;
 		uint64 LastAckSent = 0;
 		uint32 PeerWindow = 0;
+
+		// Viewer (play) state, on this session's strand.
+		bool bPlaying = false;
+		int64 ViewerSinkHandle = 0;
+		FString PlayStreamName;
+		bool bViewerDropUntilKeyframe = true;
+		int64 ViewerBaseDts = -1;
+		int64 ViewerTimelineOffset = 0;
+		int64 ViewerLastTs = 0;
+		std::atomic<int64> ViewerInFlight{0};
+		std::shared_ptr<asio::steady_timer> KeepAlive;
 	};
 
 	class FRtmpServerCore : public std::enable_shared_from_this<FRtmpServerCore> {
@@ -115,10 +145,25 @@ namespace IPNet::Rtmp {
 		void SetAllowedStreamNames(TArray<FString> Names);
 		bool IsStreamNameAllowed(const FString& Name) const;
 
+		/** Playback (RTMP play) is off by default. MaxViewers: per published stream, 0 = unlimited. */
+		void SetPlayback(bool bEnabled, int32 MaxViewers);
+		bool IsPlaybackEnabled() const;
+		/** Maps a view key (what players put in their URL) to a published stream key of App. */
+		void SetPlaybackKeys(TMap<FString, FString> ViewKeyToStream);
+		/** Resolves App/ViewKey to the published stream name. False if playback is off or the key is unknown. */
+		bool ResolvePlayback(const FString& App, const FString& ViewKey, FString& OutStreamName) const;
+		/** Reserves a viewer slot for App/StreamName (false when the limit is reached). */
+		bool AddViewer(const FString& App, const FString& StreamName);
+		void RemoveViewer(const FString& App, const FString& StreamName);
+		int32 GetViewerCount(const FString& App) const;
+		static FString MakePlaybackKey(const FString& App, const FString& ViewKey) { return App + TEXT("|") + ViewKey; }
+
 		// Session -> owner notifications (network threads).
 		void NotifyPublishStarted(const FRtmpStreamInfo& Info);
 		void NotifyPublishEnded(const FRtmpStreamInfo& Info);
 		void NotifyError(const asio::error_code& Error);
+		void NotifyPlayStarted(const FString& App, const FTcpEndpoint& Remote);
+		void NotifyPlayEnded(const FString& App, const FTcpEndpoint& Remote);
 
 	private:
 		void OnAccept(asio::ip::tcp::socket&& Socket);
@@ -129,6 +174,10 @@ namespace IPNet::Rtmp {
 		uint16 Port = 0;
 		mutable FCriticalSection Lock;
 		TArray<FString> AllowedNames;
+		bool bPlaybackEnabled = false;
+		int32 MaxViewersPerStream = 0;
+		TMap<FString, FString> PlaybackKeys;
+		TMap<FString, int32> ViewerCounts;
 		TArray<std::weak_ptr<FRtmpServerSession>> Sessions;
 	};
 
