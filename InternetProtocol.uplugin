@@ -30,6 +30,14 @@
 			"LoadingPhase": "PostDefault"
 		},
 		{
+			"Name": "InternetProtocolExample",
+			"Type": "Runtime",
+			"PlatformAllowList": [
+				"Win64"
+			],
+			"LoadingPhase": "PostDefault"
+		},
+		{
 			"Name": "InternetProtocolTests",
 			"Type": "Editor",
 			"PlatformAllowList": [
