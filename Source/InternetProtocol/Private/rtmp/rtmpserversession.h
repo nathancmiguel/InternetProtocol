@@ -8,6 +8,7 @@
 #include "rtmp/amf0.h"
 #include "rtmp/rtmpchunk.h"
 #include "rtmp/rtmphandshake.h"
+#include "rtmp/rtmpcommon.h"
 #include "net/acceptor.h"
 #include "net/tls.h"
 #include "net/transport.h"
@@ -55,13 +56,6 @@ namespace IPNet::Rtmp {
 			int64 Handle = 0;
 			TSharedRef<IRtmpMediaSink, ESPMode::ThreadSafe> Sink;
 			bool bWaitKeyframe = true;
-		};
-
-		struct FTimestampUnwrapper {
-			uint32 Last = 0;
-			int64 Wraps = 0;
-			bool bStarted = false;
-			int64 Unwrap(uint32 Timestamp);
 		};
 
 		void Fail(const TCHAR* Reason);

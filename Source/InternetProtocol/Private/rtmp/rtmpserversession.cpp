@@ -14,24 +14,11 @@ namespace IPNet::Rtmp {
 		constexpr uint32 ServerChunkSize = 4096;
 		constexpr uint32 PublishStreamId = 1;
 
-		FString ToFString(const std::string& Text) {
-			return FString(UTF8_TO_TCHAR(Text.c_str()));
-		}
-
 		/** "key?token=..." -> "key" (query parameters are not part of the stream identity). */
 		std::string StripQuery(const std::string& Name) {
 			const size_t Query = Name.find('?');
 			return Query == std::string::npos ? Name : Name.substr(0, Query);
 		}
-	}
-
-	int64 FRtmpServerSession::FTimestampUnwrapper::Unwrap(uint32 Timestamp) {
-		if (bStarted && Timestamp < Last && (Last - Timestamp) > 0x80000000u) {
-			++Wraps;
-		}
-		bStarted = true;
-		Last = Timestamp;
-		return (Wraps << 32) | Timestamp;
 	}
 
 	FRtmpServerSession::FRtmpServerSession(std::weak_ptr<FRtmpServerCore> InCore, uint16 InPort)
