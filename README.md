@@ -1,4 +1,7 @@
-# InternetProtocol | 4.27 to 5.6 |
+# InternetProtocol | 4.27 to 5.8 |
+
+> The networking modules (TCP, UDP, HTTP, WebSocket, SSL, RTMP protocol) target 4.27 to 5.8. The live audio/video
+> modules (`InternetProtocolMedia`, `InternetProtocolExample`) require **UE 5.8, Win64**.
 
 The InternetProtocol plugin is a versatile networking solution designed for Unreal Engine, enabling developers to seamlessly establish and manage HTTP, WebSocket, TCP, UDP and RTMP connections, including live audio/video receive and publish (see [RTMP and live audio/video](#rtmp-and-live-audiovideo-ue-58-win64)). This powerful plugin caters to the creation of both clients and servers, providing a robust framework for real-time data exchange and online interaction. Whether you’re developing multiplayer games, interactive applications, or complex networked systems, the InternetProtocol plugin offers the essential tools to bring your project’s connectivity to the next level.
 
