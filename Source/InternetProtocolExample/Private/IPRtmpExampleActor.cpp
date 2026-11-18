@@ -4,6 +4,7 @@
 
 #include "IPRtmpExampleActor.h"
 #include "Components/AudioComponent.h"
+#include "Components/InputComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/StaticMeshComponent.h"
