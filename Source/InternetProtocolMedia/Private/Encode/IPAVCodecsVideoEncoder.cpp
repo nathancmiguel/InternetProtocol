@@ -32,6 +32,10 @@ namespace IPMedia {
 					LastError = FString::Printf(TEXT("invalid video size %dx%d (even values, at least 16)"), Settings.Width, Settings.Height);
 					return false;
 				}
+				// Never touch AVCodecs outside D3D12: on D3D11 a failed encoder creation removes the device.
+				if (!CanUseDefaultVideoEncoder(LastError)) {
+					return false;
+				}
 				FVideoEncoderConfigH264 Config(EAVPreset::Default);
 				Config.LatencyMode = EAVLatencyMode::LowLatency;
 				Config.Width = static_cast<uint32>(Settings.Width);
@@ -102,6 +106,19 @@ namespace IPMedia {
 			FString Name = TEXT("AVCodecs H.264");
 			FString LastError;
 		};
+	}
+
+	bool CanUseDefaultVideoEncoder(FString& OutReason) {
+		if (!GDynamicRHI) {
+			OutReason = TEXT("hardware H.264 publishing needs a GPU (no RHI in this process)");
+			return false;
+		}
+		if (RHIGetInterfaceType() != ERHIInterfaceType::D3D12) {
+			OutReason = FString::Printf(TEXT("hardware H.264 publishing needs the D3D12 RHI (current: %s); use DirectX 12 with SM5 or SM6 shader formats"),
+				GDynamicRHI->GetName());
+			return false;
+		}
+		return true;
 	}
 
 	TSharedPtr<IIPVideoEncoder, ESPMode::ThreadSafe> CreateDefaultVideoEncoder() {

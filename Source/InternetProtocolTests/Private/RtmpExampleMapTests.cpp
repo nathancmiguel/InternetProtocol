@@ -72,8 +72,8 @@ namespace {
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPRtmpExampleMapTest, "InternetProtocol.Example.RtmpMap", ExampleTestFlags)
 bool FIPRtmpExampleMapTest::RunTest(const FString& Parameters) {
 	const FString Ffmpeg = FindFfmpegTool();
-	if (Ffmpeg.IsEmpty() || !GDynamicRHI || FCString::Stricmp(GDynamicRHI->GetName(), TEXT("Null")) == 0 || (!IsRHIDeviceNVIDIA() && !IsRHIDeviceAMD())) {
-		AddWarning(TEXT("Example map test needs ffmpeg, a real RHI and an NVIDIA/AMD GPU: skipped."));
+	if (Ffmpeg.IsEmpty() || !GDynamicRHI || FCString::Stricmp(GDynamicRHI->GetName(), TEXT("Null")) == 0 || (!IsRHIDeviceNVIDIA() && !IsRHIDeviceAMD()) || RHIGetInterfaceType() != ERHIInterfaceType::D3D12) {
+		AddWarning(TEXT("Example map test needs ffmpeg, a real D3D12 RHI and an NVIDIA/AMD GPU: skipped."));
 		return true;
 	}
 	if (!TestTrue(TEXT("Example map opens"), AutomationOpenMap(TEXT("/InternetProtocol/Example/RTMP/RtmpExample")))) {

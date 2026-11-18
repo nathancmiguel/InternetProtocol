@@ -9,6 +9,7 @@
 #include "Engine/TextureRenderTarget2D.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
+#include "IPMediaEncoders.h"
 #include "IPRtmpPublisher.h"
 #include "IPRtmpReceiver.h"
 #include "RHI.h"
@@ -29,6 +30,10 @@ namespace {
 		}
 		if (!IsRHIDeviceNVIDIA() && !IsRHIDeviceAMD()) {
 			Test->AddWarning(TEXT("No NVIDIA/AMD GPU (hardware H.264 needed): publish test skipped."));
+			return false;
+		}
+		if (RHIGetInterfaceType() != ERHIInterfaceType::D3D12) {
+			Test->AddWarning(TEXT("Publishing needs the D3D12 RHI: publish test skipped (see Publish.RequiresD3D12)."));
 			return false;
 		}
 		return true;
@@ -249,6 +254,34 @@ bool FIPRtmpPublishFfmpegTest::RunTest(const FString& Parameters) {
 		Publisher->RemoveFromRoot();
 		Target->RemoveFromRoot();
 	});
+	return true;
+}
+
+/**
+ * Outside D3D12 the default (AVCodecs) encoder must refuse cleanly: on D3D11 a failed AVCodecs encoder creation
+ * removes the GPU device (fatal). Run with -d3d11 to exercise it; skipped on D3D12.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPRtmpPublishRequiresD3D12Test, "InternetProtocol.Media.Publish.RequiresD3D12", PublishTestFlags)
+bool FIPRtmpPublishRequiresD3D12Test::RunTest(const FString& Parameters) {
+	if (!GDynamicRHI || FCString::Stricmp(GDynamicRHI->GetName(), TEXT("Null")) == 0) {
+		AddWarning(TEXT("No RHI: D3D12 requirement test skipped."));
+		return true;
+	}
+	if (RHIGetInterfaceType() == ERHIInterfaceType::D3D12) {
+		AddWarning(TEXT("Running on D3D12: run with -d3d11 to check the refusal."));
+		return true;
+	}
+	TSharedPtr<IIPVideoEncoder, ESPMode::ThreadSafe> Encoder = FIPMediaEncoders::CreateVideoEncoder();
+	TestFalse(TEXT("Default encoder refuses to open outside D3D12"), Encoder->Open(FIPVideoEncoderSettings()));
+	TestTrue(TEXT("Refusal explains the D3D12 requirement"), Encoder->GetLastError().Contains(TEXT("D3D12")));
+
+	UTextureRenderTarget2D* Target = MakeTarget();
+	UIPRtmpPublisher* Publisher = NewObject<UIPRtmpPublisher>();
+	Publisher->AddToRoot();
+	TestFalse(TEXT("Publisher refuses to start"), Publisher->Start(TEXT("rtmp://127.0.0.1:1/live"), TEXT("key"), MakeConfig(Target)));
+	TestEqual(TEXT("Publisher state is Error"), Publisher->GetState(), EIPRtmpPublisherState::Error);
+	Publisher->RemoveFromRoot();
+	Target->RemoveFromRoot();
 	return true;
 }
 

@@ -34,6 +34,10 @@ bool FIPH264EncoderTest::RunTest(const FString& Parameters) {
 		AddWarning(TEXT("No RHI (-nullrhi): H.264 encoder test skipped."));
 		return true;
 	}
+	if (RHIGetInterfaceType() != ERHIInterfaceType::D3D12) {
+		AddWarning(TEXT("Hardware H.264 needs the D3D12 RHI: encoder test skipped."));
+		return true;
+	}
 	TSharedPtr<IIPVideoEncoder, ESPMode::ThreadSafe> Encoder = FIPMediaEncoders::CreateVideoEncoder();
 	FIPVideoEncoderSettings Settings;
 	Settings.Width = 320;

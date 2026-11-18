@@ -39,6 +39,11 @@ TSharedPtr<IIPVideoEncoder, ESPMode::ThreadSafe> FIPMediaEncoders::CreateVideoEn
 	return Factory ? Factory() : IPMedia::CreateDefaultVideoEncoder();
 }
 
+bool FIPMediaEncoders::HasCustomVideoEncoderFactory() {
+	FScopeLock ScopeLock(&EncoderFactoryLock);
+	return static_cast<bool>(VideoEncoderFactory());
+}
+
 TSharedPtr<IIPAudioEncoder, ESPMode::ThreadSafe> FIPMediaEncoders::CreateAudioEncoder() {
 	FIPAudioEncoderFactory Factory;
 	{

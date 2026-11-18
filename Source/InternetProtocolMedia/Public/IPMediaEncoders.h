@@ -85,5 +85,7 @@ public:
 	static void SetAudioEncoderFactory(FIPAudioEncoderFactory Factory);
 	/** Creates an encoder with the registered factory. Thread-safe. */
 	static TSharedPtr<IIPVideoEncoder, ESPMode::ThreadSafe> CreateVideoEncoder();
+	/** True when SetVideoEncoderFactory replaced the default (AVCodecs) encoder. */
+	static bool HasCustomVideoEncoderFactory();
 	static TSharedPtr<IIPAudioEncoder, ESPMode::ThreadSafe> CreateAudioEncoder();
 };

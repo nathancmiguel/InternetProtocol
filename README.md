@@ -174,6 +174,9 @@ A light flash and a beep every second help judge audio/video sync. The map and i
 - **Engine version:** UE 5.8, Win64 only. The RTMP media modules use Electra and AVCodecs APIs from 5.8.
 - **Encoders:** AVCodecs is **Experimental** in UE 5.8, so its API may change in later versions. The encoders are behind `IIPVideoEncoder` / `IIPAudioEncoder` (`FIPMediaEncoders::Set*EncoderFactory`), so they can be replaced.
 - **No software H.264 encoder:** publishing needs an NVIDIA (NVENC) or AMD (AMF) GPU. Otherwise `Start` reports a clear error through `OnError`.
+- **Publishing requires the D3D12 RHI.** AVCodecs' D3D11 path removes the GPU device when it fails to open, so on D3D11 `Start` refuses with a clear error instead. Receiving works on both D3D11 and D3D12.
+  - A GPU without SM6 (e.g. GTX 750 Ti) falls back to D3D11 when the project targets only `PCD3D_SM6` for D3D12.
+  - To keep D3D12 on such GPUs, also target SM5: Project Settings > Platforms > Windows > Targeted RHIs > *DirectX 12 (SM5)*, i.e. `+D3D12TargetedShaderFormats=PCD3D_SM5`.
 - **Decode speed follows the engine frame rate:** Electra hands decoded pictures to the GPU through the RHI. If the game runs slower than the stream (or is throttled by Windows while in the background), frames are dropped.
   - Windows' background power throttling (EcoQoS) can cut a background Unreal process to about 20 fps.
   - For reliable results keep the window in the foreground, or use the *Best performance* power mode.

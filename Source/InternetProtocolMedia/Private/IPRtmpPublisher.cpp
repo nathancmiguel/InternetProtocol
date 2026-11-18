@@ -10,6 +10,8 @@
 #include "Engine/TextureRenderTarget2D.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/PlatformTime.h"
+#include "Encode/IPEncoderDefaults.h"
+#include "IPMediaEncoders.h"
 #include "Publish/IPPublishPipeline.h"
 #include "Rendering/SlateRenderer.h"
 #include "RenderingThread.h"
@@ -76,6 +78,13 @@ bool UIPRtmpPublisher::Start(const FString& Url, const FString& StreamKey, const
 	Config.Width = FMath::Max(16, Config.Width & ~1);
 	Config.Height = FMath::Max(16, Config.Height & ~1);
 	Config.FrameRate = FMath::Clamp(Config.FrameRate, 1, 120);
+
+	// Refuse before any thread or connection exists (the default encoder would also refuse, later).
+	FString EncoderError;
+	if (!FIPMediaEncoders::HasCustomVideoEncoderFactory() && !IPMedia::CanUseDefaultVideoEncoder(EncoderError)) {
+		Fail(EncoderError);
+		return false;
+	}
 
 	switch (Config.VideoSource) {
 	case EIPPublishVideoSource::RenderTarget:
