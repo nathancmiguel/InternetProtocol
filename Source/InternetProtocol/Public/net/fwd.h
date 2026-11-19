@@ -38,8 +38,8 @@ struct FIpStreamState {
 	std::shared_ptr<IPNet::FTransport> Transport;
 	/** Session whose events are currently delivered (0 = none). */
 	uint64 SessionId = 0;
-	/** Session closed by the user whose OnClose has not been delivered yet. */
-	uint64 PendingCloseId = 0;
+	/** Sessions closed by the user whose final OnClose has not been delivered yet (Close then Connect again). */
+	TArray<uint64, TInlineAllocator<2>> PendingCloseIds;
 	bool bOpen = false;
 	FTcpEndpoint Local;
 	FTcpEndpoint Remote;
@@ -50,7 +50,8 @@ struct FIpStreamState {
 struct FIpServerState {
 	std::shared_ptr<IPNet::FTcpAcceptor> Acceptor;
 	uint64 SessionId = 0;
-	uint64 PendingCloseId = 0;
+	/** Sessions closed by the user whose final OnClose has not been delivered yet (Close then Connect again). */
+	TArray<uint64, TInlineAllocator<2>> PendingCloseIds;
 	bool bOpen = false;
 	FTcpEndpoint Local;
 	FErrorCode LastError;
@@ -60,7 +61,8 @@ struct FIpServerState {
 struct FIpUdpState {
 	std::shared_ptr<IPNet::FUdpSocket> Socket;
 	uint64 SessionId = 0;
-	uint64 PendingCloseId = 0;
+	/** Sessions closed by the user whose final OnClose has not been delivered yet (Close then Connect again). */
+	TArray<uint64, TInlineAllocator<2>> PendingCloseIds;
 	bool bOpen = false;
 	FUdpEndpoint Local;
 	FUdpEndpoint Remote;

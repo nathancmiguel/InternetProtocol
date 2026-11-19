@@ -7,6 +7,8 @@
 #include "net/facade.h"
 #include "net/http.h"
 #include "http/httpclient.h"
+#include "http/httpremote.h"
+#include "Containers/Ticker.h"
 
 /*
  * HTTP facades.
@@ -26,9 +28,23 @@ namespace IPNet {
 
 		std::weak_ptr<FTransport> Transport;
 
+		/** Pipelined bytes buffered while a response is pending, before the connection is dropped. */
+		static constexpr size_t MaxPipelinedBytes = 1024 * 1024;
+
 		/** Strand. */
 		void OnData(const uint8* Data, size_t Size) {
+			if (bFailed) {
+				return; // the error response is on its way and the connection closes: ignore the rest
+			}
 			Parser.Append(Data, Size);
+			if (bAwaiting && Parser.BufferedBytes() > MaxPipelinedBytes) {
+				// A client flooding pipelined requests faster than they are answered: memory stays bounded.
+				bFailed = true;
+				if (std::shared_ptr<FTransport> Strong = Transport.lock()) {
+					Strong->Close();
+				}
+				return;
+			}
 			ParseLoop();
 		}
 
@@ -110,6 +126,10 @@ namespace IPNet {
 				const FIpHttpPendingRequest& Front = S.Queue[0];
 				const bool bHead = Front.Request.Method == ERequestMethod::HEAD;
 				FBytes Bytes = SerializeRequest(Front.Request, HostHeader(Self->bind_options, bTls));
+				if (Bytes.empty()) {
+					FailFront(Self, FErrorCode(MakeError(EError::InvalidArgument)));
+					continue;
+				}
 				std::shared_ptr<FHttpParser> Parser = S.Parser;
 				S.Net.Transport->Post([Parser, bHead]() { Parser->SetNoBody(bHead); });
 				if (S.Net.Transport->Send(MoveTemp(Bytes))) {
@@ -146,6 +166,11 @@ namespace IPNet {
 					if (Result == FHttpParser::EResult::Complete) {
 						FHttpResponse Response = MoveTemp(Parser->Response);
 						Parser->Next();
+						// 1xx (100 Continue, 103 Early Hints...) are interim: the final response follows on the
+						// same request. 101 Switching Protocols is final (the connection changes protocol).
+						if (Response.Status_Code >= 100 && Response.Status_Code < 200 && Response.Status_Code != 101) {
+							continue;
+						}
 						RunOnGameThread(Weak, [Id, Response = MoveTemp(Response), Tls, bTls](T* Owner) {
 							OnResponse(Owner, Id, Response, Tls, bTls);
 						});
@@ -238,6 +263,16 @@ namespace IPNet {
 				FailFront(Self, Error);
 			}
 			Pump(Self, Tls, bTls);
+		}
+
+		/**
+		 * The target changed: the current connection must not be reused, and requests already sent or queued
+		 * for the previous host fail (Cancelled) instead of waiting forever for a response that cannot come.
+		 */
+		template <typename T>
+		static void ChangeHost(T* Self) {
+			Detach(Self->State);
+			FailAll(Self, FErrorCode(MakeError(EError::Cancelled)));
 		}
 
 		/** Forgets the current connection without delivering anything else from it. */
@@ -371,6 +406,32 @@ namespace IPNet {
 			}
 			Remote->bHeadRequest = Request.Method == ERequestMethod::HEAD;
 			Remote->bResponsePending = true;
+			++Remote->ResponseSerial;
+		}
+
+		/**
+		 * A handler that never calls Write would block the connection forever (responses are ordered): after
+		 * Seconds the request is answered with 503 automatically. 0 disables it.
+		 */
+		template <typename TRemote>
+		static void ArmResponseTimeout(TRemote* Remote, float Seconds) {
+			if (Seconds <= 0.0f || !Remote->bResponsePending) {
+				return;
+			}
+			TWeakObjectPtr<TRemote> Weak(Remote);
+			const uint32 Serial = Remote->ResponseSerial;
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak, Serial](float) {
+				TRemote* Owner = Weak.Get();
+				if (Owner && Owner->bResponsePending && Owner->ResponseSerial == Serial) {
+					UE_LOG(LogAsio, Warning, TEXT("InternetProtocol HTTP: request handler did not respond in time, sending 503."));
+					Owner->Headers.Status_Code = 503;
+					Owner->Headers.Status_Message = TEXT("Service Unavailable");
+					Owner->Headers.Headers.Add(TEXT("Content-Type"), TEXT("text/plain"));
+					Owner->Headers.Body = TEXT("The request was not answered in time.");
+					Owner->Write(FDelegateHttpRemoteMessageSent());
+				}
+				return false;
+			}), Seconds);
 		}
 
 		template <typename TRemote, typename TDelegate>

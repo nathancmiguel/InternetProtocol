@@ -99,7 +99,7 @@ bool UHttpServer::Open(const FServerBindOptions& BindOpts) {
 void UHttpServer::Close() {
 	FFacadeAccess::CloseServer(this);
 	TArray<UHttpRemote*> Remotes = ClientSet.Array();
-	ClientSet.Empty();
+	// Remotes stay referenced until their own OnClose (they remove themselves then).
 	for (UHttpRemote* Remote : Remotes) {
 		if (IsValid(Remote)) {
 			Remote->Close();
@@ -155,6 +155,8 @@ void UHttpServer::Route(UHttpRemote* Remote, const FHttpRequest& Request) {
 		Remote->Headers.Status_Message = TEXT("Not Found");
 		Remote->Headers.Body = TEXT("Not Found");
 		Remote->Write(FDelegateHttpRemoteMessageSent());
+	} else if (IsValid(Remote)) {
+		FHttpAccess::ArmResponseTimeout(Remote, ResponseTimeoutSeconds);
 	}
 }
 
@@ -263,7 +265,7 @@ bool UHttpServerSsl::Open(const FServerBindOptions& BindOpts) {
 void UHttpServerSsl::Close() {
 	FFacadeAccess::CloseServer(this);
 	TArray<UHttpRemoteSsl*> Remotes = ClientSet.Array();
-	ClientSet.Empty();
+	// Remotes stay referenced until their own OnClose (they remove themselves then).
 	for (UHttpRemoteSsl* Remote : Remotes) {
 		if (IsValid(Remote)) {
 			Remote->Close();
@@ -319,5 +321,7 @@ void UHttpServerSsl::Route(UHttpRemoteSsl* Remote, const FHttpRequest& Request) 
 		Remote->Headers.Status_Message = TEXT("Not Found");
 		Remote->Headers.Body = TEXT("Not Found");
 		Remote->Write(FDelegateHttpRemoteMessageSent());
+	} else if (IsValid(Remote)) {
+		FHttpAccess::ArmResponseTimeout(Remote, ResponseTimeoutSeconds);
 	}
 }

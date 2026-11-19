@@ -60,6 +60,8 @@ private:
 	FIpStreamState Net;
 	std::shared_ptr<IPNet::FHttpServerSession> Session;
 	bool bResponsePending = false;
+	/** Incremented for every request; the automatic 503 only answers the request it was armed for. */
+	uint32 ResponseSerial = 0;
 	bool bWillClose = false;
 	bool bHeadRequest = false;
 	/** Set by the owning server (Game Thread). */
@@ -112,6 +114,8 @@ private:
 	FIpStreamState Net;
 	std::shared_ptr<IPNet::FHttpServerSession> Session;
 	bool bResponsePending = false;
+	/** Incremented for every request; the automatic 503 only answers the request it was armed for. */
+	uint32 ResponseSerial = 0;
 	bool bWillClose = false;
 	bool bHeadRequest = false;
 	/** Set by the owning server (Game Thread). */

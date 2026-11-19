@@ -64,7 +64,7 @@ bool UWSServer::Open(const FServerBindOptions& BindOpts) {
 void UWSServer::Close() {
 	FFacadeAccess::CloseServer(this);
 	TArray<UWSRemote*> Remotes = ClientSet.Array();
-	ClientSet.Empty();
+	// Remotes stay referenced until their own OnClose (they remove themselves then).
 	for (UWSRemote* Remote : Remotes) {
 		if (IsValid(Remote)) {
 			Remote->End(1001, TEXT("Server shutdown"));
@@ -142,7 +142,7 @@ bool UWSServerSsl::Open(const FServerBindOptions& BindOpts) {
 void UWSServerSsl::Close() {
 	FFacadeAccess::CloseServer(this);
 	TArray<UWSRemoteSsl*> Remotes = ClientSet.Array();
-	ClientSet.Empty();
+	// Remotes stay referenced until their own OnClose (they remove themselves then).
 	for (UWSRemoteSsl* Remote : Remotes) {
 		if (IsValid(Remote)) {
 			Remote->End(1001, TEXT("Server shutdown"));

@@ -65,6 +65,8 @@ namespace IPNet {
 		FBytes TakeRemaining();
 
 		bool HasPartialMessage() const { return Phase != EPhase::Headers || Pos < Buffer.size(); }
+		/** Bytes received and not parsed yet (pipelined requests waiting for the current response). */
+		size_t BufferedBytes() const { return Buffer.size() - Pos; }
 
 		FHttpRequest Request;
 		FHttpResponse Response;
@@ -88,6 +90,9 @@ namespace IPNet {
 		std::vector<uint8> Buffer;
 		size_t Pos = 0;
 		size_t HeaderScan = 0;
+		/** Chunked trailers seen for the current message (bounded like headers). */
+		size_t TrailerBytes = 0;
+		int32 TrailerLines = 0;
 		EPhase Phase = EPhase::Headers;
 		uint64 Remaining = 0;
 		std::vector<uint8> Body;

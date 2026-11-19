@@ -21,6 +21,8 @@ namespace IPNet {
 		TimedOut,
 		InvalidArgument,
 		NotFound,
+		/** The operation was abandoned by the caller (e.g. the HTTP host changed while a request was in flight). */
+		Cancelled,
 	};
 
 	const asio::error_category& GetErrorCategory();

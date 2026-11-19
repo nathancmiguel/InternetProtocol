@@ -195,6 +195,11 @@ namespace IPNet {
 			}
 		}
 		Target.ReplaceInline(TEXT(" "), TEXT("%20"));
+		if (!IsSafeHeaderText(Target) || !IsSafeHeaderText(Host)) {
+			// CR/LF would inject extra lines into the request (request splitting): refuse to send it.
+			UE_LOG(LogAsio, Warning, TEXT("InternetProtocol HTTP: request refused, the path or host contains CR/LF."));
+			return FBytes();
+		}
 
 		const FString Version = Request.Version.IsEmpty() ? FString(TEXT("1.1")) : Request.Version;
 		FString Head = RequestMethodToString(Request.Method) + TEXT(" ") + Target + TEXT(" HTTP/") + Version + TEXT("\r\n");
@@ -283,6 +288,8 @@ namespace IPNet {
 		Remaining = 0;
 		Phase = EPhase::Headers;
 		HeaderScan = 0;
+		TrailerBytes = 0;
+		TrailerLines = 0;
 		ErrorStatus = 400;
 		ErrorMessage.Reset();
 	}
@@ -544,6 +551,8 @@ namespace IPNet {
 				if (Body.size() + Size > Limits.MaxBodyBytes) {
 					return Fail(413, TEXT("body too large"));
 				}
+				// Drop the consumed framing so a long chunked body cannot keep every size line in memory.
+				Compact();
 				if (Size == 0) {
 					Phase = EPhase::Trailers;
 				} else {
@@ -563,7 +572,13 @@ namespace IPNet {
 					FinishBody();
 					return EResult::Complete;
 				}
-				break; // trailers are ignored
+				// Trailers are ignored, but bounded like headers (count and total size).
+				TrailerBytes += static_cast<size_t>(Line.Len()) + 2;
+				if (++TrailerLines > 100 || TrailerBytes > Limits.MaxHeaderBytes) {
+					return Fail(431, TEXT("trailers too large"));
+				}
+				Compact();
+				break;
 			}
 			case EPhase::UntilEof: {
 				const size_t Available = Buffer.size() - Pos;

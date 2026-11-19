@@ -603,4 +603,247 @@ bool FIPManualExitTest::RunTest(const FString& Parameters) {
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Phase 0 regressions
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPWsCloseReconnectTest, "InternetProtocol.WebSocket.CloseThenConnect", IPTests::Flags)
+bool FIPWsCloseReconnectTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UWSServer* Server = Make<UWSServer>();
+	UWSClient* Client = Make<UWSClient>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnWsAccepted);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnWsConnected);
+	Client->OnMessage.AddDynamic(L, &UIPTestListener::OnWsMessage);
+	Client->OnClose.AddDynamic(L, &UIPTestListener::OnWsClose);
+	if (!TestTrue(TEXT("WS server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	const int32 Port = Server->LocalEndpoint().Port;
+	Client->Connect(ClientTo(Port));
+	WaitUntil(this, TEXT("first connection"), [L]() { return L->Connected == 1; });
+	Then([this, Client, Port]() {
+		// The old connection's close arrives after the new connection started: it must not wipe it.
+		Client->Close(1000, TEXT("again"));
+		TestTrue(TEXT("Reconnect accepted right after Close"), Client->Connect(ClientTo(Port)));
+	});
+	WaitUntil(this, TEXT("second connection"), [L]() { return L->Connected == 2; });
+	WaitUntil(this, TEXT("first OnClose"), [L]() { return L->Closed == 1; });
+	Then([Client]() { Client->Write(TEXT("still alive"), FDataframe(), FDelegateWsClientMessageSent()); });
+	WaitUntil(this, TEXT("echo on the new connection"), [L]() { return L->Messages == 1; });
+	Then([this, L, ServerL, Client, Server]() {
+		TestTrue(TEXT("New connection still open"), Client->IsOpen());
+		TestEqual(TEXT("Exactly one OnClose (the old connection)"), L->Closed, 1);
+		Client->Close(1000, TEXT("done"));
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPTcpCloseReconnectTest, "InternetProtocol.TCP.CloseTwiceKeepsEveryOnClose", IPTests::Flags)
+bool FIPTcpCloseReconnectTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Server = Make<UTCPServer>();
+	UTCPClient* Client = Make<UTCPClient>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnTcpAccepted);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnClose.AddDynamic(L, &UIPTestListener::OnClose);
+	if (!TestTrue(TEXT("TCP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	const int32 Port = Server->LocalEndpoint().Port;
+	Then([Client, Port]() {
+		// Close -> Connect -> Close quickly: both sessions must still report their OnClose.
+		Client->Connect(ClientTo(Port));
+		Client->Close();
+		Client->Connect(ClientTo(Port));
+		Client->Close();
+	});
+	WaitUntil(this, TEXT("two OnClose"), [L]() { return L->Closed == 2; });
+	Then([this, L, ServerL, Client, Server]() {
+		TestEqual(TEXT("Two OnClose"), L->Closed, 2);
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPServerCloseRemotesTest, "InternetProtocol.TCP.ServerCloseNotifiesRemotes", IPTests::Flags)
+bool FIPServerCloseRemotesTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Server = Make<UTCPServer>();
+	UTCPClient* Client = Make<UTCPClient>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnRawAccepted);
+	Client->OnClose.AddDynamic(L, &UIPTestListener::OnClose);
+	if (!TestTrue(TEXT("TCP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	Client->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("accepted"), [ServerL]() { return ServerL->Accepted == 1; });
+	Then([this, Server]() {
+		Server->Close();
+		TestEqual(TEXT("Remote still listed until its OnClose"), Server->Clients().Num(), 1);
+	});
+	WaitUntil(this, TEXT("remote OnClose"), [ServerL]() { return ServerL->RemoteClosed == 1; });
+	WaitUntil(this, TEXT("client OnClose"), [L]() { return L->Closed == 1; });
+	Then([this, L, ServerL, Client, Server]() {
+		TestEqual(TEXT("Remote removed after its OnClose"), Server->Clients().Num(), 0);
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpInterimTest, "InternetProtocol.HTTP.InterimResponses", IPTests::Flags)
+bool FIPHttpInterimTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Raw = Make<UTCPServer>();
+	UHttpClient* Client = Make<UHttpClient>();
+	ServerL->RawReply = TEXT("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n")
+	                    TEXT("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal");
+	Raw->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnRawAccepted);
+	if (!TestTrue(TEXT("Raw server opens"), Raw->Open(Loopback()))) {
+		return false;
+	}
+	Client->SetHost(ClientTo(Raw->LocalEndpoint().Port));
+	FDelegateHttpClientResponse OnResponse;
+	OnResponse.BindUFunction(L, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpResponse));
+	Client->Request(FHttpRequest(), OnResponse);
+	WaitUntil(this, TEXT("final response"), [L]() { return L->Responses.Num() >= 1; });
+	Then([this, L, Raw, Client]() {
+		TestEqual(TEXT("Exactly one response delivered"), L->Responses.Num(), 1);
+		TestEqual(TEXT("1xx skipped: final status"), L->Responses[0].Status_Code, 200);
+		TestEqual(TEXT("Final body"), L->Responses[0].Body, FString(TEXT("final")));
+		Client->Close();
+		Raw->Close();
+		Release(Client);
+		Release(Raw);
+		Release(L);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpSetHostInFlightTest, "InternetProtocol.HTTP.SetHostCancelsInFlight", IPTests::Flags)
+bool FIPHttpSetHostInFlightTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Silent = Make<UTCPServer>();
+	UHttpServer* Real = Make<UHttpServer>();
+	UHttpClient* Client = Make<UHttpClient>();
+	Silent->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnRawAccepted); // never answers
+	FDelegateHttpServerRequest Hello;
+	Hello.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpHello));
+	Real->Get(TEXT("/hello"), Hello);
+	if (!TestTrue(TEXT("Servers open"), Silent->Open(Loopback()) && Real->Open(Loopback()))) {
+		return false;
+	}
+	Client->SetHost(ClientTo(Silent->LocalEndpoint().Port));
+	FDelegateHttpClientResponse OnResponse;
+	OnResponse.BindUFunction(L, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpResponse));
+	Client->Request(FHttpRequest(), OnResponse);
+	Client->Request(FHttpRequest(), OnResponse);
+	WaitUntil(this, TEXT("request reached the silent server"), [ServerL]() { return ServerL->Messages >= 1; });
+	Then([Client, Real, OnResponse]() {
+		Client->SetHost(ClientTo(Real->LocalEndpoint().Port));
+		FHttpRequest Get;
+		Get.Path = TEXT("/hello");
+		Client->Request(Get, OnResponse);
+	});
+	WaitUntil(this, TEXT("cancelled + new response"), [L]() { return L->Responses.Num() == 3; });
+	Then([this, L, Silent, Real, Client]() {
+		TestTrue(TEXT("In-flight request cancelled"), L->ResponseErrors[0].Value != 0);
+		TestTrue(TEXT("Queued request cancelled"), L->ResponseErrors[1].Value != 0);
+		TestEqual(TEXT("Request to the new host works"), L->Responses[2].Status_Code, 200);
+		Client->Close();
+		Silent->Close();
+		Real->Close();
+		Release(Client);
+		Release(Silent);
+		Release(Real);
+		Release(L);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpMuteHandlerTest, "InternetProtocol.HTTP.MuteHandlerGets503", IPTests::Flags)
+bool FIPHttpMuteHandlerTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UHttpServer* Server = Make<UHttpServer>();
+	UHttpClient* Client = Make<UHttpClient>();
+	Server->ResponseTimeoutSeconds = 0.5f;
+	FDelegateHttpServerRequest Mute;
+	Mute.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpMute));
+	Server->Get(TEXT("/mute"), Mute);
+	if (!TestTrue(TEXT("HTTP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	Client->SetHost(ClientTo(Server->LocalEndpoint().Port));
+	FDelegateHttpClientResponse OnResponse;
+	OnResponse.BindUFunction(L, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpResponse));
+	FHttpRequest Get;
+	Get.Path = TEXT("/mute");
+	Client->Request(Get, OnResponse);
+	Client->Request(Get, OnResponse);
+	WaitUntil(this, TEXT("two 503"), [L]() { return L->Responses.Num() == 2; }, 10.0);
+	Then([this, L, Server, Client]() {
+		TestEqual(TEXT("First 503"), L->Responses[0].Status_Code, 503);
+		TestEqual(TEXT("Second request answered too (connection not stuck)"), L->Responses[1].Status_Code, 503);
+		Client->Close();
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpPipelineFloodTest, "InternetProtocol.HTTP.PipelineFloodIsBounded", IPTests::Flags)
+bool FIPHttpPipelineFloodTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UHttpServer* Server = Make<UHttpServer>();
+	UTCPClient* Raw = Make<UTCPClient>();
+	Server->ResponseTimeoutSeconds = 0.0f; // the first request stays unanswered while the flood arrives
+	FDelegateHttpServerRequest Mute;
+	Mute.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpMute));
+	Server->Get(TEXT("/mute"), Mute);
+	Raw->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Raw->OnClose.AddDynamic(L, &UIPTestListener::OnClose);
+	if (!TestTrue(TEXT("HTTP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	Raw->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("raw connected"), [L]() { return L->Connected == 1; });
+	Then([Raw]() {
+		const FString One = TEXT("GET /mute HTTP/1.1\r\nHost: x\r\n\r\n");
+		FString Flood;
+		while (Flood.Len() < 2 * 1024 * 1024) {
+			Flood += One;
+		}
+		Raw->Write(Flood, FDelegateTcpClientMessageSent());
+	});
+	WaitUntil(this, TEXT("server drops the flooding connection"), [L]() { return L->Closed == 1; }, 15.0);
+	Then([this, ServerL, Server, Raw]() {
+		TestEqual(TEXT("Only the first request reached the handler"), ServerL->Messages, 1);
+		Server->Close();
+		Release(Raw);
+		Release(Server);
+		Release(ServerL);
+	});
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

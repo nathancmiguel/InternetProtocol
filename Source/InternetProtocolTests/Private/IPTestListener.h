@@ -123,6 +123,31 @@ public:
 		Remote->Write(FDelegateHttpRemoteMessageSent());
 	}
 
+	// ---- raw TCP peers for HTTP edge cases ----
+	int32 RemoteClosed = 0;
+	FString RawReply;
+	UPROPERTY() TArray<TObjectPtr<UTCPRemote>> RawRemotes;
+	/** Answers every request with RawReply verbatim (crafted HTTP responses); empty RawReply = never answers. */
+	UFUNCTION() void OnRawAccepted(UTCPRemote* Remote) {
+		++Accepted;
+		RawRemotes.Add(Remote);
+		Remote->OnMessage.AddDynamic(this, &UIPTestListener::OnRawRequest);
+		Remote->OnClose.AddDynamic(this, &UIPTestListener::OnRemoteClose);
+	}
+	UFUNCTION() void OnRawRequest(const TArray<uint8>& Buffer, int Bytes) {
+		++Messages;
+		if (!RawReply.IsEmpty()) {
+			for (UTCPRemote* Remote : RawRemotes) {
+				if (IsValid(Remote)) {
+					Remote->Write(RawReply, FDelegateTcpRemoteMessageSent());
+				}
+			}
+		}
+	}
+	UFUNCTION() void OnRemoteClose() { ++RemoteClosed; }
+	/** HTTP route that never answers (the server must send 503 by itself). */
+	UFUNCTION() void OnHttpMute(const FHttpRequest& Request, UHttpRemote* Remote) { ++Messages; }
+
 	// ---- WebSocket ----
 	UFUNCTION() void OnWsConnected(const FHttpResponse& Handshake) { ++Connected; }
 	UFUNCTION() void OnWsUnexpected(const FHttpResponse& Handshake) { ++Errors; }

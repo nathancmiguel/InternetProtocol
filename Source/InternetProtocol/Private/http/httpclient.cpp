@@ -33,8 +33,8 @@ bool UHttpClient::IsOpen() {
 
 void UHttpClient::SetHost(const FClientBindOptions& BindOpts) {
 	if (BindOpts.Address != bind_options.Address || BindOpts.Port != bind_options.Port || BindOpts.Protocol != bind_options.Protocol) {
-		// A keep-alive connection to the previous host must not be reused for the new one.
-		FHttpAccess::Detach(State);
+		// A keep-alive connection to the previous host must not be reused, and its requests are cancelled.
+		FHttpAccess::ChangeHost(this);
 	}
 	bind_options = BindOpts;
 }
@@ -79,8 +79,8 @@ bool UHttpClientSsl::IsOpen() {
 
 void UHttpClientSsl::SetHost(const FClientBindOptions& BindOpts) {
 	if (BindOpts.Address != bind_options.Address || BindOpts.Port != bind_options.Port || BindOpts.Protocol != bind_options.Protocol) {
-		// A keep-alive connection to the previous host must not be reused for the new one.
-		FHttpAccess::Detach(State);
+		// A keep-alive connection to the previous host must not be reused, and its requests are cancelled.
+		FHttpAccess::ChangeHost(this);
 	}
 	bind_options = BindOpts;
 }

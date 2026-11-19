@@ -89,7 +89,7 @@ namespace IPNet {
 		static std::function<void(const asio::error_code&)> MakeErrorEvent(const TWeakObjectPtr<T>& Weak, uint64 Id) {
 			return [Weak, Id](const asio::error_code& Ec) {
 				RunOnGameThread(Weak, [Id, Ec](T* Self) {
-					if (Self->Net.SessionId == Id || Self->Net.PendingCloseId == Id) {
+					if (Self->Net.SessionId == Id || Self->Net.PendingCloseIds.Contains(Id)) {
 						Self->Net.LastError = FErrorCode(Ec);
 						Self->OnError.Broadcast(Self->Net.LastError);
 					}
@@ -97,20 +97,50 @@ namespace IPNet {
 			};
 		}
 
-		/** Updates state for a closed session; returns true if OnClose must be broadcast. */
+		enum class EClosed : uint8 {
+			/** Not ours (stale event): ignore. */
+			None,
+			/** The current session closed: its state must be cleared and OnClose broadcast. */
+			Current,
+			/** A session the user already closed (maybe followed by a new Connect): only OnClose is broadcast. */
+			Pending,
+		};
+
+		/**
+		 * Updates state for a closed session. Only the current session clears the shared state: after
+		 * Close() + Connect(), the old session's late close must not wipe the new one.
+		 */
 		template <typename TState>
-		static bool StreamClosed(TState& State, uint64 Id) {
-			if (State.SessionId == Id) {
+		static EClosed StreamClosedKind(TState& State, uint64 Id) {
+			if (Id != 0 && State.SessionId == Id) {
 				State.SessionId = 0;
 				State.bOpen = false;
 				ResetNative(State);
-				return true;
+				return EClosed::Current;
 			}
-			if (State.PendingCloseId == Id) {
-				State.PendingCloseId = 0;
-				return true;
+			if (State.PendingCloseIds.Remove(Id) > 0) {
+				return EClosed::Pending;
 			}
-			return false;
+			return EClosed::None;
+		}
+
+		/** Returns true if OnClose must be broadcast. */
+		template <typename TState>
+		static bool StreamClosed(TState& State, uint64 Id) {
+			return StreamClosedKind(State, Id) != EClosed::None;
+		}
+
+		/** Remembers a user-closed session so that its final OnClose is still delivered. */
+		template <typename TState>
+		static void AddPendingClose(TState& State, uint64 Id) {
+			if (Id == 0) {
+				return;
+			}
+			// Bounded: a session whose close never arrives (should not happen) cannot grow this forever.
+			if (State.PendingCloseIds.Num() >= 16) {
+				State.PendingCloseIds.RemoveAt(0);
+			}
+			State.PendingCloseIds.AddUnique(Id);
 		}
 
 		static void ResetNative(FIpStreamState& State) { State.Transport.reset(); }
@@ -160,7 +190,7 @@ namespace IPNet {
 			}
 			State.Transport->Close();
 			State.Transport.reset();
-			State.PendingCloseId = State.SessionId;
+			AddPendingClose(State, State.SessionId);
 			State.SessionId = 0;
 			State.bOpen = false;
 		}
@@ -172,7 +202,7 @@ namespace IPNet {
 				State.Transport.reset();
 			}
 			State.SessionId = 0;
-			State.PendingCloseId = 0;
+			State.PendingCloseIds.Reset();
 		}
 
 		template <typename T, typename TDelegate>
@@ -273,7 +303,7 @@ namespace IPNet {
 			}
 			Self->Server.Acceptor->Close();
 			Self->Server.Acceptor.reset();
-			Self->Server.PendingCloseId = Self->Server.SessionId;
+			AddPendingClose(Self->Server, Self->Server.SessionId);
 			Self->Server.SessionId = 0;
 			Self->Server.bOpen = false;
 		}
@@ -284,7 +314,7 @@ namespace IPNet {
 				State.Acceptor.reset();
 			}
 			State.SessionId = 0;
-			State.PendingCloseId = 0;
+			State.PendingCloseIds.Reset();
 			State.bOpen = false;
 		}
 
@@ -354,7 +384,7 @@ namespace IPNet {
 			}
 			State.Socket->Close();
 			State.Socket.reset();
-			State.PendingCloseId = State.SessionId;
+			AddPendingClose(State, State.SessionId);
 			State.SessionId = 0;
 			State.bOpen = false;
 		}
@@ -365,7 +395,7 @@ namespace IPNet {
 				State.Socket.reset();
 			}
 			State.SessionId = 0;
-			State.PendingCloseId = 0;
+			State.PendingCloseIds.Reset();
 			State.bOpen = false;
 		}
 

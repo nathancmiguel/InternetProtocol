@@ -60,7 +60,7 @@ namespace IPNet {
 			Events.OnData = [Session](const uint8* Data, size_t Size) { Session->OnData(Data, Size); };
 			Events.OnError = [Weak, Id](const asio::error_code& Ec) {
 				RunOnGameThread(Weak, [Id, Ec](T* Self) {
-					if (Self->State.Net.SessionId == Id || Self->State.Net.PendingCloseId == Id) {
+					if (Self->State.Net.SessionId == Id || Self->State.Net.PendingCloseIds.Contains(Id)) {
 						Self->State.Net.LastError = FErrorCode(Ec);
 						Self->OnError.Broadcast(Self->State.Net.LastError);
 					}
@@ -71,9 +71,13 @@ namespace IPNet {
 				FString Reason;
 				Session->OnTransportClosed(Code, Reason);
 				RunOnGameThread(Weak, [Id, Code, Reason](T* Self) {
-					if (FFacadeAccess::StreamClosed(Self->State.Net, Id)) {
-						Self->State.Session.reset();
-						Self->State.bClosing = false;
+					const FFacadeAccess::EClosed Kind = FFacadeAccess::StreamClosedKind(Self->State.Net, Id);
+					if (Kind != FFacadeAccess::EClosed::None) {
+						// After Close() + Connect() the WebSocket session belongs to the new connection.
+						if (Kind == FFacadeAccess::EClosed::Current) {
+							Self->State.Session.reset();
+							Self->State.bClosing = false;
+						}
 						Self->OnClose.Broadcast(Code, Reason);
 						FFacadeAccess::NotifyClosed(Self);
 					}
@@ -262,9 +266,9 @@ namespace IPNet {
 			}
 			Self->State.Session->Close(static_cast<uint16>(FMath::Clamp(Code, 0, 65535)), Reason);
 			// The session aborts the transport; the final OnClose(Code, Reason) is still delivered
-			// (PendingCloseId), nothing else from this connection is.
+			// (PendingCloseIds), nothing else from this connection is.
 			Self->State.Net.Transport.reset();
-			Self->State.Net.PendingCloseId = Self->State.Net.SessionId;
+			FFacadeAccess::AddPendingClose(Self->State.Net, Self->State.Net.SessionId);
 			Self->State.Net.SessionId = 0;
 			Self->State.Net.bOpen = false;
 			Self->State.Session.reset();
@@ -284,7 +288,7 @@ namespace IPNet {
 				Self->State.Net.Transport.reset();
 			}
 			Self->State.Net.SessionId = 0;
-			Self->State.Net.PendingCloseId = 0;
+			Self->State.Net.PendingCloseIds.Reset();
 		}
 	};
 }

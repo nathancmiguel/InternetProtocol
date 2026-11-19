@@ -41,6 +41,10 @@ public:
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
 	uint8 IdleTimeoutSeconds = 0;
 
+	/** A request whose handler has not called Write after this many seconds is answered with 503. 0 = never. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
+	float ResponseTimeoutSeconds = 30.0f;
+
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
 	bool IsOpen();
 
@@ -134,6 +138,10 @@ public:
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
 	uint8 IdleTimeoutSeconds = 0;
+
+	/** A request whose handler has not called Write after this many seconds is answered with 503. 0 = never. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
+	float ResponseTimeoutSeconds = 30.0f;
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
 	bool IsOpen();

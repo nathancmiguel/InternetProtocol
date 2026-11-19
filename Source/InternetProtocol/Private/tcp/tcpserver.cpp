@@ -64,7 +64,7 @@ bool UTCPServer::Open(const FServerBindOptions& BindOpts) {
 void UTCPServer::Close() {
 	FFacadeAccess::CloseServer(this);
 	TArray<UTCPRemote*> Remotes = ClientSet.Array();
-	ClientSet.Empty();
+	// Remotes stay referenced until their own OnClose (they remove themselves then).
 	for (UTCPRemote* Remote : Remotes) {
 		if (IsValid(Remote)) {
 			Remote->Close();
@@ -143,7 +143,7 @@ bool UTCPServerSsl::Open(const FServerBindOptions& BindOpts) {
 void UTCPServerSsl::Close() {
 	FFacadeAccess::CloseServer(this);
 	TArray<UTCPRemoteSsl*> Remotes = ClientSet.Array();
-	ClientSet.Empty();
+	// Remotes stay referenced until their own OnClose (they remove themselves then).
 	for (UTCPRemoteSsl* Remote : Remotes) {
 		if (IsValid(Remote)) {
 			Remote->Close();

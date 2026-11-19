@@ -23,6 +23,7 @@ namespace IPNet {
 				case EError::TimedOut: return "Operation timed out";
 				case EError::InvalidArgument: return "Invalid argument";
 				case EError::NotFound: return "Not found";
+				case EError::Cancelled: return "Operation cancelled";
 				default: return "Unknown error";
 				}
 			}
