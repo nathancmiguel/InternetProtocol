@@ -1,8 +1,58 @@
-﻿/** 
+/** 
  * Copyright © 2025 Nathan Miguel
  */
 
 #include "json/json.h"
+#include "net/common.h"
+
+namespace {
+	/** int64 beyond +-2^53 cannot round-trip through a double: keep the exact digits (still a JSON number). */
+	TSharedRef<FJsonValue> MakeInt64Value(int64 Value) {
+		return MakeShared<FJsonValueNumberString>(LexToString(Value));
+	}
+
+	/** Exact int64 from a number (string-backed numbers keep all digits) or from a numeric string ("123"). */
+	bool ReadInt64(const TSharedPtr<FJsonValue>& Value, int64& Out) {
+		if (!Value.IsValid()) {
+			return false;
+		}
+		if (Value->Type == EJson::String) {
+			const FString Text = Value->AsString().TrimStartAndEnd();
+			if (Text.IsEmpty() || !Text.IsNumeric()) {
+				return false;
+			}
+			LexFromString(Out, *Text);
+			return true;
+		}
+		return Value->Type == EJson::Number && Value->TryGetNumber(Out);
+	}
+
+	/** Whether Candidate is Root or (directly or deeply) contains it: storing it in Root would make a cycle. */
+	bool ContainsObject(const TSharedPtr<FJsonObject>& Candidate, const FJsonObject* Root, int32 Depth = 0) {
+		if (!Candidate.IsValid() || Depth > 256) {
+			return false;
+		}
+		if (Candidate.Get() == Root) {
+			return true;
+		}
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Candidate->Values) {
+			if (!Pair.Value.IsValid()) {
+				continue;
+			}
+			if (Pair.Value->Type == EJson::Object && ContainsObject(Pair.Value->AsObject(), Root, Depth + 1)) {
+				return true;
+			}
+			if (Pair.Value->Type == EJson::Array) {
+				for (const TSharedPtr<FJsonValue>& Item : Pair.Value->AsArray()) {
+					if (Item.IsValid() && Item->Type == EJson::Object && ContainsObject(Item->AsObject(), Root, Depth + 1)) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+}
 
 void UJavaScriptObjectNotation::BeginDestroy()
 {
@@ -49,6 +99,10 @@ void UJavaScriptObjectNotation::ConstructJsonFromString(TEnumAsByte<EOutputExecP
 
 FString UJavaScriptObjectNotation::ToString()
 {
+	if (!Json.IsValid())
+	{
+		return FString();
+	}
 	FString JsonString;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);
 	FJsonSerializer::Serialize(Json.ToSharedRef(), Writer);
@@ -101,8 +155,7 @@ void UJavaScriptObjectNotation::SetIntegerField(const FString& FieldName, const 
 void UJavaScriptObjectNotation::SetInteger64Field(const FString& FieldName, const int64 Value)
 {
 	if (!Json.IsValid()) return;
-	double number = static_cast<double>(Value);
-	Json->SetNumberField(FieldName, number);
+	Json->SetField(FieldName, MakeInt64Value(Value));
 }
 
 void UJavaScriptObjectNotation::SetFloatField(const FString& FieldName, const float& Value)
@@ -120,9 +173,13 @@ void UJavaScriptObjectNotation::SetStringField(const FString& FieldName, const F
 
 void UJavaScriptObjectNotation::SetObjectField(const FString& FieldName, UJavaScriptObjectNotation* Value)
 {
-	if (!Json.IsValid()) return;
-	if (Value != nullptr)
-		Json->SetObjectField(FieldName, Value->GetJsonObject());
+	if (!Json.IsValid() || Value == nullptr || !Value->GetJsonObject().IsValid()) return;
+	if (ContainsObject(Value->GetJsonObject(), Json.Get()))
+	{
+		UE_LOG(LogAsio, Warning, TEXT("Json: SetObjectField('%s') refused: the object contains this object (cycle)."), *FieldName);
+		return;
+	}
+	Json->SetObjectField(FieldName, Value->GetJsonObject());
 }
 
 void UJavaScriptObjectNotation::SetBoolArrayField(const FString& FieldName, const TArray<bool>& Value)
@@ -131,7 +188,7 @@ void UJavaScriptObjectNotation::SetBoolArrayField(const FString& FieldName, cons
 	TArray<TSharedPtr<FJsonValue>> JsonArray;
 	for (bool Bool : Value)
 	{
-		JsonArray.Add(MakeShareable(new FJsonValueNumber(Bool)));
+		JsonArray.Add(MakeShared<FJsonValueBoolean>(Bool));
 	}
 	Json->SetArrayField(FieldName, JsonArray);
 }
@@ -164,7 +221,7 @@ void UJavaScriptObjectNotation::SetInteger64ArrayField(const FString& FieldName,
 	TArray<TSharedPtr<FJsonValue>> JsonArray;
 	for (int64 Integer : Value)
 	{
-		JsonArray.Add(MakeShareable(new FJsonValueNumber(Integer)));
+		JsonArray.Add(MakeInt64Value(Integer));
 	}
 	Json->SetArrayField(FieldName, JsonArray);
 }
@@ -198,8 +255,13 @@ void UJavaScriptObjectNotation::SetObjectArrayField(const FString& FieldName, co
 	TArray<TSharedPtr<FJsonValue>> JsonArray;
 	for (UJavaScriptObjectNotation* JsonObject : Value)
 	{
-		if (JsonObject != nullptr)
+		if (JsonObject != nullptr && JsonObject->GetJsonObject().IsValid())
 		{
+			if (ContainsObject(JsonObject->GetJsonObject(), Json.Get()))
+			{
+				UE_LOG(LogAsio, Warning, TEXT("Json: SetObjectArrayField('%s') skipped an element that contains this object (cycle)."), *FieldName);
+				continue;
+			}
 			TSharedPtr<FJsonValue> JsonValue = MakeShareable(new FJsonValueObject(JsonObject->GetJsonObject()));
 			JsonArray.Add(JsonValue);
 		}
@@ -262,7 +324,7 @@ void UJavaScriptObjectNotation::TryGetInteger64Field(TEnumAsByte<EOutputExecPins
 		Output = EOutputExecPins::Failure;
 		return;
 	}
-	if (Json->TryGetNumberField(FieldName, Value))
+	if (ReadInt64(Json->TryGetField(FieldName), Value))
 	{
 		Output = EOutputExecPins::Success;
 		return;
@@ -309,25 +371,16 @@ void UJavaScriptObjectNotation::TryGetObjectField(TEnumAsByte<EOutputExecPins>& 
 		Output = EOutputExecPins::Failure;
 		return;
 	}
-	const TSharedPtr<FJsonObject>* JsonObject;
-	if (!Json->TryGetObjectField(FieldName, JsonObject))
+	// The pointer is owned by the JSON object: never delete it (it is not even set when the field is missing).
+	const TSharedPtr<FJsonObject>* JsonObject = nullptr;
+	if (!Json->TryGetObjectField(FieldName, JsonObject) || JsonObject == nullptr)
 	{
-		delete JsonObject;
 		Output = EOutputExecPins::Failure;
 		return;
 	}
 	UJavaScriptObjectNotation* NewJson = NewObject<UJavaScriptObjectNotation>();
-	if (!NewJson)
-	{
-		delete JsonObject;
-		delete NewJson;
-		Output = EOutputExecPins::Failure;
-		return;
-	}
 	if (!NewJson->ConstructJsonFromObject(*JsonObject))
 	{
-		delete JsonObject;
-		delete NewJson;
 		Output = EOutputExecPins::Failure;
 		return;
 	}
@@ -379,6 +432,7 @@ void UJavaScriptObjectNotation::TryGetByteArrayField(TEnumAsByte<EOutputExecPins
 				data.Add(static_cast<uint8>(Val->AsNumber()));
 			}
 		}
+		Value = data;
 		Output = EOutputExecPins::Success;
 		return;
 	}
@@ -424,9 +478,10 @@ void UJavaScriptObjectNotation::TryGetInteger64ArrayField(TEnumAsByte<EOutputExe
 		TArray<int64> data;
 		for (TSharedPtr<FJsonValue> Val : *JsonArray)
 		{
-			if (Val.IsValid() && Val->Type == EJson::Number)
+			int64 Number = 0;
+			if (ReadInt64(Val, Number))
 			{
-				data.Add(static_cast<int64>(Val->AsNumber()));
+				data.Add(Number);
 			}
 		}
 		Value = data;
