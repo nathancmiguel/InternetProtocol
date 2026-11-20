@@ -143,3 +143,19 @@ void UWSClientSsl::End(int code, const FString& reason) {
 void UWSClientSsl::Close(int code, const FString& reason) {
 	FWsAccess::Close(this, code, reason);
 }
+
+FString UWSClient::GetSubProtocol() {
+	return State.SubProtocol;
+}
+
+float UWSClient::GetRoundTripTimeMs() {
+	return State.RoundTripMs;
+}
+
+FString UWSClientSsl::GetSubProtocol() {
+	return State.SubProtocol;
+}
+
+float UWSClientSsl::GetRoundTripTimeMs() {
+	return State.RoundTripMs;
+}

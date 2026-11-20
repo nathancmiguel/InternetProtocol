@@ -50,6 +50,10 @@ namespace IPNet {
 			Callbacks.OnPong = [Weak, Id]() {
 				RunOnGameThread(Weak, [Id](T* Self) {
 					if (Self->State.Net.SessionId == Id) {
+						if (Self->State.LastPingSeconds > 0.0) {
+							Self->State.RoundTripMs = static_cast<float>((FPlatformTime::Seconds() - Self->State.LastPingSeconds) * 1000.0);
+							Self->State.LastPingSeconds = 0.0;
+						}
 						Self->OnPong.Broadcast();
 					}
 				});
@@ -126,7 +130,13 @@ namespace IPNet {
 			Request.Method = ERequestMethod::GET;
 			Request.Version = TEXT("1.1");
 			Request.Body.Reset();
-			for (const TCHAR* Name : {TEXT("Upgrade"), TEXT("Connection"), TEXT("Sec-WebSocket-Key"), TEXT("Sec-WebSocket-Version")}) {
+			// Requested subprotocols (user header), validated against the server's choice.
+			FWsSession::FOptions SessionOptions;
+			if (const FString* Protocols = FindHeader(Request.Headers, TEXT("Sec-WebSocket-Protocol"))) {
+				SessionOptions.RequestedProtocols = SplitHeaderList(*Protocols);
+			}
+			// No extension is implemented: users cannot negotiate one (its framing would not be understood).
+			for (const TCHAR* Name : {TEXT("Upgrade"), TEXT("Connection"), TEXT("Sec-WebSocket-Key"), TEXT("Sec-WebSocket-Version"), TEXT("Sec-WebSocket-Extensions")}) {
 				TArray<FString> Keys;
 				Request.Headers.GetKeys(Keys);
 				for (const FString& Existing : Keys) {
@@ -152,6 +162,8 @@ namespace IPNet {
 				RunOnGameThread(Weak, [Id, Response = MoveTemp(Response)](T* Owner) {
 					if (Owner->State.Net.SessionId == Id) {
 						Owner->State.Net.bOpen = true;
+						const FString* Protocol = FindHeader(Response.Headers, TEXT("Sec-WebSocket-Protocol"));
+						Owner->State.SubProtocol = Protocol ? Protocol->TrimStartAndEnd() : FString();
 						Owner->OnConnected.Broadcast(Response);
 					}
 				});
@@ -163,7 +175,7 @@ namespace IPNet {
 					}
 				});
 			};
-			std::shared_ptr<FWsSession> Session = std::make_shared<FWsSession>(true, MoveTemp(Callbacks), MoveTemp(HandshakeBytes), Key);
+			std::shared_ptr<FWsSession> Session = std::make_shared<FWsSession>(true, MoveTemp(Callbacks), MoveTemp(HandshakeBytes), Key, MoveTemp(SessionOptions));
 
 			FTransportEvents Events = MakeTransportEvents(Weak, Id, Session);
 			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsClient(Tls, MoveTemp(Events), TransportOptions)
@@ -199,9 +211,12 @@ namespace IPNet {
 			FWsSession::FCallbacks Callbacks = MakeCommonCallbacks(Weak, Id, TransportOptions.Flow);
 			Callbacks.OnServerHandshake = [Weak, Id, TransportRef](FHttpRequest&& Request) {
 				MarkEstablished(TransportRef);
-				RunOnGameThread(Weak, [Id, Request = MoveTemp(Request)](TRemote* Owner) {
+				RunOnGameThread(Weak, [Id, Request = MoveTemp(Request)](TRemote* Owner) mutable {
 					if (Owner->State.Net.SessionId == Id) {
 						Owner->State.Net.bOpen = true;
+						FString Selected;
+						Request.Headers.RemoveAndCopyValue(TEXT("x-selected-protocol"), Selected);
+						Owner->State.SubProtocol = Selected;
 						Owner->OnConnected.Broadcast(Request);
 					}
 				});
@@ -213,7 +228,26 @@ namespace IPNet {
 					}
 				});
 			};
-			std::shared_ptr<FWsSession> Session = std::make_shared<FWsSession>(false, MoveTemp(Callbacks));
+			FWsSession::FOptions SessionOptions;
+			SessionOptions.ServerProtocols = Server->SubProtocols;
+			SessionOptions.bManualAccept = Server->OnUpgradeRequest.IsBound();
+			if (SessionOptions.bManualAccept) {
+				TWeakObjectPtr<TServer> WeakServer(Server);
+				Callbacks.OnUpgradeRequest = [Weak, WeakServer, Id](FHttpRequest&& Request) {
+					RunOnGameThread(Weak, [Id, WeakServer, Request = MoveTemp(Request)](TRemote* Owner) {
+						TServer* ServerPtr = WeakServer.Get();
+						if (Owner->State.Net.SessionId != Id) {
+							return;
+						}
+						if (!ServerPtr) {
+							Owner->RejectUpgrade(503, TEXT("Server closed"));
+							return;
+						}
+						ServerPtr->OnUpgradeRequest.Broadcast(Owner, Request);
+					});
+				};
+			}
+			std::shared_ptr<FWsSession> Session = std::make_shared<FWsSession>(false, MoveTemp(Callbacks), FBytes(), FString(), MoveTemp(SessionOptions));
 
 			FTransportEvents Events = MakeTransportEvents(Weak, Id, Session);
 			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events), TransportOptions)
@@ -249,31 +283,72 @@ namespace IPNet {
 				return false;
 			}
 			const bool bMask = Self->State.Session->IsClient();
-			FBytes Bytes = EncodeWsFrame(Opcode, Data, Size, Frame.bFin, Frame.bRsv1, Frame.bRsv2, Frame.bRsv3, bMask);
+			const bool bControl = Opcode == EOpcode::PING || Opcode == EOpcode::PONG || Opcode == EOpcode::CLOSE_FRAME;
+			// RSV bits are never sent: they only have a meaning with a negotiated extension.
+			FBytes Bytes = EncodeWsFrame(Opcode, Data, Size, bControl ? true : Frame.bFin, false, false, false, bMask);
 			Self->State.Session->SendFrame(MoveTemp(Bytes), MakeSendCallback(Self, Callback));
+			return true;
+		}
+
+		/**
+		 * Data message or fragment: Dataframe.bFin = false starts (or continues) a fragmented message; the
+		 * frames after the first one use the continuation opcode, and the one with bFin = true ends it.
+		 */
+		template <typename T, typename TDelegate>
+		static bool SendData(T* Self, EOpcode MessageOpcode, const uint8* Data, size_t Size, const FDataframe& Frame, const TDelegate& Callback) {
+			const EOpcode Opcode = Self->State.bFragmenting ? EOpcode::NONE /* continuation (0x0) */ : MessageOpcode;
+			if (!SendFrame(Self, Opcode, Data, Size, Frame, Callback)) {
+				return false;
+			}
+			Self->State.bFragmenting = !Frame.bFin;
 			return true;
 		}
 
 		template <typename T, typename TDelegate>
 		static bool Write(T* Self, const FString& Message, const FDataframe& Frame, const TDelegate& Callback) {
-			if (Message.IsEmpty()) {
-				return false;
-			}
+			// Empty messages are valid WebSocket messages.
 			const FBytes Utf8 = ToUtf8(Message);
-			return SendFrame(Self, EOpcode::TEXT_FRAME, Utf8.data(), Utf8.size(), Frame, Callback);
+			return SendData(Self, EOpcode::TEXT_FRAME, Utf8.data(), Utf8.size(), Frame, Callback);
 		}
 
 		template <typename T, typename TDelegate>
 		static bool WriteBuffer(T* Self, const TArray<uint8>& Buffer, const FDataframe& Frame, const TDelegate& Callback) {
-			if (Buffer.Num() == 0) {
-				return false;
-			}
-			return SendFrame(Self, EOpcode::BINARY_FRAME, Buffer.GetData(), static_cast<size_t>(Buffer.Num()), Frame, Callback);
+			return SendData(Self, EOpcode::BINARY_FRAME, Buffer.GetData(), static_cast<size_t>(Buffer.Num()), Frame, Callback);
 		}
 
 		template <typename T, typename TDelegate>
-		static bool Control(T* Self, EOpcode Opcode, const TDelegate& Callback) {
-			return SendFrame(Self, Opcode, nullptr, 0, FDataframe(), Callback);
+		static bool Control(T* Self, EOpcode Opcode, const TDelegate& Callback, const TArray<uint8>& Payload = TArray<uint8>()) {
+			if (Payload.Num() > 125) {
+				return false; // control frames carry at most 125 bytes
+			}
+			if (Opcode == EOpcode::PING) {
+				Self->State.LastPingSeconds = FPlatformTime::Seconds();
+			}
+			return SendFrame(Self, Opcode, Payload.GetData(), static_cast<size_t>(Payload.Num()), FDataframe(), Callback);
+		}
+
+		static uint16 SendableCloseCode(int32 Code) {
+			const uint16 Clamped = static_cast<uint16>(FMath::Clamp(Code, 0, 65535));
+			if (IsSendableCloseCode(Clamped)) {
+				return Clamped;
+			}
+			// 1005 / 1006 / 1015 and unregistered codes must never be sent (RFC 6455 7.4.1).
+			UE_LOG(LogAsio, Warning, TEXT("InternetProtocol WebSocket: close code %d cannot be sent, using 1000."), Code);
+			return 1000;
+		}
+
+		template <typename TRemote>
+		static void AcceptUpgrade(TRemote* Remote) {
+			if (Remote->State.Session) {
+				Remote->State.Session->AcceptUpgrade();
+			}
+		}
+
+		template <typename TRemote>
+		static void RejectUpgrade(TRemote* Remote, int32 Status, const FString& Reason) {
+			if (Remote->State.Session) {
+				Remote->State.Session->RejectUpgrade(Status, Reason);
+			}
 		}
 
 		template <typename T>
@@ -281,7 +356,7 @@ namespace IPNet {
 			if (!Self->State.Session) {
 				return;
 			}
-			Self->State.Session->End(static_cast<uint16>(FMath::Clamp(Code, 0, 65535)), Reason);
+			Self->State.Session->End(SendableCloseCode(Code), Reason);
 			Self->State.bClosing = true;
 		}
 
@@ -290,7 +365,7 @@ namespace IPNet {
 			if (!Self->State.Session) {
 				return;
 			}
-			Self->State.Session->Close(static_cast<uint16>(FMath::Clamp(Code, 0, 65535)), Reason);
+			Self->State.Session->Close(SendableCloseCode(Code), Reason);
 			// The session aborts the transport; the final OnClose(Code, Reason) is still delivered
 			// (PendingCloseIds), nothing else from this connection is.
 			Self->State.Net.Transport.reset();

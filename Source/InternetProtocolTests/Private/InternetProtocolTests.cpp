@@ -1236,4 +1236,152 @@ bool FIPHttpExpectContinueTest::RunTest(const FString& Parameters) {
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Phase 2: WebSocket and TCP framing
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPWsProtocolTest, "InternetProtocol.WebSocket.FragmentsSubprotocolPing", IPTests::Flags)
+bool FIPWsProtocolTest::RunTest(const FString& Parameters) {
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UWSServer* Server = Make<UWSServer>();
+	UWSClient* Client = Make<UWSClient>();
+	Server->SubProtocols = {TEXT("chat.v2"), TEXT("chat.v1")};
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnWsAccepted);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnWsConnected);
+	Client->OnMessage.AddDynamic(L, &UIPTestListener::OnWsMessage);
+	Client->OnClose.AddDynamic(L, &UIPTestListener::OnWsClose);
+	Client->OnPong.AddDynamic(L, &UIPTestListener::OnPongEvent);
+	Client->Handshake.Headers.Add(TEXT("Sec-WebSocket-Protocol"), TEXT("chat.v1, chat.v2"));
+	Client->Handshake.Headers.Add(TEXT("Sec-WebSocket-Extensions"), TEXT("permessage-deflate")); // must not be sent
+	if (!TestTrue(TEXT("WS server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	Client->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("connected"), [L]() { return L->Connected == 1; });
+	Then([this, Client]() {
+		TestEqual(TEXT("Server preference wins"), Client->GetSubProtocol(), FString(TEXT("chat.v2")));
+		FDataframe Partial;
+		Partial.bFin = false;
+		Client->Write(TEXT("frag"), Partial, FDelegateWsClientMessageSent());
+		Client->Write(TEXT("mented"), FDataframe(), FDelegateWsClientMessageSent());
+	});
+	WaitUntil(this, TEXT("reassembled echo"), [L]() { return L->Messages == 1; });
+	Then([this, L, Client]() {
+		const FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(L->Received.GetData()), L->Received.Num());
+		TestEqual(TEXT("Fragments form one message"), FString(Text.Length(), Text.Get()), FString(TEXT("fragmented")));
+		TestTrue(TEXT("Empty message accepted"), Client->Write(TEXT(""), FDataframe(), FDelegateWsClientMessageSent()));
+		Client->Ping(FDelegateWsClientMessageSent());
+	});
+	WaitUntil(this, TEXT("empty echo and pong"), [L]() { return L->Messages == 2 && L->Pongs == 1; });
+	Then([this, L, Client]() {
+		TestEqual(TEXT("Empty message echoed"), L->Received.Num(), 0);
+		TestTrue(TEXT("RTT measured"), Client->GetRoundTripTimeMs() >= 0.0f);
+		Client->End(1006, TEXT("not sendable")); // replaced by 1000
+	});
+	WaitUntil(this, TEXT("closed"), [L]() { return L->Closed == 1; });
+	Then([this, L, ServerL, Server, Client]() {
+		TestEqual(TEXT("Unsendable close code replaced by 1000"), L->LastCloseCode, 1000);
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPWsUpgradeDecisionTest, "InternetProtocol.WebSocket.UpgradeAcceptReject", IPTests::Flags)
+bool FIPWsUpgradeDecisionTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UWSServer* Server = Make<UWSServer>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnWsAccepted);
+	Server->OnUpgradeRequest.AddDynamic(ServerL, &UIPTestListener::OnWsUpgrade);
+	if (!TestTrue(TEXT("WS server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	UIPTestListener* Good = Make<UIPTestListener>();
+	UIPTestListener* Bad = Make<UIPTestListener>();
+	UWSClient* GoodClient = Make<UWSClient>();
+	UWSClient* BadClient = Make<UWSClient>();
+	GoodClient->Handshake.Headers.Add(TEXT("X-Token"), TEXT("secret"));
+	BadClient->Handshake.Headers.Add(TEXT("X-Token"), TEXT("wrong"));
+	for (TPair<UWSClient*, UIPTestListener*> Pair : {TPair<UWSClient*, UIPTestListener*>(GoodClient, Good), TPair<UWSClient*, UIPTestListener*>(BadClient, Bad)}) {
+		Pair.Key->OnConnected.AddDynamic(Pair.Value, &UIPTestListener::OnWsConnected);
+		Pair.Key->OnUnexpectedHandshake.AddDynamic(Pair.Value, &UIPTestListener::OnWsUnexpected);
+		Pair.Key->Connect(ClientTo(Server->LocalEndpoint().Port));
+	}
+	WaitUntil(this, TEXT("decisions"), [Good, Bad]() { return Good->Connected == 1 && Bad->Errors == 1; });
+	Then([this, Good, Bad, ServerL, Server, GoodClient, BadClient]() {
+		TestEqual(TEXT("Both requests reached OnUpgradeRequest"), ServerL->Upgrades, 2);
+		TestEqual(TEXT("Rejected client never connected"), Bad->Connected, 0);
+		GoodClient->Close(1000, TEXT("done"));
+		Server->Close();
+		Release(GoodClient);
+		Release(BadClient);
+		Release(Server);
+		Release(Good);
+		Release(Bad);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPTcpFramingTest, "InternetProtocol.TCP.Framing", IPTests::Flags)
+bool FIPTcpFramingTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UIPTestListener* LineL = Make<UIPTestListener>();
+	UTCPServer* Server = Make<UTCPServer>();       // length-prefixed echo
+	UTCPServer* LineServer = Make<UTCPServer>();   // line based echo
+	UTCPClient* Client = Make<UTCPClient>();
+	UTCPClient* LineClient = Make<UTCPClient>();
+	Server->Framing.Mode = ETcpFramingMode::LengthPrefixed;
+	Client->Framing.Mode = ETcpFramingMode::LengthPrefixed;
+	Client->Framing.MaxMessageBytes = 1024;
+	LineServer->Framing.Mode = ETcpFramingMode::Delimiter;
+	LineClient->Framing.Mode = ETcpFramingMode::Delimiter;
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnTcpAccepted);
+	LineServer->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnTcpAccepted);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnMessage.AddDynamic(L, &UIPTestListener::OnBytes);
+	Client->OnError.AddDynamic(L, &UIPTestListener::OnError);
+	LineClient->OnConnected.AddDynamic(LineL, &UIPTestListener::OnConnected);
+	LineClient->OnMessage.AddDynamic(LineL, &UIPTestListener::OnBytes);
+	if (!TestTrue(TEXT("Servers open"), Server->Open(Loopback()) && LineServer->Open(Loopback()))) {
+		return false;
+	}
+	Client->Connect(ClientTo(Server->LocalEndpoint().Port));
+	LineClient->Connect(ClientTo(LineServer->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("connected"), [L, LineL, ServerL]() { return L->Connected == 1 && LineL->Connected == 1 && ServerL->Accepted == 2; });
+	Then([this, Client, LineClient]() {
+		// Three messages written back to back arrive as three messages, whatever TCP did with them.
+		Client->Write(TEXT("one"), FDelegateTcpClientMessageSent());
+		Client->Write(TEXT("two"), FDelegateTcpClientMessageSent());
+		Client->Write(TEXT("three"), FDelegateTcpClientMessageSent());
+		LineClient->Write(TEXT("alpha"), FDelegateTcpClientMessageSent());
+		LineClient->Write(TEXT("beta"), FDelegateTcpClientMessageSent());
+		TestFalse(TEXT("Message above MaxMessageBytes refused"), Client->Write(FString::ChrN(2048, TEXT('x')), FDelegateTcpClientMessageSent()));
+	});
+	WaitUntil(this, TEXT("framed echoes"), [L, LineL]() { return L->Messages == 3 && LineL->Messages == 2; });
+	Then([this, L, LineL, ServerL, Server, LineServer, Client, LineClient]() {
+		const FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(L->Received.GetData()), L->Received.Num());
+		TestEqual(TEXT("Prefixes removed, order kept"), FString(Text.Length(), Text.Get()), FString(TEXT("onetwothree")));
+		const FUTF8ToTCHAR Lines(reinterpret_cast<const ANSICHAR*>(LineL->Received.GetData()), LineL->Received.Num());
+		TestEqual(TEXT("Delimiters removed"), FString(Lines.Length(), Lines.Get()), FString(TEXT("alphabeta")));
+		TestEqual(TEXT("MessageTooLarge reported"), L->Errors, 1);
+		Client->Close();
+		LineClient->Close();
+		Server->Close();
+		LineServer->Close();
+		Release(Client);
+		Release(LineClient);
+		Release(Server);
+		Release(LineServer);
+		Release(L);
+		Release(LineL);
+		Release(ServerL);
+	});
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

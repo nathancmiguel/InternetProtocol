@@ -38,6 +38,11 @@ public:
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	bool IsOpen();
 
+
+	/** How the byte stream is cut into messages (applies to the next Connect / to accepted connections). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|TCP")
+	FTcpFramingOptions Framing;
+
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	FTcpEndpoint LocalEndpoint();
 
@@ -98,6 +103,11 @@ public:
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	bool IsOpen();
+
+
+	/** How the byte stream is cut into messages (applies to the next Connect / to accepted connections). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|TCP")
+	FTcpFramingOptions Framing;
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	FTcpEndpoint LocalEndpoint();

@@ -47,6 +47,14 @@ public:
 
 	UFUNCTION(bLueprintCallable, BlueprintPure, Category = "IP|Websocket")
 	bool IsOpen();
+	/** Subprotocol agreed in the handshake (empty: none). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FString GetSubProtocol();
+
+	/** Round trip of the last Ping answered by a Pong, in ms (-1: none yet). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	float GetRoundTripTimeMs();
+
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|Websocket")
 	FTcpEndpoint LocalEndpoint();
@@ -135,6 +143,14 @@ public:
 
 	UFUNCTION(bLueprintCallable, BlueprintPure, Category = "IP|Websocket")
 	bool IsOpen();
+	/** Subprotocol agreed in the handshake (empty: none). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FString GetSubProtocol();
+
+	/** Round trip of the last Ping answered by a Pong, in ms (-1: none yet). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	float GetRoundTripTimeMs();
+
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|Websocket")
 	FTcpEndpoint LocalEndpoint();

@@ -13,6 +13,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FDelegateWsServer);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FDelegateWsServerClientConnect, UWSRemote*, Client);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FDelegateWsServerClientSslConnect, UWSRemoteSsl*, Client);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FDelegateWsServerError, const FErrorCode &, ErrorCode);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FDelegateWsServerUpgradeRequest, UWSRemote*, Client, const FHttpRequest&, Request);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FDelegateWsServerSslUpgradeRequest, UWSRemoteSsl*, Client, const FHttpRequest&, Request);
 
 UCLASS(Blueprintable, BlueprintType, Category = "IP|Websocket")
 class INTERNETPROTOCOL_API UWSServer : public UObject
@@ -58,6 +60,17 @@ public:
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
 	FDelegateWsServerClientConnect OnClientAccepted;
+
+	/**
+	 * Bound: every valid upgrade request waits for Client->AcceptUpgrade() or Client->RejectUpgrade() (e.g. to
+	 * check Origin or a token). Unanswered requests are dropped after HandshakeTimeoutSeconds.
+	 */
+	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
+	FDelegateWsServerUpgradeRequest OnUpgradeRequest;
+
+	/** Subprotocols supported, in order of preference; the first one the client offers is selected. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	TArray<FString> SubProtocols;
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
 	FDelegateWsServer OnClose;
@@ -120,6 +133,17 @@ public:
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
 	FDelegateWsServerClientSslConnect OnClientAccepted;
+
+	/**
+	 * Bound: every valid upgrade request waits for Client->AcceptUpgrade() or Client->RejectUpgrade() (e.g. to
+	 * check Origin or a token). Unanswered requests are dropped after HandshakeTimeoutSeconds.
+	 */
+	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
+	FDelegateWsServerSslUpgradeRequest OnUpgradeRequest;
+
+	/** Subprotocols supported, in order of preference; the first one the client offers is selected. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	TArray<FString> SubProtocols;
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
 	FDelegateWsServer OnClose;

@@ -44,6 +44,8 @@ struct FIpStreamState {
 	FTcpEndpoint Local;
 	FTcpEndpoint Remote;
 	FErrorCode LastError;
+	/** TCP facades: framing applied to sent and received data. */
+	FTcpFramingOptions Framing;
 };
 
 /** Game Thread state of a listening server facade. */
@@ -77,4 +79,10 @@ struct FIpWsState {
 	std::shared_ptr<IPNet::FWsSession> Session;
 	/** End() was called: no more data frames are accepted. */
 	bool bClosing = false;
+	/** A message was started with bFin = false: the next frames are continuations. */
+	bool bFragmenting = false;
+	/** Subprotocol agreed in the handshake (empty: none). */
+	FString SubProtocol;
+	double LastPingSeconds = 0.0;
+	float RoundTripMs = -1.0f;
 };

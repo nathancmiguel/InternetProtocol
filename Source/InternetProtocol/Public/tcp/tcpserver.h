@@ -39,6 +39,11 @@ public:
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|TCP")
 	int Backlog = 2147483647;
 
+	/** How the byte stream is cut into messages (applies to the next Connect / to accepted connections). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|TCP")
+	FTcpFramingOptions Framing;
+
+
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	bool IsOpen();
 
@@ -99,6 +104,11 @@ public:
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|TCP")
 	int Backlog = 2147483647;
+
+	/** How the byte stream is cut into messages (applies to the next Connect / to accepted connections). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|TCP")
+	FTcpFramingOptions Framing;
+
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	bool IsOpen();

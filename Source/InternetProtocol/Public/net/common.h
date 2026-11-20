@@ -274,6 +274,33 @@ enum class ECloseState: uint8  {
 };
 
 // Client side
+/** How a TCP byte stream is cut into messages. */
+UENUM(BlueprintType, Category="IP|ENUM|Common")
+enum class ETcpFramingMode : uint8 {
+	/** No framing: OnMessage receives whatever each read returned (one Write may arrive split or merged). */
+	Raw,
+	/** Every message is preceded by its length (4 bytes, big endian). */
+	LengthPrefixed,
+	/** Messages end with Delimiter (e.g. "\n" for line based protocols); the delimiter is not delivered. */
+	Delimiter,
+};
+
+USTRUCT(BlueprintType, Category="IP|STRUCT|Common")
+struct FTcpFramingOptions {
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Framing")
+	ETcpFramingMode Mode = ETcpFramingMode::Raw;
+
+	/** Larger messages are a protocol error: OnError (MessageTooLarge) and the connection is closed. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Framing")
+	int32 MaxMessageBytes = 16 * 1024 * 1024;
+
+	/** Delimiter mode only (UTF-8). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Framing")
+	FString Delimiter = TEXT("\n");
+};
+
 USTRUCT(BlueprintType, Category="IP|STRUCT|Common")
 struct FClientBindOptions {
 	GENERATED_BODY()

@@ -168,6 +168,21 @@ public:
 		Remote->Write(FDelegateHttpRemoteMessageSent());
 	}
 
+	// ---- WebSocket extras ----
+	int32 Pongs = 0;
+	int32 Upgrades = 0;
+	UFUNCTION() void OnPongEvent() { ++Pongs; }
+	/** Accepts upgrade requests carrying "X-Token: secret", rejects the others with 401. */
+	UFUNCTION() void OnWsUpgrade(UWSRemote* Remote, const FHttpRequest& Request) {
+		++Upgrades;
+		const FString* Token = Request.Headers.Find(TEXT("x-token"));
+		if (Token && *Token == TEXT("secret")) {
+			Remote->AcceptUpgrade();
+		} else {
+			Remote->RejectUpgrade(401, TEXT("bad token"));
+		}
+	}
+
 	// ---- WebSocket ----
 	UFUNCTION() void OnWsConnected(const FHttpResponse& Handshake) { ++Connected; }
 	UFUNCTION() void OnWsUnexpected(const FHttpResponse& Handshake) { ++Errors; }

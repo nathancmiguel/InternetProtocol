@@ -9,12 +9,13 @@ namespace IPNet {
 		constexpr std::chrono::milliseconds CloseHandshakeTimeout{5000};
 	}
 
-	FWsSession::FWsSession(bool bInClient, FCallbacks InCallbacks, FBytes InHandshakeBytes, FString InKey)
+	FWsSession::FWsSession(bool bInClient, FCallbacks InCallbacks, FBytes InHandshakeBytes, FString InKey, FOptions InOptions)
 		: bClient(bInClient),
 		  Callbacks(MoveTemp(InCallbacks)),
 		  HandshakeBytes(MoveTemp(InHandshakeBytes)),
 		  Key(MoveTemp(InKey)),
 		  HandshakeParser(bInClient ? FHttpParser::EMode::Response : FHttpParser::EMode::Request),
+		  Options(MoveTemp(InOptions)),
 		  Frames(/*bExpectMasked*/ !bInClient) {
 		HandshakeParser.SetHeadersOnly(true);
 	}
@@ -54,7 +55,9 @@ namespace IPNet {
 		}
 		if (State == EState::Handshake) {
 			HandshakeParser.Append(Data, Size);
-			HandleHandshake();
+			if (!bAwaitingDecision) {
+				HandleHandshake();
+			}
 			return;
 		}
 		Frames.Append(Data, Size);
@@ -70,7 +73,7 @@ namespace IPNet {
 		FString Reason;
 		if (bClient) {
 			FHttpResponse Response = MoveTemp(HandshakeParser.Response);
-			if (Result == FHttpParser::EResult::Complete && ValidateWsUpgradeResponse(Response, Key, Reason)) {
+			if (Result == FHttpParser::EResult::Complete && ValidateWsUpgradeResponse(Response, Key, Options.RequestedProtocols, Reason)) {
 				State = EState::Open;
 				const FBytes Remaining = HandshakeParser.TakeRemaining();
 				if (Callbacks.OnClientHandshake) {
@@ -95,44 +98,100 @@ namespace IPNet {
 			return;
 		}
 
-		FHttpRequest Request = MoveTemp(HandshakeParser.Request);
-		if (Result == FHttpParser::EResult::Complete && ValidateWsUpgradeRequest(Request, Reason)) {
-			const FString* RequestKey = FindHeader(Request.Headers, TEXT("Sec-WebSocket-Key"));
-			FHttpResponse Upgrade;
-			Upgrade.Status_Code = 101;
-			Upgrade.Status_Message = TEXT("Switching Protocols");
-			Upgrade.Headers.Add(TEXT("Upgrade"), TEXT("websocket"));
-			Upgrade.Headers.Add(TEXT("Sec-WebSocket-Accept"), ComputeWebSocketAccept(RequestKey ? *RequestKey : FString()));
-			FHttpResponse UpgradeWithConnection = Upgrade;
-			UpgradeWithConnection.Headers.Add(TEXT("Connection"), TEXT("Upgrade"));
-			Send(SerializeResponse(UpgradeWithConnection, true, false));
-
-			State = EState::Open;
-			const FBytes Remaining = HandshakeParser.TakeRemaining();
-			if (Callbacks.OnServerHandshake) {
-				Callbacks.OnServerHandshake(MoveTemp(Request));
+		int32 Status = 400;
+		PendingRequest = MoveTemp(HandshakeParser.Request);
+		if (Result == FHttpParser::EResult::Complete && ValidateWsUpgradeRequest(PendingRequest, Reason, Status)) {
+			// Subprotocol: the first one of ours (preference order) that the client offered.
+			if (const FString* Offered = FindHeader(PendingRequest.Headers, TEXT("Sec-WebSocket-Protocol"))) {
+				const TArray<FString> ClientProtocols = SplitHeaderList(*Offered);
+				for (const FString& Candidate : Options.ServerProtocols) {
+					if (ClientProtocols.Contains(Candidate)) {
+						SelectedProtocol = Candidate;
+						break;
+					}
+				}
 			}
-			Frames.Append(Remaining.data(), Remaining.size());
-			ProcessFrames();
+			if (Options.bManualAccept && Callbacks.OnUpgradeRequest) {
+				// The Game Thread decides (Origin check, authentication...). The handshake timeout of the
+				// transport bounds the wait.
+				bAwaitingDecision = true;
+				FHttpRequest Copy = PendingRequest;
+				Callbacks.OnUpgradeRequest(MoveTemp(Copy));
+				return;
+			}
+			CompleteServerHandshake();
 			return;
 		}
+		if (Result == FHttpParser::EResult::Error) {
+			Status = HandshakeParser.ErrorStatus;
+			Reason = HandshakeParser.ErrorMessage;
+		}
+		RejectServerHandshake(Status, Reason);
+	}
 
-		const int32 Status = Result == FHttpParser::EResult::Error ? HandshakeParser.ErrorStatus : 400;
+	void FWsSession::CompleteServerHandshake() {
+		const FString* RequestKey = FindHeader(PendingRequest.Headers, TEXT("Sec-WebSocket-Key"));
+		FHttpResponse Upgrade;
+		Upgrade.Status_Code = 101;
+		Upgrade.Status_Message = TEXT("Switching Protocols");
+		Upgrade.Headers.Add(TEXT("Upgrade"), TEXT("websocket"));
+		Upgrade.Headers.Add(TEXT("Connection"), TEXT("Upgrade"));
+		Upgrade.Headers.Add(TEXT("Sec-WebSocket-Accept"), ComputeWebSocketAccept(RequestKey ? *RequestKey : FString()));
+		if (!SelectedProtocol.IsEmpty()) {
+			Upgrade.Headers.Add(TEXT("Sec-WebSocket-Protocol"), SelectedProtocol);
+		}
+		Send(SerializeResponse(Upgrade, true, false));
+
+		State = EState::Open;
+		bAwaitingDecision = false;
+		const FBytes Remaining = HandshakeParser.TakeRemaining();
+		FHttpRequest Request = MoveTemp(PendingRequest);
+		if (!SelectedProtocol.IsEmpty()) {
+			// The remote reports the selected subprotocol through its handshake request.
+			Request.Headers.Add(TEXT("x-selected-protocol"), SelectedProtocol);
+		}
+		if (Callbacks.OnServerHandshake) {
+			Callbacks.OnServerHandshake(MoveTemp(Request));
+		}
+		Frames.Append(Remaining.data(), Remaining.size());
+		ProcessFrames();
+	}
+
+	void FWsSession::RejectServerHandshake(int32 Status, const FString& Reason) {
 		FHttpResponse Rejection;
 		Rejection.Status_Code = Status;
 		Rejection.Headers.Add(TEXT("Content-Type"), TEXT("text/plain"));
-		Rejection.Body = Result == FHttpParser::EResult::Error ? HandshakeParser.ErrorMessage : Reason;
-		if (Status == 400 && Result != FHttpParser::EResult::Error) {
+		Rejection.Body = Reason;
+		if (Status == 426 || Status == 400) {
 			Rejection.Headers.Add(TEXT("Sec-WebSocket-Version"), TEXT("13"));
 		}
 		Send(SerializeResponse(Rejection, false, true));
 		State = EState::Closed;
+		bAwaitingDecision = false;
 		CloseCode = 1002;
 		CloseReason = TEXT("Protocol error");
 		if (Callbacks.OnServerUnexpected) {
-			Callbacks.OnServerUnexpected(MoveTemp(Request));
+			Callbacks.OnServerUnexpected(MoveTemp(PendingRequest));
 		}
 		CloseTransport();
+	}
+
+	void FWsSession::AcceptUpgrade() {
+		std::shared_ptr<FWsSession> Self = shared_from_this();
+		RunOnStrand([Self]() {
+			if (Self->bAwaitingDecision && Self->State == EState::Handshake) {
+				Self->CompleteServerHandshake();
+			}
+		});
+	}
+
+	void FWsSession::RejectUpgrade(int32 Status, const FString& Reason) {
+		std::shared_ptr<FWsSession> Self = shared_from_this();
+		RunOnStrand([Self, Status, Reason]() {
+			if (Self->bAwaitingDecision && Self->State == EState::Handshake) {
+				Self->RejectServerHandshake(FMath::Clamp(Status, 400, 599), Reason);
+			}
+		});
 	}
 
 	void FWsSession::ProcessFrames() {

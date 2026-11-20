@@ -34,10 +34,21 @@ namespace IPNet {
 			std::function<void(FBytes&&, bool)> OnMessage;
 			std::function<void()> OnPing;
 			std::function<void()> OnPong;
+			/** Server with manual acceptance: a valid upgrade request waits for AcceptUpgrade / RejectUpgrade. */
+			std::function<void(FHttpRequest&&)> OnUpgradeRequest;
+		};
+
+		struct FOptions {
+			/** Client: subprotocols sent in Sec-WebSocket-Protocol (the server may pick one). */
+			TArray<FString> RequestedProtocols;
+			/** Server: subprotocols supported, in order of preference. */
+			TArray<FString> ServerProtocols;
+			/** Server: wait for AcceptUpgrade / RejectUpgrade before answering the upgrade request. */
+			bool bManualAccept = false;
 		};
 
 		/** Client: HandshakeBytes is the serialized upgrade request and Key its Sec-WebSocket-Key. */
-		FWsSession(bool bInClient, FCallbacks InCallbacks, FBytes InHandshakeBytes = {}, FString InKey = FString());
+		FWsSession(bool bInClient, FCallbacks InCallbacks, FBytes InHandshakeBytes = {}, FString InKey = FString(), FOptions InOptions = FOptions());
 
 		std::weak_ptr<FTransport> Transport;
 
@@ -52,6 +63,9 @@ namespace IPNet {
 		void SendFrame(FBytes Frame, FSendCallback Callback);
 		void End(uint16 Code, const FString& Reason);
 		void Close(uint16 Code, const FString& Reason);
+		/** Server, manual acceptance: answers the pending upgrade request. */
+		void AcceptUpgrade();
+		void RejectUpgrade(int32 Status, const FString& Reason);
 
 		bool IsClient() const { return bClient; }
 
@@ -59,6 +73,8 @@ namespace IPNet {
 		enum class EState : uint8 { Handshake, Open, Closing, Closed };
 
 		void HandleHandshake();
+		void CompleteServerHandshake();
+		void RejectServerHandshake(int32 Status, const FString& Reason);
 		void ProcessFrames();
 		void SendClose(uint16 Code, const FString& Reason);
 		void Send(FBytes&& Bytes, FSendCallback Callback = nullptr);
@@ -70,6 +86,11 @@ namespace IPNet {
 		FBytes HandshakeBytes;
 		FString Key;
 		FHttpParser HandshakeParser;
+		FOptions Options;
+		/** Server: the validated upgrade request (kept while waiting for a manual decision). */
+		FHttpRequest PendingRequest;
+		FString SelectedProtocol;
+		bool bAwaitingDecision = false;
 		FWsFrameParser Frames;
 		EState State = EState::Handshake;
 		bool bCloseSent = false;

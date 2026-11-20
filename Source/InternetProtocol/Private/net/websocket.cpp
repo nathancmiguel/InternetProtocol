@@ -32,6 +32,7 @@ namespace IPNet {
 			}
 			switch (Code) {
 			case 1000: case 1001: case 1002: case 1003: case 1007: case 1008: case 1009: case 1010: case 1011:
+			case 1012: case 1013: case 1014:
 				return true;
 			default:
 				return false;
@@ -81,7 +82,22 @@ namespace IPNet {
 		return FBase64::Encode(Digest, SHA_DIGEST_LENGTH);
 	}
 
-	bool ValidateWsUpgradeRequest(const FHttpRequest& Request, FString& OutReason) {
+	bool IsSendableCloseCode(uint16 Code) {
+		return IsValidCloseCode(Code);
+	}
+
+	TArray<FString> SplitHeaderList(const FString& Value) {
+		TArray<FString> Parts;
+		Value.ParseIntoArray(Parts, TEXT(","), true);
+		for (FString& Part : Parts) {
+			Part.TrimStartAndEndInline();
+		}
+		Parts.RemoveAll([](const FString& Part) { return Part.IsEmpty(); });
+		return Parts;
+	}
+
+	bool ValidateWsUpgradeRequest(const FHttpRequest& Request, FString& OutReason, int32& OutStatus) {
+		OutStatus = 400;
 		if (Request.Method != ERequestMethod::GET) {
 			OutReason = TEXT("WebSocket upgrade requires GET");
 			return false;
@@ -104,13 +120,15 @@ namespace IPNet {
 		}
 		const FString* Version = FindHeader(Request.Headers, TEXT("Sec-WebSocket-Version"));
 		if (!Version || Version->TrimStartAndEnd() != TEXT("13")) {
+			// RFC 6455 4.4: answer 426 with the version we support.
 			OutReason = TEXT("\"Sec-WebSocket-Version\" must be 13");
+			OutStatus = 426;
 			return false;
 		}
 		return true;
 	}
 
-	bool ValidateWsUpgradeResponse(const FHttpResponse& Response, const FString& SentKey, FString& OutReason) {
+	bool ValidateWsUpgradeResponse(const FHttpResponse& Response, const FString& SentKey, const TArray<FString>& RequestedProtocols, FString& OutReason) {
 		if (Response.Status_Code != 101) {
 			OutReason = FString::Printf(TEXT("unexpected status %d"), Response.Status_Code);
 			return false;
@@ -129,6 +147,19 @@ namespace IPNet {
 		if (!Accept || Accept->TrimStartAndEnd() != ComputeWebSocketAccept(SentKey)) {
 			OutReason = TEXT("invalid \"Sec-WebSocket-Accept\"");
 			return false;
+		}
+		if (const FString* Extensions = FindHeader(Response.Headers, TEXT("Sec-WebSocket-Extensions"))) {
+			if (!Extensions->TrimStartAndEnd().IsEmpty()) {
+				OutReason = TEXT("the server selected an extension that was not requested");
+				return false;
+			}
+		}
+		if (const FString* Protocol = FindHeader(Response.Headers, TEXT("Sec-WebSocket-Protocol"))) {
+			const FString Chosen = Protocol->TrimStartAndEnd();
+			if (!Chosen.IsEmpty() && !RequestedProtocols.Contains(Chosen)) {
+				OutReason = FString::Printf(TEXT("the server selected subprotocol \"%s\" that was not requested"), *Chosen);
+				return false;
+			}
 		}
 		return true;
 	}
@@ -249,6 +280,10 @@ namespace IPNet {
 				}
 			}
 
+			if ((Header[0] & 0x70) != 0) {
+				// RSV1-3 have a meaning only with a negotiated extension, and none is ever negotiated.
+				return Error(Out, 1002, TEXT("reserved bits set without a negotiated extension"));
+			}
 			if (bMasked != bExpectMasked) {
 				return Error(Out, 1002, bExpectMasked ? TEXT("client frames must be masked") : TEXT("server frames must not be masked"));
 			}

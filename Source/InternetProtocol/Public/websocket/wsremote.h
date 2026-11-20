@@ -31,6 +31,22 @@ public:
 
 	UFUNCTION(bLueprintCallable, BlueprintPure, Category = "IP|Websocket")
 	bool IsOpen();
+	/** Subprotocol agreed in the handshake (empty: none). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FString GetSubProtocol();
+
+	/** Round trip of the last Ping answered by a Pong, in ms (-1: none yet). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	float GetRoundTripTimeMs();
+
+	/** Server with OnUpgradeRequest bound: accepts the pending upgrade request. */
+	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
+	void AcceptUpgrade();
+
+	/** Server with OnUpgradeRequest bound: refuses the pending upgrade request with an HTTP status (400..599). */
+	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
+	void RejectUpgrade(int32 Status, const FString& Reason);
+
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|Websocket")
 	FTcpEndpoint LocalEndpoint();
@@ -100,6 +116,22 @@ public:
 
 	UFUNCTION(bLueprintCallable, BlueprintPure, Category = "IP|Websocket")
 	bool IsOpen();
+	/** Subprotocol agreed in the handshake (empty: none). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FString GetSubProtocol();
+
+	/** Round trip of the last Ping answered by a Pong, in ms (-1: none yet). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	float GetRoundTripTimeMs();
+
+	/** Server with OnUpgradeRequest bound: accepts the pending upgrade request. */
+	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
+	void AcceptUpgrade();
+
+	/** Server with OnUpgradeRequest bound: refuses the pending upgrade request with an HTTP status (400..599). */
+	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
+	void RejectUpgrade(int32 Status, const FString& Reason);
+
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|Websocket")
 	FTcpEndpoint LocalEndpoint();

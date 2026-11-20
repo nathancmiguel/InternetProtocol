@@ -12,6 +12,7 @@
 #include "net/tls.h"
 #include "net/transport.h"
 #include "net/udp.h"
+#include <algorithm>
 #include <atomic>
 
 /*
@@ -37,6 +38,89 @@ namespace IPNet {
 		}
 		std::shared_ptr<FFlowControl> Flow;
 		int64 Bytes = 0;
+	};
+
+	/** Cuts a TCP byte stream into messages (strand only). */
+	class FTcpFramer {
+	public:
+		explicit FTcpFramer(const FTcpFramingOptions& Options)
+			: Mode(Options.Mode), MaxBytes(static_cast<size_t>(FMath::Max(Options.MaxMessageBytes, 1))) {
+			const FTCHARToUTF8 Utf8(*Options.Delimiter);
+			Delimiter.assign(reinterpret_cast<const uint8*>(Utf8.Get()), reinterpret_cast<const uint8*>(Utf8.Get()) + Utf8.Length());
+			if (Mode == ETcpFramingMode::Delimiter && Delimiter.empty()) {
+				Delimiter.push_back('\n');
+			}
+		}
+
+		/** Appends data and calls Emit for every complete message. Returns false on a framing error. */
+		template <typename FEmit>
+		bool Feed(const uint8* Data, size_t Size, FEmit&& Emit) {
+			Buffer.insert(Buffer.end(), Data, Data + Size);
+			size_t Pos = 0;
+			bool bOk = true;
+			for (;;) {
+				const size_t Available = Buffer.size() - Pos;
+				if (Mode == ETcpFramingMode::LengthPrefixed) {
+					if (Available < 4) {
+						break;
+					}
+					const uint8* P = Buffer.data() + Pos;
+					const size_t Length = (static_cast<size_t>(P[0]) << 24) | (static_cast<size_t>(P[1]) << 16) | (static_cast<size_t>(P[2]) << 8) | P[3];
+					if (Length > MaxBytes) {
+						bOk = false;
+						break;
+					}
+					if (Available < 4 + Length) {
+						break;
+					}
+					Emit(P + 4, Length);
+					Pos += 4 + Length;
+				} else {
+					const auto Begin = Buffer.begin() + static_cast<std::ptrdiff_t>(Pos);
+					const auto Found = std::search(Begin, Buffer.end(), Delimiter.begin(), Delimiter.end());
+					if (Found == Buffer.end()) {
+						if (Available > MaxBytes) {
+							bOk = false;
+						}
+						break;
+					}
+					const size_t Length = static_cast<size_t>(Found - Begin);
+					if (Length > MaxBytes) {
+						bOk = false;
+						break;
+					}
+					Emit(Buffer.data() + Pos, Length);
+					Pos += Length + Delimiter.size();
+				}
+			}
+			Buffer.erase(Buffer.begin(), Buffer.begin() + static_cast<std::ptrdiff_t>(Pos));
+			return bOk;
+		}
+
+		/** Frames one outgoing message; false if it is too large. */
+		static bool Encode(const FTcpFramingOptions& Options, FBytes& InOut) {
+			if (Options.Mode == ETcpFramingMode::Raw) {
+				return true;
+			}
+			if (InOut.size() > static_cast<size_t>(FMath::Max(Options.MaxMessageBytes, 1))) {
+				return false;
+			}
+			if (Options.Mode == ETcpFramingMode::LengthPrefixed) {
+				const uint32 Length = static_cast<uint32>(InOut.size());
+				const uint8 Prefix[4] = {static_cast<uint8>(Length >> 24), static_cast<uint8>(Length >> 16), static_cast<uint8>(Length >> 8), static_cast<uint8>(Length)};
+				InOut.insert(InOut.begin(), Prefix, Prefix + 4);
+				return true;
+			}
+			const FTCHARToUTF8 Utf8(*(Options.Delimiter.IsEmpty() ? FString(TEXT("\n")) : Options.Delimiter));
+			InOut.insert(InOut.end(), reinterpret_cast<const uint8*>(Utf8.Get()), reinterpret_cast<const uint8*>(Utf8.Get()) + Utf8.Length());
+			return true;
+		}
+
+	private:
+		ETcpFramingMode Mode;
+		size_t MaxBytes;
+		FBytes Delimiter;
+		FBytes Buffer;
 	};
 
 	inline uint64 NextSessionId() {
@@ -98,7 +182,8 @@ namespace IPNet {
 		// Optional hook: void HandleClosedNative() (remotes notify their server).
 
 		template <typename T>
-		static FTransportEvents MakeTcpEvents(T* Owner, uint64 Id, std::shared_ptr<FFlowControl> Flow = nullptr) {
+		static FTransportEvents MakeTcpEvents(T* Owner, uint64 Id, std::shared_ptr<FFlowControl> Flow = nullptr,
+		                                      const FTcpFramingOptions& Framing = FTcpFramingOptions()) {
 			TWeakObjectPtr<T> Weak(Owner);
 			FTransportEvents Events;
 			Events.OnConnected = [Weak, Id](const asio::ip::tcp::endpoint& Local, const asio::ip::tcp::endpoint& Remote) {
@@ -112,7 +197,31 @@ namespace IPNet {
 					Self->OnConnected.Broadcast();
 				});
 			};
-			Events.OnData = [Weak, Id, Flow](const uint8* Data, size_t Size) {
+			std::shared_ptr<FTcpFramer> Framer = Framing.Mode == ETcpFramingMode::Raw ? nullptr : std::make_shared<FTcpFramer>(Framing);
+			Events.OnData = [Weak, Id, Flow, Framer](const uint8* Data, size_t Size) {
+				if (Framer) {
+					// One OnMessage per complete message.
+					const bool bOk = Framer->Feed(Data, Size, [&Weak, Id, &Flow](const uint8* Message, size_t Length) {
+						TArray<uint8> Buffer(Message, static_cast<int32>(Length));
+						if (Flow) {
+							Flow->Add(static_cast<int64>(Length));
+						}
+						RunOnGameThread(Weak, [Id, Guard = FFlowGuard(Flow, Length), Buffer = MoveTemp(Buffer)](T* Self) {
+							if (Self->Net.SessionId == Id) {
+								Self->OnMessage.Broadcast(Buffer, Buffer.Num());
+							}
+						});
+					});
+					if (!bOk) {
+						RunOnGameThread(Weak, [Id](T* Self) {
+							if (Self->Net.SessionId == Id) {
+								FailImmediately(Self, EError::MessageTooLarge);
+								CloseStream(Self->Net);
+							}
+						});
+					}
+					return;
+				}
 				TArray<uint8> Buffer(Data, static_cast<int32>(Size));
 				if (Flow) {
 					Flow->Add(static_cast<int64>(Size));
@@ -215,7 +324,7 @@ namespace IPNet {
 			}
 			const uint64 Id = NextSessionId();
 			FTransportOptions TransportOptions = ClientTransportOptions(Options, true);
-			FTransportEvents Events = MakeTcpEvents(Self, Id, TransportOptions.Flow);
+			FTransportEvents Events = MakeTcpEvents(Self, Id, TransportOptions.Flow, Self->Framing);
 			std::shared_ptr<FTransport> Transport = bUseTls ? MakeTlsClient(Tls, MoveTemp(Events), TransportOptions)
 			                                                : MakeTcpClient(MoveTemp(Events), TransportOptions);
 			if (!Transport) {
@@ -223,6 +332,7 @@ namespace IPNet {
 				return false;
 			}
 			BeginSession(Self->Net, Transport, Id);
+			Self->Net.Framing = Self->Framing;
 			Transport->Connect(ToStd(Options.Address), ToStd(Options.Port), Options.Protocol);
 			return true;
 		}
@@ -260,7 +370,11 @@ namespace IPNet {
 
 		template <typename T, typename TDelegate>
 		static bool SendBytes(T* Self, FBytes Bytes, const TDelegate& Callback) {
-			if (!Self->Net.Transport || !Self->Net.bOpen || Bytes.empty()) {
+			if (!Self->Net.Transport || !Self->Net.bOpen || (Bytes.empty() && Self->Net.Framing.Mode == ETcpFramingMode::Raw)) {
+				return false;
+			}
+			if (!FTcpFramer::Encode(Self->Net.Framing, Bytes)) {
+				FailImmediately(Self, EError::MessageTooLarge);
 				return false;
 			}
 			if (!Self->Net.Transport->Send(MoveTemp(Bytes), MakeSendCallback(Self, Callback))) {
@@ -394,13 +508,14 @@ namespace IPNet {
 			TRemote* Remote = NewObject<TRemote>(Server);
 			const uint64 Id = NextSessionId();
 			FTransportOptions TransportOptions = AcceptedTransportOptions(Server->Server.Options, true, true);
-			FTransportEvents Events = MakeTcpEvents(Remote, Id, TransportOptions.Flow);
+			FTransportEvents Events = MakeTcpEvents(Remote, Id, TransportOptions.Flow, Server->Framing);
 			std::shared_ptr<FTransport> Transport = bUseTls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events), TransportOptions)
 			                                                : MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events), TransportOptions);
 			if (!Transport) {
 				return nullptr;
 			}
 			BeginSession(Remote->Net, Transport, Id);
+			Remote->Net.Framing = Server->Framing;
 			BindRemoteToServer(Server, Clients, Remote);
 			return Remote;
 		}

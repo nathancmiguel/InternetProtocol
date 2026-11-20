@@ -104,3 +104,35 @@ void UWSRemoteSsl::End(int code, const FString& reason) {
 void UWSRemoteSsl::Close(int code, const FString& reason) {
 	FWsAccess::Close(this, code, reason);
 }
+
+FString UWSRemote::GetSubProtocol() {
+	return State.SubProtocol;
+}
+
+float UWSRemote::GetRoundTripTimeMs() {
+	return State.RoundTripMs;
+}
+
+void UWSRemote::AcceptUpgrade() {
+	FWsAccess::AcceptUpgrade(this);
+}
+
+void UWSRemote::RejectUpgrade(int32 Status, const FString& Reason) {
+	FWsAccess::RejectUpgrade(this, Status, Reason);
+}
+
+FString UWSRemoteSsl::GetSubProtocol() {
+	return State.SubProtocol;
+}
+
+float UWSRemoteSsl::GetRoundTripTimeMs() {
+	return State.RoundTripMs;
+}
+
+void UWSRemoteSsl::AcceptUpgrade() {
+	FWsAccess::AcceptUpgrade(this);
+}
+
+void UWSRemoteSsl::RejectUpgrade(int32 Status, const FString& Reason) {
+	FWsAccess::RejectUpgrade(this, Status, Reason);
+}
