@@ -74,17 +74,19 @@ bool UUDPServer::Bind(const FServerBindOptions& BindOpts) {
 		return false;
 	}
 	const uint64 Id = IPNet::NextSessionId();
+	std::shared_ptr<IPNet::FFlowControl> Flow = IPNet::MakeFlow(BindOpts.MaxPendingReceiveMB);
 	IPNet::FUdpEvents Events = FFacadeAccess::MakeUdpEvents(this, Id,
 		[](UUDPServer* Self, const TArray<uint8>& Buffer, const asio::ip::udp::endpoint& From) {
 			const FUdpEndpoint Sender(From);
 			Self->Net.Remote = Sender;
 			Self->OnMessage.Broadcast(Buffer, Buffer.Num(), Sender);
-		});
+		}, Flow);
 	std::shared_ptr<IPNet::FUdpSocket> Socket = IPNet::FUdpSocket::Create(MoveTemp(Events), static_cast<size_t>(recv_buffer_size));
 	if (!Socket) {
 		FFacadeAccess::FailImmediately(this, IPNet::EError::NotRunning);
 		return false;
 	}
+	Socket->SetFlowControl(Flow);
 
 	asio::ip::address Address;
 	asio::error_code Ec;

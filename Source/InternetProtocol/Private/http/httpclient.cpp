@@ -87,7 +87,7 @@ void UHttpClientSsl::SetHost(const FClientBindOptions& BindOpts) {
 
 void UHttpClientSsl::Request(const FHttpRequest& Req, const FDelegateHttpClientResponse& Callback) {
 	if (!Tls) {
-		Tls = IPNet::MakeTlsConfig(FSecurityContextOpts(), false);
+		Tls = IPNet::GetDefaultClientTlsConfig();
 	}
 	FHttpAccess::Request(this, Req, Callback, Tls, true);
 }

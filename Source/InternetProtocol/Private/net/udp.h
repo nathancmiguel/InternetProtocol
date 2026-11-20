@@ -47,6 +47,11 @@ namespace IPNet {
 		/** Applies to the next receive operation. */
 		void SetReceiveBufferSize(size_t Size) { ReceiveSize.store(FMath::Max<size_t>(Size, 1)); }
 
+		/** Receive backpressure: datagrams are dropped (and counted) while the Game Thread is behind. */
+		void SetFlowControl(std::shared_ptr<FFlowControl> InFlow) { Flow = MoveTemp(InFlow); }
+		/** Datagrams dropped so far (truncated or over the pending limit). Any thread. */
+		uint64 DroppedDatagrams() const { return Dropped.load(std::memory_order_relaxed); }
+
 		void Close();
 		virtual void abort() override { Close(); }
 
@@ -71,7 +76,12 @@ namespace IPNet {
 		std::atomic<size_t> ReceiveSize;
 		std::atomic<size_t> PendingBytes{0};
 		std::atomic<EState> State{EState::Idle};
+		std::atomic<uint64> Dropped{0};
+		std::shared_ptr<FFlowControl> Flow;
 		bool bConnected = false;
+
+		void ConfigureSocket();
+		void CountDrop(const TCHAR* Why);
 
 		static constexpr size_t MaxPendingBytes = 16u * 1024u * 1024u;
 	};

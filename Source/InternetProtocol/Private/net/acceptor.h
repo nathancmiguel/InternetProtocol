@@ -50,6 +50,7 @@ namespace IPNet {
 		FAcceptorEvents Events;
 		asio::ip::tcp::endpoint BoundEndpoint;
 		bool bClosed = false;
+		int32 RetryDelayMs = 0;
 	};
 
 	/**

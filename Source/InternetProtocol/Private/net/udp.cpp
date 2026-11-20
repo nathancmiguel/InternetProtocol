@@ -5,8 +5,36 @@
 #include "net/udp.h"
 #include "net/errors.h"
 
+#if PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <winsock2.h>
+#include <mstcpip.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
+
 namespace IPNet {
 	using asio::ip::udp;
+
+	void FUdpSocket::ConfigureSocket() {
+#if PLATFORM_WINDOWS
+		// Windows reports an ICMP "port unreachable" from an earlier send as an error on the NEXT receive
+		// (WSAECONNRESET). For UDP that is noise (often caused by a peer that just went away) and would turn
+		// into a stream of OnError events: switch it off.
+		BOOL bReport = 0;
+		DWORD Returned = 0;
+		::WSAIoctl(Socket.native_handle(), SIO_UDP_CONNRESET, &bReport, sizeof(bReport), nullptr, 0, &Returned, nullptr, nullptr);
+#endif
+	}
+
+	void FUdpSocket::CountDrop(const TCHAR* Why) {
+		const uint64 Count = Dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+		static std::atomic<double> LastLog{0.0};
+		const double Now = FPlatformTime::Seconds();
+		double Previous = LastLog.load(std::memory_order_relaxed);
+		if (Now - Previous >= 1.0 && LastLog.compare_exchange_strong(Previous, Now)) {
+			UE_LOG(LogAsio, Warning, TEXT("InternetProtocol UDP: datagram dropped (%s); %llu dropped so far."), Why, Count);
+		}
+	}
 
 	std::shared_ptr<FUdpSocket> FUdpSocket::Create(FUdpEvents Events, size_t ReceiveBufferSize) {
 		std::shared_ptr<FIoCore> Core = FIoService::Get();
@@ -36,10 +64,18 @@ namespace IPNet {
 				return;
 			}
 			Self->State.store(EState::Connecting);
-			Self->Resolver.async_resolve(Protocol == EProtocolType::V6 ? udp::v6() : udp::v4(), Host, Port,
-				[Self](const asio::error_code& Ec, const udp::resolver::results_type& Results) {
-					Self->OnResolved(Ec, Results);
-				});
+			std::string Target = Host;
+			if (Target.size() > 2 && Target.front() == '[' && Target.back() == ']') {
+				Target = Target.substr(1, Target.size() - 2);
+			}
+			auto Handler = [Self](const asio::error_code& Ec, const udp::resolver::results_type& Results) {
+				Self->OnResolved(Ec, Results);
+			};
+			if (Protocol == EProtocolType::Any) {
+				Self->Resolver.async_resolve(Target, Port, MoveTemp(Handler));
+			} else {
+				Self->Resolver.async_resolve(Protocol == EProtocolType::V6 ? udp::v6() : udp::v4(), Target, Port, MoveTemp(Handler));
+			}
 		});
 	}
 
@@ -59,6 +95,7 @@ namespace IPNet {
 		asio::error_code OpenEc;
 		Socket.open(Remote.protocol(), OpenEc);
 		if (!OpenEc) {
+			ConfigureSocket();
 			// UDP "connect" only sets the default peer and filters incoming datagrams; it does not block.
 			Socket.connect(Remote, OpenEc);
 		}
@@ -83,6 +120,12 @@ namespace IPNet {
 		Socket.open(Endpoint.protocol(), OutError);
 		if (OutError) {
 			return false;
+		}
+		ConfigureSocket();
+		if (Endpoint.address().is_v6() && Endpoint.address().is_unspecified()) {
+			// "::" listens on IPv4 too (dual stack), as the Any protocol promises.
+			Socket.set_option(asio::ip::v6_only(false), OutError);
+			OutError.clear();
 		}
 		Socket.set_option(asio::socket_base::reuse_address(bReuseAddress), OutError);
 		if (!OutError) {
@@ -125,8 +168,13 @@ namespace IPNet {
 			if (Ec == asio::error::operation_aborted) {
 				return;
 			}
-			// ICMP port unreachable / truncated datagrams must not kill a UDP socket: report and keep receiving.
-			if (Events.OnError) {
+			if (Ec == asio::error::message_size) {
+				// Windows: the datagram was larger than the receive buffer and has been truncated. Delivering a
+				// partial datagram would be wrong; it is dropped and counted instead of being a fatal error.
+				CountDrop(TEXT("larger than the receive buffer"));
+			} else if (Ec == asio::error::connection_refused || Ec == asio::error::connection_reset) {
+				// ICMP port unreachable from an earlier send (other platforms): not an error of this socket.
+			} else if (Events.OnError) {
 				Events.OnError(Ec);
 			}
 			if (State.load() == EState::Open) {
@@ -134,7 +182,12 @@ namespace IPNet {
 			}
 			return;
 		}
-		if (Events.OnData) {
+		if (Flow && Flow->IsOverLimit()) {
+			CountDrop(TEXT("the Game Thread is behind"));
+		} else if (Events.OnData) {
+			if (Flow) {
+				Flow->Add(static_cast<int64>(Bytes));
+			}
 			Events.OnData(ReceiveBuffer.data(), Bytes, Sender);
 		}
 		if (State.load() == EState::Open) {
@@ -157,7 +210,12 @@ namespace IPNet {
 		const size_t Size = Data.size();
 		if (PendingBytes.fetch_add(Size) + Size > MaxPendingBytes) {
 			PendingBytes.fetch_sub(Size);
-			UE_LOG(LogAsio, Warning, TEXT("InternetProtocol UDP: send queue limit reached, datagram dropped."));
+			static std::atomic<double> LastLog{0.0};
+			const double Now = FPlatformTime::Seconds();
+			double Previous = LastLog.load(std::memory_order_relaxed);
+			if (Now - Previous >= 1.0 && LastLog.compare_exchange_strong(Previous, Now)) {
+				UE_LOG(LogAsio, Warning, TEXT("InternetProtocol UDP: send queue limit reached, datagram dropped."));
+			}
 			return false;
 		}
 		const bool bHasTarget = To != nullptr;
@@ -185,6 +243,10 @@ namespace IPNet {
 	}
 
 	void FUdpSocket::Close() {
+		if (Core->IsStopped()) {
+			Finish();
+			return;
+		}
 		asio::post(Executor, [Self = shared_from_this()]() { Self->Finish(); });
 	}
 

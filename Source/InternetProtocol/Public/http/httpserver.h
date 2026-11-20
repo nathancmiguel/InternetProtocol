@@ -39,7 +39,7 @@ public:
 	int Backlog = 2147483647;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
-	uint8 IdleTimeoutSeconds = 0;
+	uint8 IdleTimeoutSeconds = 60;
 
 	/** A request whose handler has not called Write after this many seconds is answered with 503. 0 = never. */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
@@ -137,7 +137,7 @@ public:
 	int Backlog = 2147483647;
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
-	uint8 IdleTimeoutSeconds = 0;
+	uint8 IdleTimeoutSeconds = 60;
 
 	/** A request whose handler has not called Write after this many seconds is answered with 503. 0 = never. */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")

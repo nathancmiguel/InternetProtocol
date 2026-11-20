@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Copyright © 2025 Nathan Miguel
  */
 
@@ -6,22 +6,36 @@
 #include "common.h"
 #include "asio.generated.h"
 
+UENUM(BlueprintType, Category="IP|ENUM|Common")
+enum class EErrorCategory : uint8 {
+	None,
+	/** Operating system / socket errors (connection refused, reset, host not found...). */
+	System,
+	/** TLS errors (certificate verification, handshake). */
+	SSL,
+	/** Plugin errors (timeouts, queue full, invalid argument...). */
+	Plugin,
+	/** HTTP protocol errors. */
+	Http,
+	/** WebSocket protocol errors. */
+	WebSocket,
+};
+
 USTRUCT(BlueprintType, Category="IP|Net|ErrorCode")
 struct INTERNETPROTOCOL_API FErrorCode {
 	GENERATED_BODY()
 	FErrorCode() = default;
-	explicit FErrorCode(const asio::error_code& error_code) {
-		if (error_code) {
-			Value = error_code.value();
-			Message = UTF8_TO_TCHAR(error_code.message().c_str());
-		}
-	}
+	explicit FErrorCode(const asio::error_code& error_code);
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ErrorCode")
 	FString Message;
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ErrorCode")
 	int Value = 0;
+
+	/** Where Value comes from: the same number means different things in different categories. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ErrorCode")
+	EErrorCategory Category = EErrorCategory::None;
 };
 
 USTRUCT(BlueprintType, Category="IP|Net|Endpoint")

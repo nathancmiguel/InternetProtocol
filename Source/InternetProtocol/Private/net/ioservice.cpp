@@ -59,6 +59,8 @@ namespace IPNet {
 			TArray<TUniquePtr<FIoWorker>> Workers;
 			TArray<FRunnableThread*> Threads;
 			std::atomic<int32> Active{0};
+			bool bAllowed = false;
+			bool bShutDown = false;
 		};
 
 		FServiceState& State() {
@@ -70,7 +72,13 @@ namespace IPNet {
 	void FIoService::Startup() {
 		FServiceState& S = State();
 		FScopeLock ScopeLock(&S.Lock);
-		if (S.Core) {
+		S.bAllowed = true;
+	}
+
+	namespace {
+		/** Starts the worker threads; S.Lock held. */
+		void StartLocked(FServiceState& S) {
+		if (S.Core || !S.bAllowed || S.bShutDown) {
 			return;
 		}
 
@@ -105,6 +113,7 @@ namespace IPNet {
 		}
 
 		UE_LOG(LogAsio, Log, TEXT("InternetProtocol: started %d I/O thread(s)."), S.Threads.Num());
+		}
 	}
 
 	void FIoService::Shutdown() {
@@ -114,6 +123,7 @@ namespace IPNet {
 		TArray<TUniquePtr<FIoWorker>> Workers;
 		{
 			FScopeLock ScopeLock(&S.Lock);
+			S.bShutDown = true;
 			if (!S.Core) {
 				return;
 			}
@@ -143,6 +153,7 @@ namespace IPNet {
 			delete Thread;
 		}
 		Workers.Empty();
+		Core->bStopped.store(true, std::memory_order_release);
 
 		// 3. Run, on this thread, the completion handlers that are still queued (aborted operations) so the
 		// sessions they reference are released now instead of staying alive inside the stopped io_context.
@@ -163,6 +174,9 @@ namespace IPNet {
 	std::shared_ptr<FIoCore> FIoService::Get() {
 		FServiceState& S = State();
 		FScopeLock ScopeLock(&S.Lock);
+		if (!S.Core) {
+			StartLocked(S);
+		}
 		return S.Core;
 	}
 }

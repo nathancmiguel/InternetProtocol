@@ -15,6 +15,12 @@ DEFINE_LOG_CATEGORY(LogAsio);
 void FInternetProtocolModule::StartupModule()
 {
 	IPNet::FIoService::Startup();
+	if (!IsRunningCommandlet()) {
+		// Builds the default TLS client configuration (system root certificates) off the Game Thread.
+		// Modules can only be loaded on the Game Thread: load SSL here first.
+		FModuleManager::Get().LoadModule(TEXT("SSL"));
+		IPNet::WarmUpDefaultClientTls();
+	}
 }
 
 void FInternetProtocolModule::ShutdownModule()

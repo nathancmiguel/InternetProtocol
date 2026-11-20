@@ -75,6 +75,17 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category="IP|Subsystem")
 	URTMPServer* CreateRTMPServer();
+
+	/** Closes every connection / server created by this subsystem (their ports are freed when the world ends, e.g. at the end of PIE). */
+	virtual void Deinitialize() override;
+
 private:
-	
+	template <typename T>
+	T* Track(T* Object) {
+		Created.Add(Object);
+		return Object;
+	}
+
+	/** Objects created here; weak: the caller decides how long they live. */
+	TArray<TWeakObjectPtr<UObject>> Created;
 };

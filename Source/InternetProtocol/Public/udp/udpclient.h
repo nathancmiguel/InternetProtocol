@@ -80,5 +80,5 @@ public:
 private:
 	friend struct IPNet::FFacadeAccess;
 	FIpUdpState Net;
-	int32 recv_buffer_size = 16384;
+	int32 recv_buffer_size = 65536;
 };

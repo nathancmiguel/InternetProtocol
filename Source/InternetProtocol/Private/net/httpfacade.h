@@ -63,6 +63,13 @@ namespace IPNet {
 			}
 			const FHttpParser::EResult Result = Parser.Parse();
 			if (Result == FHttpParser::EResult::Complete) {
+				if (!bEstablished) {
+					// Headers (and body) of the first request arrived in time: stop the handshake timeout.
+					bEstablished = true;
+					if (std::shared_ptr<FTransport> Strong = Transport.lock()) {
+						Strong->MarkEstablished();
+					}
+				}
 				bAwaiting = true;
 				FHttpRequest Request = MoveTemp(Parser.Request);
 				Parser.Next();
@@ -86,6 +93,7 @@ namespace IPNet {
 		std::function<void(FHttpRequest&&)> OnRequest;
 		bool bAwaiting = false;
 		bool bFailed = false;
+		bool bEstablished = false;
 	};
 
 	struct FHttpAccess {
@@ -208,7 +216,7 @@ namespace IPNet {
 				});
 			};
 
-			FTransportOptions Options;
+			FTransportOptions Options = ClientTransportOptions(Self->bind_options, false);
 			Options.IdleTimeout = std::chrono::seconds(Self->IdleTimeoutSeconds);
 			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsClient(Tls, MoveTemp(Events), Options)
 			                                             : MakeTcpClient(MoveTemp(Events), Options);
@@ -369,7 +377,7 @@ namespace IPNet {
 				});
 			};
 
-			FTransportOptions Options;
+			FTransportOptions Options = AcceptedTransportOptions(Server->Server.Options, false, false);
 			Options.IdleTimeout = std::chrono::seconds(Server->IdleTimeoutSeconds);
 			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events), Options)
 			                                             : MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events), Options);

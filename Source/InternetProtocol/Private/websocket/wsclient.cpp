@@ -131,7 +131,7 @@ bool UWSClientSsl::Pong(const FDelegateWsClientMessageSent& Callback) {
 
 bool UWSClientSsl::Connect(const FClientBindOptions& BindOpts) {
 	if (!Tls) {
-		Tls = IPNet::MakeTlsConfig(FSecurityContextOpts(), false);
+		Tls = IPNet::GetDefaultClientTlsConfig();
 	}
 	return FWsAccess::Connect(this, BindOpts, Tls, true);
 }

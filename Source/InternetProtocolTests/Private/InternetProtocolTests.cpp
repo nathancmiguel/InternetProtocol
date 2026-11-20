@@ -846,4 +846,241 @@ bool FIPHttpPipelineFloodTest::RunTest(const FString& Parameters) {
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Phase 1: transport hardening
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPConnectTimeoutTest, "InternetProtocol.Transport.ConnectTimeout", IPTests::Flags)
+bool FIPConnectTimeoutTest::RunTest(const FString& Parameters) {
+	// A plain TCP server that never answers: the TLS handshake of the client can never complete.
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Silent = Make<UTCPServer>();
+	Silent->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnRawAccepted);
+	if (!TestTrue(TEXT("Silent server opens"), Silent->Open(Loopback()))) {
+		return false;
+	}
+	UIPTestListener* L = Make<UIPTestListener>();
+	UTCPClientSsl* Client = Make<UTCPClientSsl>();
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnError.AddDynamic(L, &UIPTestListener::OnError);
+	Client->OnClose.AddDynamic(L, &UIPTestListener::OnClose);
+	FClientBindOptions Options = ClientTo(Silent->LocalEndpoint().Port);
+	Options.ConnectTimeoutSeconds = 1.0f;
+	const double Start = FPlatformTime::Seconds();
+	Client->Connect(Options);
+	WaitUntil(this, TEXT("connect timeout"), [L]() { return L->Closed == 1; }, 10.0);
+	Then([this, L, ServerL, Silent, Client, Start]() {
+		TestEqual(TEXT("Never connected"), L->Connected, 0);
+		TestEqual(TEXT("TimedOut reported"), L->LastError.Message.Contains(TEXT("timed out")), true);
+		TestEqual(TEXT("Plugin error category"), L->LastError.Category, EErrorCategory::Plugin);
+		TestTrue(TEXT("Within a few seconds"), FPlatformTime::Seconds() - Start < 5.0);
+		Silent->Close();
+		Release(Client);
+		Release(Silent);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHandshakeTimeoutTest, "InternetProtocol.Transport.HandshakeTimeout", IPTests::Flags)
+bool FIPHandshakeTimeoutTest::RunTest(const FString& Parameters) {
+	FString CertPem, KeyPem;
+	if (!TestTrue(TEXT("Self-signed certificate generated"), MakeSelfSignedCertificate(CertPem, KeyPem))) {
+		return false;
+	}
+	FSecurityContextOpts ServerOpts;
+	ServerOpts.Cert = CertPem;
+	ServerOpts.Private_Key = KeyPem;
+	ServerOpts.Verify_Mode = EVerifyMode::None;
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServerSsl* Server = Make<UTCPServerSsl>();
+	Server->Construct(ServerOpts);
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnTcpSslAccepted);
+	FServerBindOptions Bind = Loopback();
+	Bind.HandshakeTimeoutSeconds = 1.0f;
+	if (!TestTrue(TEXT("TLS server opens"), Server->Open(Bind))) {
+		return false;
+	}
+	// A plain TCP client never sends a ClientHello: the server must drop it.
+	UIPTestListener* L = Make<UIPTestListener>();
+	UTCPClient* Client = Make<UTCPClient>();
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnClose.AddDynamic(L, &UIPTestListener::OnClose);
+	Client->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("server drops the silent client"), [L]() { return L->Closed == 1; }, 10.0);
+	Then([this, L, ServerL, Server, Client]() {
+		TestEqual(TEXT("TCP connected first"), L->Connected, 1);
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPMaxConnectionsTest, "InternetProtocol.Transport.MaxConnections", IPTests::Flags)
+bool FIPMaxConnectionsTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Server = Make<UTCPServer>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnRawAccepted);
+	FServerBindOptions Bind = Loopback();
+	Bind.MaxConnections = 1;
+	if (!TestTrue(TEXT("TCP server opens"), Server->Open(Bind))) {
+		return false;
+	}
+	UIPTestListener* First = Make<UIPTestListener>();
+	UIPTestListener* Second = Make<UIPTestListener>();
+	UTCPClient* A = Make<UTCPClient>();
+	UTCPClient* B = Make<UTCPClient>();
+	A->OnClose.AddDynamic(First, &UIPTestListener::OnClose);
+	B->OnClose.AddDynamic(Second, &UIPTestListener::OnClose);
+	A->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("first accepted"), [ServerL]() { return ServerL->Accepted == 1; });
+	Then([B, Server]() { B->Connect(ClientTo(Server->LocalEndpoint().Port)); });
+	WaitUntil(this, TEXT("second refused"), [Second]() { return Second->Closed == 1; }, 10.0);
+	Then([this, First, Second, ServerL, Server, A, B]() {
+		TestEqual(TEXT("Only one connection accepted"), ServerL->Accepted, 1);
+		TestEqual(TEXT("First connection still open"), First->Closed, 0);
+		TestTrue(TEXT("First client open"), A->IsOpen());
+		Server->Close();
+		Release(A);
+		Release(B);
+		Release(Server);
+		Release(First);
+		Release(Second);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPBackpressureTest, "InternetProtocol.Transport.BackpressureKeepsData", IPTests::Flags)
+bool FIPBackpressureTest::RunTest(const FString& Parameters) {
+	// 24 MiB through a 1 MiB receive limit: reading pauses and resumes many times, nothing is lost or reordered.
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Server = Make<UTCPServer>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnRawAccepted);
+	FServerBindOptions Bind = Loopback();
+	Bind.MaxPendingReceiveMB = 1;
+	if (!TestTrue(TEXT("TCP server opens"), Server->Open(Bind))) {
+		return false;
+	}
+	UIPTestListener* L = Make<UIPTestListener>();
+	UTCPClient* Client = Make<UTCPClient>();
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnMessage.AddDynamic(L, &UIPTestListener::OnBytes);
+	FClientBindOptions Options = ClientTo(Server->LocalEndpoint().Port);
+	Options.MaxPendingReceiveMB = 1;
+	Client->Connect(Options);
+	// The remote is accepted before its own OnConnected: wait until it can send.
+	WaitUntil(this, TEXT("connected"), [L, ServerL]() {
+		return L->Connected == 1 && ServerL->RawRemotes.Num() == 1 && ServerL->RawRemotes[0]->IsOpen();
+	});
+	const TArray<uint8> Data = Pattern(24 * 1024 * 1024);
+	Then([this, ServerL, Data]() {
+		TestTrue(TEXT("24 MiB queued"), ServerL->RawRemotes[0]->WriteBuffer(Data, FDelegateTcpRemoteMessageSent()));
+	});
+	WaitUntil(this, TEXT("24 MiB received"), [L, Data]() { return L->Received.Num() >= Data.Num(); }, 60.0);
+	Then([this, L, ServerL, Server, Client, Data]() {
+		AddInfo(FString::Printf(TEXT("Received %d of %d bytes in %d messages"), L->Received.Num(), Data.Num(), L->Messages));
+		TestTrue(TEXT("Received intact and in order"), L->Received == Data);
+		Client->Close();
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPDualStackTest, "InternetProtocol.Transport.DualStack", IPTests::Flags)
+bool FIPDualStackTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UTCPServer* Server = Make<UTCPServer>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnTcpAccepted);
+	FServerBindOptions Bind;
+	Bind.Address = TEXT("");          // any address
+	Bind.Port = 0;
+	Bind.Protocol = EProtocolType::Any; // "::" with IPv4 mapped
+	if (!TestTrue(TEXT("Dual stack server opens"), Server->Open(Bind))) {
+		return false;
+	}
+	const int32 Port = Server->LocalEndpoint().Port;
+	UIPTestListener* V4 = Make<UIPTestListener>();
+	UIPTestListener* V6 = Make<UIPTestListener>();
+	UTCPClient* ClientV4 = Make<UTCPClient>();
+	UTCPClient* ClientV6 = Make<UTCPClient>();
+	ClientV4->OnConnected.AddDynamic(V4, &UIPTestListener::OnConnected);
+	ClientV6->OnConnected.AddDynamic(V6, &UIPTestListener::OnConnected);
+	ClientV4->Connect(ClientTo(Port, TEXT("127.0.0.1")));
+	ClientV6->Connect(ClientTo(Port, TEXT("[::1]")));
+	WaitUntil(this, TEXT("IPv4 and IPv6 clients connected"), [V4, V6]() { return V4->Connected == 1 && V6->Connected == 1; });
+	Then([this, V4, V6, ServerL, Server, ClientV4, ClientV6]() {
+		TestEqual(TEXT("Both accepted"), ServerL->Accepted, 2);
+		ClientV4->Close();
+		ClientV6->Close();
+		Server->Close();
+		Release(ClientV4);
+		Release(ClientV6);
+		Release(Server);
+		Release(V4);
+		Release(V6);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPUdpLargeDatagramTest, "InternetProtocol.UDP.LargeDatagram", IPTests::Flags)
+bool FIPUdpLargeDatagramTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UUDPServer* Server = Make<UUDPServer>();
+	UUDPClient* Client = Make<UUDPClient>();
+	ServerL->UdpServer = Server;
+	Server->OnMessage.AddDynamic(ServerL, &UIPTestListener::OnUdpServerMessage);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnMessage.AddDynamic(L, &UIPTestListener::OnBytes);
+	Client->OnError.AddDynamic(L, &UIPTestListener::OnError);
+	if (!TestTrue(TEXT("UDP server binds"), Server->Bind(Loopback()))) {
+		return false;
+	}
+	Client->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("udp connected"), [L]() { return L->Connected == 1; });
+	const TArray<uint8> Datagram = Pattern(60 * 1024);
+	Then([Client, Datagram]() { Client->SendBuffer(Datagram, FDelegateUdpClientMessageSent()); });
+	WaitUntil(this, TEXT("60 KB echo"), [L]() { return L->Messages == 1; });
+	Then([this, L, ServerL, Server, Client, Datagram]() {
+		TestTrue(TEXT("60 KB datagram not truncated"), L->Received == Datagram);
+		TestEqual(TEXT("No error"), L->Errors, 0);
+		Client->Close();
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPErrorCategoryTest, "InternetProtocol.Transport.ErrorCategory", IPTests::Flags)
+bool FIPErrorCategoryTest::RunTest(const FString& Parameters) {
+	UTCPServer* Probe = Make<UTCPServer>();
+	Probe->Open(Loopback());
+	const int32 Port = Probe->LocalEndpoint().Port;
+	Probe->Close();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UTCPClient* Client = Make<UTCPClient>();
+	Client->OnError.AddDynamic(L, &UIPTestListener::OnError);
+	Client->Connect(ClientTo(Port));
+	WaitUntil(this, TEXT("connection refused"), [L]() { return L->Errors >= 1; });
+	Then([this, L, Client, Probe]() {
+		TestEqual(TEXT("Refused is a system error"), L->LastError.Category, EErrorCategory::System);
+		Release(Client);
+		Release(Probe);
+		Release(L);
+	});
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

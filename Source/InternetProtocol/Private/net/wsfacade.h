@@ -17,12 +17,24 @@ namespace IPNet {
 	 */
 	struct FWsAccess {
 
+		/** Set once the transport exists; lets session callbacks (strand) reach it. */
+		using FTransportRef = std::shared_ptr<std::weak_ptr<FTransport>>;
+
+		static void MarkEstablished(const FTransportRef& Ref) {
+			if (std::shared_ptr<FTransport> Strong = Ref->lock()) {
+				Strong->MarkEstablished();
+			}
+		}
+
 		template <typename T>
-		static FWsSession::FCallbacks MakeCommonCallbacks(const TWeakObjectPtr<T>& Weak, uint64 Id) {
+		static FWsSession::FCallbacks MakeCommonCallbacks(const TWeakObjectPtr<T>& Weak, uint64 Id, std::shared_ptr<FFlowControl> Flow = nullptr) {
 			FWsSession::FCallbacks Callbacks;
-			Callbacks.OnMessage = [Weak, Id](FBytes&& Payload, bool bBinary) {
+			Callbacks.OnMessage = [Weak, Id, Flow](FBytes&& Payload, bool bBinary) {
 				TArray<uint8> Buffer(Payload.data(), static_cast<int32>(Payload.size()));
-				RunOnGameThread(Weak, [Id, bBinary, Buffer = MoveTemp(Buffer)](T* Self) {
+				if (Flow) {
+					Flow->Add(static_cast<int64>(Payload.size()));
+				}
+				RunOnGameThread(Weak, [Id, bBinary, Guard = FFlowGuard(Flow, Payload.size()), Buffer = MoveTemp(Buffer)](T* Self) {
 					if (Self->State.Net.SessionId == Id) {
 						Self->OnMessage.Broadcast(Buffer, bBinary);
 					}
@@ -130,8 +142,13 @@ namespace IPNet {
 			Request.Headers.Add(TEXT("Sec-WebSocket-Version"), TEXT("13"));
 			FBytes HandshakeBytes = SerializeRequest(Request, HostHeader(Options, bTls));
 
-			FWsSession::FCallbacks Callbacks = MakeCommonCallbacks(Weak, Id);
-			Callbacks.OnClientHandshake = [Weak, Id](FHttpResponse&& Response) {
+			// The connect timeout also covers the upgrade response.
+			FTransportOptions TransportOptions = ClientTransportOptions(Options, true);
+			TransportOptions.bEstablishOnOpen = false;
+			FTransportRef TransportRef = std::make_shared<std::weak_ptr<FTransport>>();
+			FWsSession::FCallbacks Callbacks = MakeCommonCallbacks(Weak, Id, TransportOptions.Flow);
+			Callbacks.OnClientHandshake = [Weak, Id, TransportRef](FHttpResponse&& Response) {
+				MarkEstablished(TransportRef);
 				RunOnGameThread(Weak, [Id, Response = MoveTemp(Response)](T* Owner) {
 					if (Owner->State.Net.SessionId == Id) {
 						Owner->State.Net.bOpen = true;
@@ -149,7 +166,11 @@ namespace IPNet {
 			std::shared_ptr<FWsSession> Session = std::make_shared<FWsSession>(true, MoveTemp(Callbacks), MoveTemp(HandshakeBytes), Key);
 
 			FTransportEvents Events = MakeTransportEvents(Weak, Id, Session);
-			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsClient(Tls, MoveTemp(Events)) : MakeTcpClient(MoveTemp(Events));
+			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsClient(Tls, MoveTemp(Events), TransportOptions)
+			                                             : MakeTcpClient(MoveTemp(Events), TransportOptions);
+			if (Transport) {
+				*TransportRef = Transport;
+			}
 			if (!Transport) {
 				S.Net.LastError = FErrorCode(MakeError(EError::NotRunning));
 				Self->OnError.Broadcast(S.Net.LastError);
@@ -172,8 +193,12 @@ namespace IPNet {
 			const uint64 Id = NextSessionId();
 			TWeakObjectPtr<TRemote> Weak(Remote);
 
-			FWsSession::FCallbacks Callbacks = MakeCommonCallbacks(Weak, Id);
-			Callbacks.OnServerHandshake = [Weak, Id](FHttpRequest&& Request) {
+			// TLS + upgrade request must arrive within the handshake timeout.
+			FTransportOptions TransportOptions = AcceptedTransportOptions(Server->Server.Options, true, false);
+			FTransportRef TransportRef = std::make_shared<std::weak_ptr<FTransport>>();
+			FWsSession::FCallbacks Callbacks = MakeCommonCallbacks(Weak, Id, TransportOptions.Flow);
+			Callbacks.OnServerHandshake = [Weak, Id, TransportRef](FHttpRequest&& Request) {
+				MarkEstablished(TransportRef);
 				RunOnGameThread(Weak, [Id, Request = MoveTemp(Request)](TRemote* Owner) {
 					if (Owner->State.Net.SessionId == Id) {
 						Owner->State.Net.bOpen = true;
@@ -191,11 +216,12 @@ namespace IPNet {
 			std::shared_ptr<FWsSession> Session = std::make_shared<FWsSession>(false, MoveTemp(Callbacks));
 
 			FTransportEvents Events = MakeTransportEvents(Weak, Id, Session);
-			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events))
-			                                             : MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events));
+			std::shared_ptr<FTransport> Transport = bTls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events), TransportOptions)
+			                                             : MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events), TransportOptions);
 			if (!Transport) {
 				return nullptr;
 			}
+			*TransportRef = Transport;
 			Session->Transport = Transport;
 			FFacadeAccess::BeginSession(Remote->State.Net, Transport, Id);
 			Remote->State.Session = Session;

@@ -14,6 +14,8 @@ THIRD_PARTY_INCLUDES_START
 THIRD_PARTY_INCLUDES_END
 #undef UI
 
+#include "Async/Async.h"
+
 namespace IPNet {
 	namespace {
 		std::atomic<bool> GSslInitialized{false};
@@ -63,7 +65,28 @@ namespace IPNet {
 		}
 	}
 
+	namespace {
+		FCriticalSection GDefaultClientLock;
+		std::shared_ptr<const FTlsConfig> GDefaultClient;
+	}
+
+	std::shared_ptr<const FTlsConfig> GetDefaultClientTlsConfig() {
+		FScopeLock Lock(&GDefaultClientLock);
+		if (!GDefaultClient) {
+			GDefaultClient = MakeTlsConfig(FSecurityContextOpts(), false);
+		}
+		return GDefaultClient;
+	}
+
+	void WarmUpDefaultClientTls() {
+		Async(EAsyncExecution::ThreadPool, []() { GetDefaultClientTlsConfig(); });
+	}
+
 	void ShutdownTls() {
+		{
+			FScopeLock Lock(&GDefaultClientLock);
+			GDefaultClient.reset();
+		}
 		if (GSslInitialized.exchange(false)) {
 			if (FModuleManager::Get().IsModuleLoaded(TEXT("SSL"))) {
 				FSslModule::Get().GetSslManager().ShutdownSsl();
@@ -223,6 +246,11 @@ namespace IPNet {
 		}
 
 		Config->bVerifyHostname = Opts.bVerifyHostname;
+		if (!bServer && Config->bVerifyPeer && !Opts.bVerifyHostname) {
+			// A valid certificate for ANY host is accepted: as dangerous as Verify_Mode = None.
+			UE_LOG(LogAsio, Warning, TEXT("InternetProtocol TLS: host name verification is DISABLED (bVerifyHostname = false). "
+				"Any valid certificate is accepted, so connections are vulnerable to man-in-the-middle attacks."));
+		}
 		if (!Opts.Host_Name_Verification.IsEmpty()) {
 			Config->HostnameOverride = TCHAR_TO_UTF8(*Opts.Host_Name_Verification);
 			if (bServer && Config->bVerifyPeer) {

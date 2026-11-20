@@ -45,4 +45,12 @@ namespace IPNet {
 	/** Called from module startup/shutdown to initialize the engine SSL library. */
 	void InitializeTls();
 	void ShutdownTls();
+
+	/**
+	 * Shared client configuration with the default options (system roots, peer + host name verification).
+	 * Loading the root certificates is expensive: it is built once (WarmUpDefaultClientTls builds it on a
+	 * worker thread at startup) instead of on the Game Thread at every first request.
+	 */
+	std::shared_ptr<const FTlsConfig> GetDefaultClientTlsConfig();
+	void WarmUpDefaultClientTls();
 }

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Copyright © 2025 Nathan Miguel
  */
 
@@ -74,6 +74,8 @@ UENUM(Blueprintable, Category="IP|ENUM|Common")
 enum class EProtocolType: uint8 {
 	V4 = 0,
 	V6 = 1,
+	/** Clients try every resolved address (IPv6 and IPv4); servers listen on IPv6 with IPv4 mapped (dual stack). */
+	Any = 2,
 };
 
 UENUM(Blueprintable, Category="IP|ENUM|Common")
@@ -256,7 +258,18 @@ struct FClientBindOptions {
 	FString Port = "8080";
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ClientBindOptions")
-	EProtocolType Protocol = EProtocolType::V4;
+	EProtocolType Protocol = EProtocolType::Any;
+
+	/** DNS + connect + TLS handshake must complete within this time (0 = no limit). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ClientBindOptions")
+	float ConnectTimeoutSeconds = 15.0f;
+
+	/**
+	 * Received data not yet handled by the Game Thread, per connection. Above it the plugin stops reading
+	 * (the peer slows down); UDP drops datagrams instead.
+	 */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ClientBindOptions")
+	int MaxPendingReceiveMB = 8;
 };
 
 // Server side
@@ -271,7 +284,19 @@ struct FServerBindOptions {
 	int Port = 8080;
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ServerBindOptions")
-	EProtocolType Protocol = EProtocolType::V4;
+	EProtocolType Protocol = EProtocolType::Any;
+
+	/** Connections above this are refused (closed right after accept). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ServerBindOptions")
+	int MaxConnections = 1024;
+
+	/** TLS handshake / HTTP headers / WebSocket upgrade must complete within this time (0 = no limit). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ServerBindOptions")
+	float HandshakeTimeoutSeconds = 10.0f;
+
+	/** Per connection, see FClientBindOptions::MaxPendingReceiveMB. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ServerBindOptions")
+	int MaxPendingReceiveMB = 8;
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ServerBindOptions")
 	bool bReuse_Address = true;

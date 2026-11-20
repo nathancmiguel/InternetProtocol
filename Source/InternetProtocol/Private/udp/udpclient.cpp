@@ -71,15 +71,17 @@ bool UUDPClient::Connect(const FClientBindOptions& BindOpts) {
 		return false;
 	}
 	const uint64 Id = IPNet::NextSessionId();
+	std::shared_ptr<IPNet::FFlowControl> Flow = IPNet::MakeFlow(BindOpts.MaxPendingReceiveMB);
 	IPNet::FUdpEvents Events = FFacadeAccess::MakeUdpEvents(this, Id,
 		[](UUDPClient* Self, const TArray<uint8>& Buffer, const asio::ip::udp::endpoint&) {
 			Self->OnMessage.Broadcast(Buffer, Buffer.Num());
-		});
+		}, Flow);
 	std::shared_ptr<IPNet::FUdpSocket> Socket = IPNet::FUdpSocket::Create(MoveTemp(Events), static_cast<size_t>(recv_buffer_size));
 	if (!Socket) {
 		FFacadeAccess::FailImmediately(this, IPNet::EError::NotRunning);
 		return false;
 	}
+	Socket->SetFlowControl(Flow);
 	Net.Socket = Socket;
 	Net.SessionId = Id;
 	Net.bOpen = false;

@@ -16,6 +16,24 @@ namespace IPNet {
 		return Error == asio::error::eof || Error == asio::ssl::error::stream_truncated;
 	}
 
+	void FFlowControl::Consume(int64 Bytes) {
+		const int64 Now = Pending.fetch_sub(Bytes, std::memory_order_acq_rel) - Bytes;
+		if (Now < Limit / 2 && bPaused.exchange(false, std::memory_order_acq_rel)) {
+			if (std::shared_ptr<FTransport> Strong = Transport.lock()) {
+				Strong->ResumeRead();
+			}
+		}
+	}
+
+	namespace {
+		/** At most one warning per second per call site (a flood must not flood the log too). */
+		bool ShouldLog(std::atomic<double>& Last) {
+			const double Now = FPlatformTime::Seconds();
+			double Previous = Last.load(std::memory_order_relaxed);
+			return Now - Previous >= 1.0 && Last.compare_exchange_strong(Previous, Now);
+		}
+	}
+
 	namespace {
 		enum class EState : uint8 { Idle, Connecting, Handshaking, Open, Closing, Closed };
 
@@ -43,6 +61,8 @@ namespace IPNet {
 				  Resolver(Executor),
 				  CloseTimer(Executor),
 				  IdleTimer(Executor),
+					  SetupTimer(Executor),
+					  FlowTimer(Executor),
 				  Events(MoveTemp(InEvents)),
 				  Options(InOptions),
 				  ReadBuffer(ReadChunkSize) {}
@@ -57,6 +77,8 @@ namespace IPNet {
 				  Resolver(Executor),
 				  CloseTimer(Executor),
 				  IdleTimer(Executor),
+					  SetupTimer(Executor),
+					  FlowTimer(Executor),
 				  Events(MoveTemp(InEvents)),
 				  Options(InOptions),
 				  ReadBuffer(ReadChunkSize) {}
@@ -84,7 +106,10 @@ namespace IPNet {
 				const size_t Size = Data.size();
 				if (QueuedBytes.fetch_add(Size, std::memory_order_acq_rel) + Size > Options.MaxQueuedBytes) {
 					QueuedBytes.fetch_sub(Size, std::memory_order_acq_rel);
-					UE_LOG(LogAsio, Warning, TEXT("InternetProtocol: send queue limit reached, message dropped."));
+					static std::atomic<double> LastLog{0.0};
+					if (ShouldLog(LastLog)) {
+						UE_LOG(LogAsio, Warning, TEXT("InternetProtocol: send queue limit reached, message dropped."));
+					}
 					return false;
 				}
 				asio::post(Executor, [Self = this->shared_from_this(), Data = MoveTemp(Data), Callback = MoveTemp(Callback)]() mutable {
@@ -94,6 +119,12 @@ namespace IPNet {
 			}
 
 			virtual void Close() override {
+				if (Core->IsStopped()) {
+					// The I/O threads are gone: nothing would ever run a posted handler. Nothing else runs
+					// on this strand anymore either, so closing right here is safe.
+					Finish();
+					return;
+				}
 				asio::post(Executor, [Self = this->shared_from_this()]() { Self->DoClose(); });
 			}
 
@@ -119,6 +150,23 @@ namespace IPNet {
 			}
 
 			virtual bool IsTls() const override { return bTls; }
+
+			virtual void MarkEstablished() override {
+				asio::post(Executor, [Self = this->shared_from_this()]() {
+					Self->bEstablished = true;
+					Self->SetupTimer.cancel();
+				});
+			}
+
+			virtual void ResumeRead() override {
+				asio::post(Executor, [Self = this->shared_from_this()]() {
+					if (Self->bReadPaused && !Self->bReadPending && Self->State.load() == EState::Open) {
+						Self->bReadPaused = false;
+						Self->FlowTimer.cancel();
+						Self->StartRead();
+					}
+				});
+			}
 
 		private:
 			static FStream MakeClientStream(const asio::any_io_executor& Ex, const std::shared_ptr<const FTlsConfig>& InTls) {
@@ -163,11 +211,20 @@ namespace IPNet {
 				}
 				State.store(EState::Connecting);
 				ConnectHost = Host;
-				const tcp Family = Protocol == EProtocolType::V6 ? tcp::v6() : tcp::v4();
-				Resolver.async_resolve(Family, Host, Port,
-					[Self = this->shared_from_this()](const asio::error_code& Ec, const tcp::resolver::results_type& Results) {
-						Self->OnResolved(Ec, Results);
-					});
+				// "[::1]" style IPv6 literals are accepted (brackets are URL syntax, not part of the address).
+				if (ConnectHost.size() > 2 && ConnectHost.front() == '[' && ConnectHost.back() == ']') {
+					ConnectHost = ConnectHost.substr(1, ConnectHost.size() - 2);
+				}
+				ArmSetupTimer(Options.ConnectTimeout);
+				auto OnResolvedHandler = [Self = this->shared_from_this()](const asio::error_code& Ec, const tcp::resolver::results_type& Results) {
+					Self->OnResolved(Ec, Results);
+				};
+				if (Protocol == EProtocolType::Any) {
+					// Every resolved address (IPv6 and IPv4) is tried in order by async_connect.
+					Resolver.async_resolve(ConnectHost, Port, MoveTemp(OnResolvedHandler));
+				} else {
+					Resolver.async_resolve(Protocol == EProtocolType::V6 ? tcp::v6() : tcp::v4(), ConnectHost, Port, MoveTemp(OnResolvedHandler));
+				}
 			}
 
 			void OnResolved(const asio::error_code& Ec, const tcp::resolver::results_type& Results) {
@@ -218,6 +275,7 @@ namespace IPNet {
 						return;
 					}
 					State.store(EState::Handshaking);
+					ArmSetupTimer(Options.HandshakeTimeout);
 					ArmIdle();
 					Stream.async_handshake(asio::ssl::stream_base::server,
 						[Self = this->shared_from_this()](const asio::error_code& HandshakeEc) {
@@ -242,6 +300,13 @@ namespace IPNet {
 
 			void OnOpen() {
 				State.store(EState::Open);
+				if (Options.bEstablishOnOpen) {
+					bEstablished = true;
+					SetupTimer.cancel();
+				} else if (!bEstablished && !bSetupTimerArmed) {
+					// Plain accepted connection: the protocol handshake starts now.
+					ArmSetupTimer(Options.HandshakeTimeout);
+				}
 				asio::error_code Ec;
 				const tcp::endpoint Local = Lowest().local_endpoint(Ec);
 				const tcp::endpoint Remote = Lowest().remote_endpoint(Ec);
@@ -276,6 +341,18 @@ namespace IPNet {
 					if (bShutdownAfterRead) {
 						bShutdownAfterRead = false;
 						StartTlsShutdown();
+						return;
+					}
+					if constexpr (!bTls) {
+						if (bHalfClosed) {
+							// Half-close: our FIN is sent; drain (and discard) until the peer's EOF, bounded by the
+							// close timer. EOF or any error ends the connection.
+							if (Ec || Bytes == 0) {
+								Finish();
+							} else {
+								StartRead();
+							}
+						}
 					}
 					return;
 				}
@@ -291,9 +368,20 @@ namespace IPNet {
 				if (Events.OnData && Bytes > 0) {
 					Events.OnData(ReadBuffer.data(), Bytes);
 				}
-				if (State.load() == EState::Open) {
-					StartRead();
+				if (State.load() != EState::Open) {
+					return;
 				}
+				if (Options.Flow && Options.Flow->IsOverLimit()) {
+					// The Game Thread is behind: stop reading. Set the flag first, then re-check, so a Consume()
+					// racing with us cannot be missed.
+					Options.Flow->bPaused.store(true, std::memory_order_release);
+					if (Options.Flow->IsOverLimit() || !Options.Flow->bPaused.exchange(false, std::memory_order_acq_rel)) {
+						bReadPaused = true;
+						ArmFlowRecheck();
+						return;
+					}
+				}
+				StartRead();
 			}
 
 			void DoQueue(FBytes&& Data, FSendCallback&& Callback) {
@@ -385,6 +473,13 @@ namespace IPNet {
 					}
 				}
 				asio::error_code Ignored;
+				if (bReadPending) {
+					// Graceful TCP close: send FIN, keep reading until the peer closes too (bounded by the
+					// close timer). Data still in flight from the peer is not turned into a connection reset.
+					Lowest().shutdown(tcp::socket::shutdown_send, Ignored);
+					bHalfClosed = true;
+					return;
+				}
 				Lowest().shutdown(tcp::socket::shutdown_both, Ignored);
 				Finish();
 			}
@@ -414,7 +509,48 @@ namespace IPNet {
 				IdleTimer.expires_after(Options.IdleTimeout);
 				IdleTimer.async_wait([Self = this->shared_from_this()](const asio::error_code& Ec) {
 					if (!Ec) {
+						if (Self->State.load() == EState::Open && Self->Events.OnError) {
+							Self->Events.OnError(MakeError(EError::TimedOut));
+						}
 						Self->DoClose();
+					}
+				});
+			}
+
+			/**
+			 * Safety net while reading is paused: Consume() normally resumes us, but a missed wake-up must
+			 * never stall a connection forever, so the limit is re-checked periodically too.
+			 */
+			void ArmFlowRecheck() {
+				FlowTimer.expires_after(std::chrono::milliseconds(100));
+				FlowTimer.async_wait([Self = this->shared_from_this()](const asio::error_code& Ec) {
+					if (Ec || !Self->bReadPaused || Self->State.load() != EState::Open) {
+						return;
+					}
+					if (Self->Options.Flow && Self->Options.Flow->IsOverLimit()) {
+						Self->ArmFlowRecheck();
+						return;
+					}
+					Self->bReadPaused = false;
+					if (Self->Options.Flow) {
+						Self->Options.Flow->bPaused.store(false, std::memory_order_release);
+					}
+					if (!Self->bReadPending) {
+						Self->StartRead();
+					}
+				});
+			}
+
+			/** Connect (client) or handshake (accepted) deadline. */
+			void ArmSetupTimer(std::chrono::milliseconds Timeout) {
+				if (Timeout.count() <= 0 || bEstablished) {
+					return;
+				}
+				bSetupTimerArmed = true;
+				SetupTimer.expires_after(Timeout);
+				SetupTimer.async_wait([Self = this->shared_from_this()](const asio::error_code& Ec) {
+					if (!Ec && !Self->bEstablished && Self->State.load() != EState::Closed) {
+						Self->Fail(MakeError(EError::TimedOut));
 					}
 				});
 			}
@@ -437,6 +573,8 @@ namespace IPNet {
 				Resolver.cancel();
 				CloseTimer.cancel();
 				IdleTimer.cancel();
+				SetupTimer.cancel();
+				FlowTimer.cancel();
 				Lowest().close(Ignored);
 
 				std::deque<FWriteItem> Dropped = MoveTemp(WriteQueue);
@@ -463,6 +601,8 @@ namespace IPNet {
 			tcp::resolver Resolver;
 			asio::steady_timer CloseTimer;
 			asio::steady_timer IdleTimer;
+			asio::steady_timer SetupTimer;
+			asio::steady_timer FlowTimer;
 			FTransportEvents Events;
 			FTransportOptions Options;
 			std::vector<uint8> ReadBuffer;
@@ -475,11 +615,19 @@ namespace IPNet {
 			bool bFlushing = false;
 			bool bShutdownAfterRead = false;
 			bool bHandshakeDone = false;
+			bool bEstablished = false;
+			bool bSetupTimerArmed = false;
+			bool bReadPaused = false;
+			bool bHalfClosed = false;
 		};
 
 		template <typename T>
-		std::shared_ptr<FTransport> Register(const std::shared_ptr<FIoCore>& Core, std::shared_ptr<T> Transport) {
+		std::shared_ptr<FTransport> Register(const std::shared_ptr<FIoCore>& Core, std::shared_ptr<T> Transport,
+		                                     const FTransportOptions& Options) {
 			Core->Register(Transport);
+			if (Options.Flow) {
+				Options.Flow->Transport = Transport;
+			}
 			return Transport;
 		}
 	}
@@ -489,7 +637,7 @@ namespace IPNet {
 		if (!Core) {
 			return nullptr;
 		}
-		return Register(Core, std::make_shared<TStreamTransport<false>>(Core, nullptr, MoveTemp(Events), Options));
+		return Register(Core, std::make_shared<TStreamTransport<false>>(Core, nullptr, MoveTemp(Events), Options), Options);
 	}
 
 	std::shared_ptr<FTransport> MakeTlsClient(std::shared_ptr<const FTlsConfig> Tls, FTransportEvents Events,
@@ -498,7 +646,7 @@ namespace IPNet {
 		if (!Core || !Tls || !Tls->Context) {
 			return nullptr;
 		}
-		return Register(Core, std::make_shared<TStreamTransport<true>>(Core, MoveTemp(Tls), MoveTemp(Events), Options));
+		return Register(Core, std::make_shared<TStreamTransport<true>>(Core, MoveTemp(Tls), MoveTemp(Events), Options), Options);
 	}
 
 	std::shared_ptr<FTransport> MakeTcpAccepted(tcp::socket&& Socket, FTransportEvents Events, const FTransportOptions& Options) {
@@ -506,7 +654,7 @@ namespace IPNet {
 		if (!Core) {
 			return nullptr;
 		}
-		return Register(Core, std::make_shared<TStreamTransport<false>>(Core, MoveTemp(Socket), nullptr, MoveTemp(Events), Options));
+		return Register(Core, std::make_shared<TStreamTransport<false>>(Core, MoveTemp(Socket), nullptr, MoveTemp(Events), Options), Options);
 	}
 
 	std::shared_ptr<FTransport> MakeTlsAccepted(tcp::socket&& Socket, std::shared_ptr<const FTlsConfig> Tls,
@@ -515,6 +663,6 @@ namespace IPNet {
 		if (!Core || !Tls || !Tls->Context) {
 			return nullptr;
 		}
-		return Register(Core, std::make_shared<TStreamTransport<true>>(Core, MoveTemp(Socket), MoveTemp(Tls), MoveTemp(Events), Options));
+		return Register(Core, std::make_shared<TStreamTransport<true>>(Core, MoveTemp(Socket), MoveTemp(Tls), MoveTemp(Events), Options), Options);
 	}
 }

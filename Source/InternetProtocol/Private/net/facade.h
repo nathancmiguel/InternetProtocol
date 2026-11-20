@@ -21,6 +21,24 @@
  */
 namespace IPNet {
 
+	/**
+	 * Moves with a Game Thread task and consumes its bytes from the flow control when the task is destroyed,
+	 * i.e. after it ran or when it was dropped because the UObject is gone.
+	 */
+	struct FFlowGuard {
+		FFlowGuard(std::shared_ptr<FFlowControl> InFlow, size_t InBytes) : Flow(MoveTemp(InFlow)), Bytes(static_cast<int64>(InBytes)) {}
+		FFlowGuard(FFlowGuard&& Other) noexcept : Flow(MoveTemp(Other.Flow)), Bytes(Other.Bytes) { Other.Flow.reset(); }
+		FFlowGuard(const FFlowGuard& Other) : Flow(Other.Flow), Bytes(Other.Bytes) { const_cast<FFlowGuard&>(Other).Flow.reset(); }
+		FFlowGuard& operator=(const FFlowGuard&) = delete;
+		~FFlowGuard() {
+			if (Flow) {
+				Flow->Consume(Bytes);
+			}
+		}
+		std::shared_ptr<FFlowControl> Flow;
+		int64 Bytes = 0;
+	};
+
 	inline uint64 NextSessionId() {
 		static std::atomic<uint64> Counter{0};
 		return ++Counter;
@@ -28,6 +46,35 @@ namespace IPNet {
 
 	inline std::string ToStd(const FString& Text) {
 		return std::string(TCHAR_TO_UTF8(*Text));
+	}
+
+	inline std::chrono::milliseconds ToMs(float Seconds) {
+		return std::chrono::milliseconds(Seconds > 0.0f ? static_cast<int64>(Seconds * 1000.0f) : 0);
+	}
+
+	inline std::shared_ptr<FFlowControl> MakeFlow(int32 MaxPendingMB) {
+		return std::make_shared<FFlowControl>(static_cast<int64>(FMath::Max(MaxPendingMB, 1)) * 1024 * 1024);
+	}
+
+	/** Transport options of an outgoing connection. */
+	inline FTransportOptions ClientTransportOptions(const FClientBindOptions& Bind, bool bFlow) {
+		FTransportOptions Options;
+		Options.ConnectTimeout = ToMs(Bind.ConnectTimeoutSeconds);
+		if (bFlow) {
+			Options.Flow = MakeFlow(Bind.MaxPendingReceiveMB);
+		}
+		return Options;
+	}
+
+	/** Transport options of an accepted connection. bEstablishOnOpen = false when a protocol handshake follows. */
+	inline FTransportOptions AcceptedTransportOptions(const FServerBindOptions& Bind, bool bFlow, bool bEstablishOnOpen) {
+		FTransportOptions Options;
+		Options.HandshakeTimeout = ToMs(Bind.HandshakeTimeoutSeconds);
+		Options.bEstablishOnOpen = bEstablishOnOpen;
+		if (bFlow) {
+			Options.Flow = MakeFlow(Bind.MaxPendingReceiveMB);
+		}
+		return Options;
 	}
 
 	/** The send-completion callback forwarded to the Game Thread. */
@@ -51,7 +98,7 @@ namespace IPNet {
 		// Optional hook: void HandleClosedNative() (remotes notify their server).
 
 		template <typename T>
-		static FTransportEvents MakeTcpEvents(T* Owner, uint64 Id) {
+		static FTransportEvents MakeTcpEvents(T* Owner, uint64 Id, std::shared_ptr<FFlowControl> Flow = nullptr) {
 			TWeakObjectPtr<T> Weak(Owner);
 			FTransportEvents Events;
 			Events.OnConnected = [Weak, Id](const asio::ip::tcp::endpoint& Local, const asio::ip::tcp::endpoint& Remote) {
@@ -65,9 +112,13 @@ namespace IPNet {
 					Self->OnConnected.Broadcast();
 				});
 			};
-			Events.OnData = [Weak, Id](const uint8* Data, size_t Size) {
+			Events.OnData = [Weak, Id, Flow](const uint8* Data, size_t Size) {
 				TArray<uint8> Buffer(Data, static_cast<int32>(Size));
-				RunOnGameThread(Weak, [Id, Buffer = MoveTemp(Buffer)](T* Self) {
+				if (Flow) {
+					Flow->Add(static_cast<int64>(Size));
+				}
+				// The Consume runs even when the object is gone (FFlowGuard), so reading can never stay paused.
+				RunOnGameThread(Weak, [Id, Guard = FFlowGuard(Flow, Size), Buffer = MoveTemp(Buffer)](T* Self) {
 					if (Self->Net.SessionId == Id) {
 						Self->OnMessage.Broadcast(Buffer, Buffer.Num());
 					}
@@ -163,8 +214,10 @@ namespace IPNet {
 				return false;
 			}
 			const uint64 Id = NextSessionId();
-			FTransportEvents Events = MakeTcpEvents(Self, Id);
-			std::shared_ptr<FTransport> Transport = bUseTls ? MakeTlsClient(Tls, MoveTemp(Events)) : MakeTcpClient(MoveTemp(Events));
+			FTransportOptions TransportOptions = ClientTransportOptions(Options, true);
+			FTransportEvents Events = MakeTcpEvents(Self, Id, TransportOptions.Flow);
+			std::shared_ptr<FTransport> Transport = bUseTls ? MakeTlsClient(Tls, MoveTemp(Events), TransportOptions)
+			                                                : MakeTcpClient(MoveTemp(Events), TransportOptions);
 			if (!Transport) {
 				FailImmediately(Self, EError::NotRunning);
 				return false;
@@ -210,7 +263,12 @@ namespace IPNet {
 			if (!Self->Net.Transport || !Self->Net.bOpen || Bytes.empty()) {
 				return false;
 			}
-			return Self->Net.Transport->Send(MoveTemp(Bytes), MakeSendCallback(Self, Callback));
+			if (!Self->Net.Transport->Send(MoveTemp(Bytes), MakeSendCallback(Self, Callback))) {
+				// The send queue is full (the peer does not read fast enough).
+				FailImmediately(Self, EError::QueueFull);
+				return false;
+			}
+			return true;
 		}
 
 		// ------------------------------------------------------------------------------------------------
@@ -234,6 +292,16 @@ namespace IPNet {
 				std::shared_ptr<asio::ip::tcp::socket> Owned = std::make_shared<asio::ip::tcp::socket>(MoveTemp(Socket));
 				RunOnGameThread(Weak, [Id, Handler, Owned](T* Self) {
 					if (Self->Server.SessionId != Id || !Self->Server.bOpen) {
+						asio::error_code Ignored;
+						Owned->close(Ignored);
+						return;
+					}
+					if (Self->Server.Options.MaxConnections > 0 && Self->Clients().Num() >= Self->Server.Options.MaxConnections) {
+						static double LastLog = 0.0;
+						if (FPlatformTime::Seconds() - LastLog >= 1.0) {
+							LastLog = FPlatformTime::Seconds();
+							UE_LOG(LogAsio, Warning, TEXT("InternetProtocol: connection refused, MaxConnections (%d) reached."), Self->Server.Options.MaxConnections);
+						}
 						asio::error_code Ignored;
 						Owned->close(Ignored);
 						return;
@@ -287,6 +355,7 @@ namespace IPNet {
 			}
 
 			Self->Server.Acceptor = Acceptor;
+			Self->Server.Options = Options;
 			Self->Server.SessionId = Id;
 			Self->Server.bOpen = true;
 			Self->Server.Local = FTcpEndpoint(Acceptor->LocalEndpoint());
@@ -324,9 +393,10 @@ namespace IPNet {
 		                               const std::shared_ptr<const FTlsConfig>& Tls, bool bUseTls) {
 			TRemote* Remote = NewObject<TRemote>(Server);
 			const uint64 Id = NextSessionId();
-			FTransportEvents Events = MakeTcpEvents(Remote, Id);
-			std::shared_ptr<FTransport> Transport = bUseTls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events))
-			                                                : MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events));
+			FTransportOptions TransportOptions = AcceptedTransportOptions(Server->Server.Options, true, true);
+			FTransportEvents Events = MakeTcpEvents(Remote, Id, TransportOptions.Flow);
+			std::shared_ptr<FTransport> Transport = bUseTls ? MakeTlsAccepted(MoveTemp(Socket), Tls, MoveTemp(Events), TransportOptions)
+			                                                : MakeTcpAccepted(MoveTemp(Socket), MoveTemp(Events), TransportOptions);
 			if (!Transport) {
 				return nullptr;
 			}
@@ -339,7 +409,7 @@ namespace IPNet {
 		// UDP (UUDPClient, UUDPServer). Required members: FIpUdpState Net; OnMessage; OnClose(); OnError(Error)
 
 		template <typename T, typename FDataHandler>
-		static FUdpEvents MakeUdpEvents(T* Owner, uint64 Id, FDataHandler DataHandler) {
+		static FUdpEvents MakeUdpEvents(T* Owner, uint64 Id, FDataHandler DataHandler, std::shared_ptr<FFlowControl> Flow = nullptr) {
 			TWeakObjectPtr<T> Weak(Owner);
 			FUdpEvents Events;
 			Events.OnConnected = [Weak, Id](const asio::ip::udp::endpoint& Local, const asio::ip::udp::endpoint& Remote) {
@@ -353,9 +423,10 @@ namespace IPNet {
 					BroadcastConnected(Self, 0);
 				});
 			};
-			Events.OnData = [Weak, Id, DataHandler](const uint8* Data, size_t Size, const asio::ip::udp::endpoint& From) {
+			Events.OnData = [Weak, Id, DataHandler, Flow](const uint8* Data, size_t Size, const asio::ip::udp::endpoint& From) {
 				TArray<uint8> Buffer(Data, static_cast<int32>(Size));
-				RunOnGameThread(Weak, [Id, From, DataHandler, Buffer = MoveTemp(Buffer)](T* Self) {
+				// The socket already counted the datagram in Flow; the guard releases it on the Game Thread.
+				RunOnGameThread(Weak, [Id, From, DataHandler, Guard = FFlowGuard(Flow, Size), Buffer = MoveTemp(Buffer)](T* Self) {
 					if (Self->Net.SessionId == Id) {
 						DataHandler(Self, Buffer, From);
 					}

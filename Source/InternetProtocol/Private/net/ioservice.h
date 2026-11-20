@@ -50,6 +50,8 @@ namespace IPNet {
 		asio::io_context Context;
 
 		bool IsRunning() const { return bRunning.load(std::memory_order_acquire); }
+		/** The I/O threads have been joined: posted handlers will never run. */
+		bool IsStopped() const { return bStopped.load(std::memory_order_acquire); }
 
 		void Register(const std::shared_ptr<FNetObject>& Object);
 		void Unregister(const FNetObject* Object);
@@ -58,13 +60,17 @@ namespace IPNet {
 	private:
 		friend class FIoService;
 		std::atomic<bool> bRunning{true};
+		std::atomic<bool> bStopped{false};
 		FCriticalSection Lock;
 		TMap<const FNetObject*, std::weak_ptr<FNetObject>> Objects;
 	};
 
 	class FIoService {
 	public:
-		/** Starts the worker threads. Called from StartupModule. */
+		/**
+		 * Allows the service to start. The worker threads start lazily on the first Get(), so editor
+		 * commandlets and games that never use the network do not spawn them.
+		 */
 		static void Startup();
 
 		/** Aborts every live session and joins the worker threads. Called from ShutdownModule. */

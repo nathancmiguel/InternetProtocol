@@ -49,6 +49,8 @@ struct FIpStreamState {
 /** Game Thread state of a listening server facade. */
 struct FIpServerState {
 	std::shared_ptr<IPNet::FTcpAcceptor> Acceptor;
+	/** Options passed to Open (connection limits and timeouts for accepted connections). */
+	FServerBindOptions Options;
 	uint64 SessionId = 0;
 	/** Sessions closed by the user whose final OnClose has not been delivered yet (Close then Connect again). */
 	TArray<uint64, TInlineAllocator<2>> PendingCloseIds;

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Copyright © 2025 Nathan Miguel
  */
 
@@ -110,7 +110,7 @@ bool UTCPClientSsl::WriteBuffer(const TArray<uint8>& Buffer, const FDelegateTcpC
 bool UTCPClientSsl::Connect(const FClientBindOptions& BindOpts) {
 	if (!Tls) {
 		// Created without the subsystem: use the secure defaults.
-		Tls = IPNet::MakeTlsConfig(FSecurityContextOpts(), false);
+		Tls = IPNet::GetDefaultClientTlsConfig();
 	}
 	return FFacadeAccess::ConnectTcp(this, BindOpts, Tls, true);
 }
