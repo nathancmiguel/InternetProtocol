@@ -46,35 +46,35 @@ FErrorCode UHttpServer::GetErrorCode() {
 }
 
 void UHttpServer::All(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	all_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(all_cb, Path, Callback);
 }
 
 void UHttpServer::Get(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	get_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(get_cb, Path, Callback);
 }
 
 void UHttpServer::Post(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	post_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(post_cb, Path, Callback);
 }
 
 void UHttpServer::Put(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	put_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(put_cb, Path, Callback);
 }
 
 void UHttpServer::Del(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	del_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(del_cb, Path, Callback);
 }
 
 void UHttpServer::Head(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	head_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(head_cb, Path, Callback);
 }
 
 void UHttpServer::Options(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	options_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(options_cb, Path, Callback);
 }
 
 void UHttpServer::Patch(const FString& Path, const FDelegateHttpServerRequest& Callback) {
-	patch_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(patch_cb, Path, Callback);
 }
 
 bool UHttpServer::Open(const FServerBindOptions& BindOpts) {
@@ -109,55 +109,7 @@ void UHttpServer::Close() {
 
 void UHttpServer::Route(UHttpRemote* Remote, const FHttpRequest& Request) {
 	FHttpAccess::PrepareResponse(Remote, Request);
-
-	if (Request.Method == ERequestMethod::UNKNOWN) {
-		Remote->Headers.Status_Code = 405;
-		Remote->Headers.Status_Message = TEXT("Method Not Allowed");
-		Remote->Headers.Headers.Add(TEXT("Allow"), TEXT("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"));
-		Remote->Headers.Body = TEXT("Method not supported.");
-		Remote->Write(FDelegateHttpRemoteMessageSent());
-		return;
-	}
-
-	TMap<FString, FDelegateHttpServerRequest>* MethodRoutes = nullptr;
-	switch (Request.Method) {
-	case ERequestMethod::DEL: MethodRoutes = &del_cb; break;
-	case ERequestMethod::GET: MethodRoutes = &get_cb; break;
-	case ERequestMethod::HEAD: MethodRoutes = &head_cb; break;
-	case ERequestMethod::OPTIONS: MethodRoutes = &options_cb; break;
-	case ERequestMethod::POST: MethodRoutes = &post_cb; break;
-	case ERequestMethod::PUT: MethodRoutes = &put_cb; break;
-	case ERequestMethod::PATCH: MethodRoutes = &patch_cb; break;
-	default: break;
-	}
-
-	// Copy the delegates: a handler may register routes or close the server while we iterate.
-	TArray<FDelegateHttpServerRequest> Handlers;
-	if (const FDelegateHttpServerRequest* Any = all_cb.Find(Request.Path)) {
-		Handlers.Add(*Any);
-	}
-	if (MethodRoutes) {
-		if (const FDelegateHttpServerRequest* Specific = MethodRoutes->Find(Request.Path)) {
-			Handlers.Add(*Specific);
-		}
-	}
-
-	bool bHandled = false;
-	for (const FDelegateHttpServerRequest& Handler : Handlers) {
-		if (Handler.IsBound()) {
-			bHandled = true;
-			Handler.ExecuteIfBound(Request, Remote);
-		}
-	}
-
-	if (!bHandled && IsValid(Remote)) {
-		Remote->Headers.Status_Code = 404;
-		Remote->Headers.Status_Message = TEXT("Not Found");
-		Remote->Headers.Body = TEXT("Not Found");
-		Remote->Write(FDelegateHttpRemoteMessageSent());
-	} else if (IsValid(Remote)) {
-		FHttpAccess::ArmResponseTimeout(Remote, ResponseTimeoutSeconds);
-	}
+	FHttpAccess::RouteRequest<FDelegateHttpServerRequest>(Remote, Request, ResponseTimeoutSeconds, all_cb, get_cb, post_cb, put_cb, del_cb, head_cb, options_cb, patch_cb);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -204,35 +156,35 @@ FErrorCode UHttpServerSsl::GetErrorCode() {
 }
 
 void UHttpServerSsl::All(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	all_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(all_cb, Path, Callback);
 }
 
 void UHttpServerSsl::Get(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	get_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(get_cb, Path, Callback);
 }
 
 void UHttpServerSsl::Post(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	post_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(post_cb, Path, Callback);
 }
 
 void UHttpServerSsl::Put(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	put_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(put_cb, Path, Callback);
 }
 
 void UHttpServerSsl::Del(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	del_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(del_cb, Path, Callback);
 }
 
 void UHttpServerSsl::Head(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	head_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(head_cb, Path, Callback);
 }
 
 void UHttpServerSsl::Options(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	options_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(options_cb, Path, Callback);
 }
 
 void UHttpServerSsl::Patch(const FString& Path, const FDelegateHttpServerRequestSsl& Callback) {
-	patch_cb.Add(Path, Callback);
+	FHttpAccess::AddRoute(patch_cb, Path, Callback);
 }
 
 bool UHttpServerSsl::Open(const FServerBindOptions& BindOpts) {
@@ -275,53 +227,5 @@ void UHttpServerSsl::Close() {
 
 void UHttpServerSsl::Route(UHttpRemoteSsl* Remote, const FHttpRequest& Request) {
 	FHttpAccess::PrepareResponse(Remote, Request);
-
-	if (Request.Method == ERequestMethod::UNKNOWN) {
-		Remote->Headers.Status_Code = 405;
-		Remote->Headers.Status_Message = TEXT("Method Not Allowed");
-		Remote->Headers.Headers.Add(TEXT("Allow"), TEXT("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"));
-		Remote->Headers.Body = TEXT("Method not supported.");
-		Remote->Write(FDelegateHttpRemoteMessageSent());
-		return;
-	}
-
-	TMap<FString, FDelegateHttpServerRequestSsl>* MethodRoutes = nullptr;
-	switch (Request.Method) {
-	case ERequestMethod::DEL: MethodRoutes = &del_cb; break;
-	case ERequestMethod::GET: MethodRoutes = &get_cb; break;
-	case ERequestMethod::HEAD: MethodRoutes = &head_cb; break;
-	case ERequestMethod::OPTIONS: MethodRoutes = &options_cb; break;
-	case ERequestMethod::POST: MethodRoutes = &post_cb; break;
-	case ERequestMethod::PUT: MethodRoutes = &put_cb; break;
-	case ERequestMethod::PATCH: MethodRoutes = &patch_cb; break;
-	default: break;
-	}
-
-	// Copy the delegates: a handler may register routes or close the server while we iterate.
-	TArray<FDelegateHttpServerRequestSsl> Handlers;
-	if (const FDelegateHttpServerRequestSsl* Any = all_cb.Find(Request.Path)) {
-		Handlers.Add(*Any);
-	}
-	if (MethodRoutes) {
-		if (const FDelegateHttpServerRequestSsl* Specific = MethodRoutes->Find(Request.Path)) {
-			Handlers.Add(*Specific);
-		}
-	}
-
-	bool bHandled = false;
-	for (const FDelegateHttpServerRequestSsl& Handler : Handlers) {
-		if (Handler.IsBound()) {
-			bHandled = true;
-			Handler.ExecuteIfBound(Request, Remote);
-		}
-	}
-
-	if (!bHandled && IsValid(Remote)) {
-		Remote->Headers.Status_Code = 404;
-		Remote->Headers.Status_Message = TEXT("Not Found");
-		Remote->Headers.Body = TEXT("Not Found");
-		Remote->Write(FDelegateHttpRemoteMessageSent());
-	} else if (IsValid(Remote)) {
-		FHttpAccess::ArmResponseTimeout(Remote, ResponseTimeoutSeconds);
-	}
+	FHttpAccess::RouteRequest<FDelegateHttpServerRequestSsl>(Remote, Request, ResponseTimeoutSeconds, all_cb, get_cb, post_cb, put_cb, del_cb, head_cb, options_cb, patch_cb);
 }

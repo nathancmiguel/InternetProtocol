@@ -166,6 +166,33 @@ namespace IPNet {
 			Out.insert(Out.end(), Utf8.begin(), Utf8.end());
 		}
 
+		/** RFC 9110 token characters (header names). */
+		bool IsTokenText(const FString& Text) {
+			if (Text.IsEmpty()) {
+				return false;
+			}
+			for (const TCHAR C : Text) {
+				const bool bAlnum = (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') || (C >= '0' && C <= '9');
+				if (!bAlnum && !FCString::Strchr(TEXT("!#$%&'*+-.^_`|~"), C)) {
+					return false;
+				}
+			}
+			return true;
+		}
+
+		void AppendHeaderList(FString& Head, const TArray<FHttpHeaderField>& List, TFunctionRef<bool(const FString&)> Skip) {
+			for (const FHttpHeaderField& Header : List) {
+				if (Header.Name.IsEmpty() || Skip(Header.Name)) {
+					continue;
+				}
+				if (!IsTokenText(Header.Name) || !IsSafeHeaderText(Header.Value)) {
+					UE_LOG(LogAsio, Warning, TEXT("InternetProtocol HTTP: header '%s' dropped (invalid name or CR/LF)."), *Header.Name);
+					continue;
+				}
+				Head += Header.Name + TEXT(": ") + Header.Value + TEXT("\r\n");
+			}
+		}
+
 		void AppendHeaders(FString& Head, const TMap<FString, FString>& Headers, TFunctionRef<bool(const FString&)> Skip) {
 			for (const TPair<FString, FString>& Header : Headers) {
 				if (Header.Key.IsEmpty() || Skip(Header.Key)) {
@@ -206,9 +233,11 @@ namespace IPNet {
 		if (!FindHeader(Request.Headers, TEXT("Host"))) {
 			Head += TEXT("Host: ") + Host + TEXT("\r\n");
 		}
-		AppendHeaders(Head, Request.Headers, [](const FString& Key) {
+		auto SkipRequest = [](const FString& Key) {
 			return Key.Equals(TEXT("Content-Length"), ESearchCase::IgnoreCase);
-		});
+		};
+		AppendHeaders(Head, Request.Headers, SkipRequest);
+		AppendHeaderList(Head, Request.HeaderList, SkipRequest);
 		const bool bMethodHasBody = Request.Method == ERequestMethod::POST || Request.Method == ERequestMethod::PUT ||
 		                            Request.Method == ERequestMethod::PATCH;
 		if (!Body.empty() || bMethodHasBody) {
@@ -227,10 +256,12 @@ namespace IPNet {
 		const FString Version = Response.Version.IsEmpty() ? FString(TEXT("1.1")) : Response.Version;
 		const FString Message = Response.Status_Message.IsEmpty() ? GetHttpStatusMessage(Response.Status_Code) : Response.Status_Message;
 		FString Head = FString::Printf(TEXT("HTTP/%s %d "), *Version, Response.Status_Code) + Message + TEXT("\r\n");
-		AppendHeaders(Head, Response.Headers, [](const FString& Key) {
+		auto SkipResponse = [](const FString& Key) {
 			return Key.Equals(TEXT("Content-Length"), ESearchCase::IgnoreCase) || Key.Equals(TEXT("Connection"), ESearchCase::IgnoreCase) ||
 			       Key.Equals(TEXT("Transfer-Encoding"), ESearchCase::IgnoreCase);
-		});
+		};
+		AppendHeaders(Head, Response.Headers, SkipResponse);
+		AppendHeaderList(Head, Response.HeaderList, SkipResponse);
 		const bool bStatusAllowsBody = !(Response.Status_Code / 100 == 1 || Response.Status_Code == 204 || Response.Status_Code == 304);
 		if (bStatusAllowsBody) {
 			Head += FString::Printf(TEXT("Content-Length: %llu\r\n"), static_cast<uint64>(Body.size()));
@@ -358,28 +389,60 @@ namespace IPNet {
 		}
 
 		TMap<FString, FString>& Headers = Mode == EMode::Request ? Request.Headers : Response.Headers;
+		TArray<FHttpHeaderField>& HeaderList = Mode == EMode::Request ? Request.HeaderList : Response.HeaderList;
 		for (int32 Index = 1; Index < Lines.Num(); ++Index) {
 			const FString& Line = Lines[Index];
 			if (Line.IsEmpty()) {
 				continue;
 			}
+			int32 Bad;
+			if (Line.FindChar(TEXT('\r'), Bad) || Line.FindChar(TEXT('\n'), Bad)) {
+				// A bare CR or LF inside the header block: parsers disagree on it (request smuggling).
+				return Fail(400, TEXT("bare CR or LF in header"));
+			}
+			if (Line[0] == TEXT(' ') || Line[0] == TEXT('\t')) {
+				return Fail(400, TEXT("obsolete line folding"));
+			}
 			int32 Colon;
 			if (!Line.FindChar(TEXT(':'), Colon) || Colon == 0) {
 				return Fail(400, TEXT("malformed header line"));
 			}
-			const FString Key = Line.Left(Colon).TrimStartAndEnd().ToLower();
+			const FString Name = Line.Left(Colon);
+			if (!IsTokenText(Name)) {
+				// Includes whitespace between the field name and the colon (RFC 9112 section 5.1).
+				return Fail(400, TEXT("invalid header name"));
+			}
+			const FString Key = Name.ToLower();
 			const FString Value = Line.Mid(Colon + 1).TrimStartAndEnd();
+			FHttpHeaderField& Entry = HeaderList.AddDefaulted_GetRef();
+			Entry.Name = Name;
+			Entry.Value = Value;
 			if (FString* Existing = Headers.Find(Key)) {
-				*Existing += TEXT(", ") + Value;
+				// Set-Cookie values may contain commas: never comma-join them.
+				*Existing += (Key == TEXT("set-cookie") ? TEXT("\n") : TEXT(", ")) + Value;
 			} else {
 				Headers.Add(Key, Value);
 			}
 		}
 
+		if (Mode == EMode::Request && Request.Version == TEXT("1.1") && !FindHeader(Headers, TEXT("host"))) {
+			return Fail(400, TEXT("missing Host header"));
+		}
+
 		// Body framing (RFC 9112 section 6).
 		const FString* TransferEncoding = FindHeader(Headers, TEXT("transfer-encoding"));
 		const FString* ContentLength = FindHeader(Headers, TEXT("content-length"));
-		const bool bChunked = TransferEncoding && HeaderHasToken(*TransferEncoding, TEXT("chunked"));
+		bool bChunked = false;
+		if (TransferEncoding) {
+			// chunked must be the final coding; anything else cannot be framed by length.
+			TArray<FString> Codings;
+			TransferEncoding->ParseIntoArray(Codings, TEXT(","), true);
+			const bool bLastChunked = Codings.Num() > 0 && Codings.Last().TrimStartAndEnd().Equals(TEXT("chunked"), ESearchCase::IgnoreCase);
+			bChunked = bLastChunked;
+			if (!bLastChunked && Mode == EMode::Request) {
+				return Fail(400, TEXT("Transfer-Encoding without final chunked"));
+			}
+		}
 
 		bool bNoBodyForThisMessage = bHeadersOnly;
 		if (Mode == EMode::Response) {
@@ -392,16 +455,22 @@ namespace IPNet {
 			FinishBody();
 			return EResult::Complete;
 		}
+		if (TransferEncoding && ContentLength && Mode == EMode::Request) {
+			// Ambiguous framing is a request smuggling vector.
+			return Fail(400, TEXT("both Transfer-Encoding and Content-Length present"));
+		}
 		if (bChunked) {
-			if (ContentLength) {
-				// Ambiguous framing is a request smuggling vector.
-				return Fail(400, TEXT("both Transfer-Encoding and Content-Length present"));
-			}
+			// Responses: Transfer-Encoding overrides Content-Length (RFC 9112 section 6.3).
 			Phase = EPhase::ChunkSize;
+			if (Mode == EMode::Request && OnRequestHeaders) {
+				OnRequestHeaders(Request);
+			}
 			return EResult::Complete;
 		}
-		if (TransferEncoding && Mode == EMode::Request) {
-			return Fail(501, TEXT("unsupported Transfer-Encoding"));
+		if (TransferEncoding) {
+			// Response with a coding we cannot frame: the body runs until the connection closes.
+			Phase = EPhase::UntilEof;
+			return EResult::Complete;
 		}
 		if (ContentLength) {
 			bool bDigitsOnly = !ContentLength->IsEmpty() && ContentLength->Len() <= 19;
@@ -419,6 +488,8 @@ namespace IPNet {
 			Phase = Length == 0 ? EPhase::Done : EPhase::FixedBody;
 			if (Phase == EPhase::Done) {
 				FinishBody();
+			} else if (Mode == EMode::Request && OnRequestHeaders) {
+				OnRequestHeaders(Request);
 			}
 			return EResult::Complete;
 		}
@@ -450,6 +521,14 @@ namespace IPNet {
 			}
 			Request.Method = StringToRequestMethod(Parts[0]);
 			FString Path = Parts[1];
+			// absolute-form ("GET http://host/path HTTP/1.1", used through proxies): keep only the path.
+			for (const TCHAR* Scheme : {TEXT("http://"), TEXT("https://")}) {
+				if (Path.StartsWith(Scheme, ESearchCase::IgnoreCase)) {
+					const int32 SlashAt = Path.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromStart, FCString::Strlen(Scheme));
+					Path = SlashAt == INDEX_NONE ? FString(TEXT("/")) : Path.Mid(SlashAt);
+					break;
+				}
+			}
 			FString Query;
 			if (Path.Split(TEXT("?"), &Path, &Query)) {
 				ParseQueryString(Query, Request.Params);

@@ -148,6 +148,26 @@ public:
 	/** HTTP route that never answers (the server must send 503 by itself). */
 	UFUNCTION() void OnHttpMute(const FHttpRequest& Request, UHttpRemote* Remote) { ++Messages; }
 
+	// ---- HTTP routing ----
+	UFUNCTION() void OnHttpUser(const FHttpRequest& Request, UHttpRemote* Remote) {
+		const FString* Id = Request.RouteParams.Find(TEXT("id"));
+		Remote->Headers.Body = FString::Printf(TEXT("user %s"), Id ? **Id : TEXT("?"));
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
+	UFUNCTION() void OnHttpFiles(const FHttpRequest& Request, UHttpRemote* Remote) {
+		const FString* Rest = Request.RouteParams.Find(TEXT("*"));
+		Remote->Headers.Body = Rest ? *Rest : FString(TEXT("?"));
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
+	UFUNCTION() void OnHttpCookies(const FHttpRequest& Request, UHttpRemote* Remote) {
+		for (const TCHAR* Cookie : {TEXT("a=1; Path=/"), TEXT("b=2, c; Path=/")}) {
+			FHttpHeaderField& Header = Remote->Headers.HeaderList.AddDefaulted_GetRef();
+			Header.Name = TEXT("Set-Cookie");
+			Header.Value = Cookie;
+		}
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
+
 	// ---- WebSocket ----
 	UFUNCTION() void OnWsConnected(const FHttpResponse& Handshake) { ++Connected; }
 	UFUNCTION() void OnWsUnexpected(const FHttpResponse& Handshake) { ++Errors; }

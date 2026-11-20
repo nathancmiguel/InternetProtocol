@@ -18,6 +18,8 @@ DECLARE_DYNAMIC_DELEGATE_TwoParams(FDelegateHttpClientResponse, const FErrorCode
 struct FIpHttpPendingRequest {
 	FHttpRequest Request;
 	FDelegateHttpClientResponse Callback;
+	/** Already resent once after a stale keep-alive connection closed. */
+	bool bRetried = false;
 };
 
 /** Game Thread state of an HTTP client. */
@@ -26,6 +28,8 @@ struct FIpHttpClientState {
 	std::shared_ptr<IPNet::FHttpParser> Parser;
 	TArray<FIpHttpPendingRequest> Queue;
 	bool bInFlight = false;
+	/** Responses already received on the current connection (> 0: the connection is a reused keep-alive). */
+	int32 ResponsesOnConnection = 0;
 	/** First error reported by the current connection, used to fail the in-flight request. */
 	FErrorCode ConnectionError;
 };

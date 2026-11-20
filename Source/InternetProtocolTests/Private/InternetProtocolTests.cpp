@@ -1083,4 +1083,157 @@ bool FIPErrorCategoryTest::RunTest(const FString& Parameters) {
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Phase 2: HTTP protocol correctness
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpMaliciousHeadersTest, "InternetProtocol.HTTP.MaliciousHeadersRejected", IPTests::Flags)
+bool FIPHttpMaliciousHeadersTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UHttpServer* Server = Make<UHttpServer>();
+	FDelegateHttpServerRequest Hello;
+	Hello.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpHello));
+	Server->All(TEXT("/"), Hello);
+	if (!TestTrue(TEXT("HTTP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	const TArray<FString> Cases = {
+		TEXT("GET / HTTP/1.1\r\nHost: x\r\nX-A: 1\nX-B: 2\r\n\r\n"),             // bare LF
+		TEXT("GET / HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n folded\r\n\r\n"),           // obs-fold
+		TEXT("GET / HTTP/1.1\r\nHost : x\r\n\r\n"),                               // space before colon
+		TEXT("GET / HTTP/1.1\r\nX-A: 1\r\n\r\n"),                                  // HTTP/1.1 without Host
+		TEXT("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"), // chunked not last
+	};
+	TArray<UIPTestListener*> Listeners;
+	TArray<UTCPClient*> Clients;
+	for (int32 Index = 0; Index < Cases.Num(); ++Index) {
+		UIPTestListener* L = Make<UIPTestListener>();
+		UTCPClient* Client = Make<UTCPClient>();
+		Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+		Client->OnMessage.AddDynamic(L, &UIPTestListener::OnBytes);
+		Client->OnClose.AddDynamic(L, &UIPTestListener::OnClose);
+		Client->Connect(ClientTo(Server->LocalEndpoint().Port));
+		Listeners.Add(L);
+		Clients.Add(Client);
+	}
+	WaitUntil(this, TEXT("all connected"), [Listeners]() {
+		for (UIPTestListener* L : Listeners) { if (L->Connected != 1) { return false; } }
+		return true;
+	});
+	Then([Clients, Cases]() {
+		for (int32 Index = 0; Index < Cases.Num(); ++Index) {
+			Clients[Index]->Write(Cases[Index], FDelegateTcpClientMessageSent());
+		}
+	});
+	WaitUntil(this, TEXT("every bad request answered and closed"), [Listeners]() {
+		for (UIPTestListener* L : Listeners) { if (L->Closed != 1) { return false; } }
+		return true;
+	});
+	Then([this, Listeners, Clients, Server, ServerL]() {
+		for (int32 Index = 0; Index < Listeners.Num(); ++Index) {
+			const FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(Listeners[Index]->Received.GetData()), Listeners[Index]->Received.Num());
+			TestTrue(*FString::Printf(TEXT("Case %d answered 400"), Index), FString(Text.Length(), Text.Get()).StartsWith(TEXT("HTTP/1.1 400")));
+			Release(Clients[Index]);
+			Release(Listeners[Index]);
+		}
+		TestEqual(TEXT("No handler ran"), ServerL->Messages, 0);
+		Server->Close();
+		Release(Server);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpRoutingTest, "InternetProtocol.HTTP.RouteParamsAnd405", IPTests::Flags)
+bool FIPHttpRoutingTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UHttpServer* Server = Make<UHttpServer>();
+	UHttpClient* Client = Make<UHttpClient>();
+	FDelegateHttpServerRequest User, Files, Cookies;
+	User.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpUser));
+	Files.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpFiles));
+	Cookies.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpCookies));
+	Server->Get(TEXT("/users/:id"), User);
+	Server->Get(TEXT("/files/*"), Files);
+	Server->Get(TEXT("/cookies"), Cookies);
+	if (!TestTrue(TEXT("HTTP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	Client->SetHost(ClientTo(Server->LocalEndpoint().Port));
+	FDelegateHttpClientResponse OnResponse;
+	OnResponse.BindUFunction(L, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpResponse));
+	auto Request = [](ERequestMethod Method, const TCHAR* Path) {
+		FHttpRequest R;
+		R.Method = Method;
+		R.Path = Path;
+		return R;
+	};
+	Client->Request(Request(ERequestMethod::GET, TEXT("/users/42")), OnResponse);        // 0
+	Client->Request(Request(ERequestMethod::GET, TEXT("/files/a/b/c.txt")), OnResponse); // 1
+	Client->Request(Request(ERequestMethod::POST, TEXT("/users/42")), OnResponse);       // 2: 405
+	Client->Request(Request(ERequestMethod::HEAD, TEXT("/users/7")), OnResponse);        // 3: HEAD -> GET
+	Client->Request(Request(ERequestMethod::GET, TEXT("/Users/42")), OnResponse);        // 4: case-sensitive -> 404
+	Client->Request(Request(ERequestMethod::GET, TEXT("/cookies")), OnResponse);         // 5: two Set-Cookie
+	WaitUntil(this, TEXT("6 responses"), [L]() { return L->Responses.Num() == 6; });
+	Then([this, L, ServerL, Server, Client]() {
+		TestEqual(TEXT(":id parameter"), L->Responses[0].Body, FString(TEXT("user 42")));
+		TestEqual(TEXT("* parameter"), L->Responses[1].Body, FString(TEXT("a/b/c.txt")));
+		TestEqual(TEXT("POST on a GET route: 405"), L->Responses[2].Status_Code, 405);
+		const FString* Allow = L->Responses[2].Headers.Find(TEXT("allow"));
+		TestTrue(TEXT("Allow lists GET and HEAD"), Allow && Allow->Contains(TEXT("GET")) && Allow->Contains(TEXT("HEAD")));
+		TestEqual(TEXT("HEAD served by the GET route"), L->Responses[3].Status_Code, 200);
+		TestTrue(TEXT("HEAD has no body"), L->Responses[3].Body.IsEmpty());
+		TestEqual(TEXT("Routes are case-sensitive"), L->Responses[4].Status_Code, 404);
+		int32 CookieCount = 0;
+		for (const FHttpHeaderField& Header : L->Responses[5].HeaderList) {
+			CookieCount += Header.Name.Equals(TEXT("Set-Cookie"), ESearchCase::IgnoreCase) ? 1 : 0;
+		}
+		TestEqual(TEXT("Two separate Set-Cookie headers"), CookieCount, 2);
+		Client->Close();
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpExpectContinueTest, "InternetProtocol.HTTP.ExpectContinue", IPTests::Flags)
+bool FIPHttpExpectContinueTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UHttpServer* Server = Make<UHttpServer>();
+	FDelegateHttpServerRequest Echo;
+	Echo.BindUFunction(ServerL, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpEcho));
+	Server->Post(TEXT("/echo"), Echo);
+	if (!TestTrue(TEXT("HTTP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	UIPTestListener* L = Make<UIPTestListener>();
+	UTCPClient* Raw = Make<UTCPClient>();
+	Raw->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Raw->OnMessage.AddDynamic(L, &UIPTestListener::OnBytes);
+	Raw->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("connected"), [L]() { return L->Connected == 1; });
+	Then([Raw]() {
+		Raw->Write(TEXT("POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"), FDelegateTcpClientMessageSent());
+	});
+	auto Text = [](UIPTestListener* Listener) {
+		const FUTF8ToTCHAR Decoded(reinterpret_cast<const ANSICHAR*>(Listener->Received.GetData()), Listener->Received.Num());
+		return FString(Decoded.Length(), Decoded.Get());
+	};
+	WaitUntil(this, TEXT("100 Continue before the body"), [L, Text]() { return Text(L).StartsWith(TEXT("HTTP/1.1 100 Continue")); });
+	Then([Raw]() { Raw->Write(TEXT("hello"), FDelegateTcpClientMessageSent()); });
+	WaitUntil(this, TEXT("final response"), [L, Text]() { return Text(L).Contains(TEXT("201")) && Text(L).EndsWith(TEXT("hello")); });
+	Then([this, L, ServerL, Server, Raw]() {
+		Raw->Close();
+		Server->Close();
+		Release(Raw);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

@@ -45,6 +45,14 @@ public:
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
 	float ResponseTimeoutSeconds = 30.0f;
 
+	/** Largest request line + headers accepted (431 above). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
+	int32 MaxHeaderBytes = 64 * 1024;
+
+	/** Largest request body accepted (413 above). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
+	int64 MaxBodyBytes = 64 * 1024 * 1024;
+
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
 	bool IsOpen();
 
@@ -100,14 +108,14 @@ private:
 	UPROPERTY(Transient)
 	TSet<UHttpRemote*> ClientSet;
 
-	TMap<FString, FDelegateHttpServerRequest> all_cb;
-	TMap<FString, FDelegateHttpServerRequest> get_cb;
-	TMap<FString, FDelegateHttpServerRequest> post_cb;
-	TMap<FString, FDelegateHttpServerRequest> put_cb;
-	TMap<FString, FDelegateHttpServerRequest> del_cb;
-	TMap<FString, FDelegateHttpServerRequest> head_cb;
-	TMap<FString, FDelegateHttpServerRequest> options_cb;
-	TMap<FString, FDelegateHttpServerRequest> patch_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> all_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> get_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> post_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> put_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> del_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> head_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> options_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequest>> patch_cb;
 
 	void RemoveClient(UHttpRemote* Remote) { ClientSet.Remove(Remote); }
 	void Route(UHttpRemote* Remote, const FHttpRequest& Request);
@@ -142,6 +150,14 @@ public:
 	/** A request whose handler has not called Write after this many seconds is answered with 503. 0 = never. */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
 	float ResponseTimeoutSeconds = 30.0f;
+
+	/** Largest request line + headers accepted (431 above). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
+	int32 MaxHeaderBytes = 64 * 1024;
+
+	/** Largest request body accepted (413 above). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
+	int64 MaxBodyBytes = 64 * 1024 * 1024;
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
 	bool IsOpen();
@@ -199,14 +215,14 @@ private:
 	TSet<UHttpRemoteSsl*> ClientSet;
 	std::shared_ptr<const IPNet::FTlsConfig> Tls;
 
-	TMap<FString, FDelegateHttpServerRequestSsl> all_cb;
-	TMap<FString, FDelegateHttpServerRequestSsl> get_cb;
-	TMap<FString, FDelegateHttpServerRequestSsl> post_cb;
-	TMap<FString, FDelegateHttpServerRequestSsl> put_cb;
-	TMap<FString, FDelegateHttpServerRequestSsl> del_cb;
-	TMap<FString, FDelegateHttpServerRequestSsl> head_cb;
-	TMap<FString, FDelegateHttpServerRequestSsl> options_cb;
-	TMap<FString, FDelegateHttpServerRequestSsl> patch_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> all_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> get_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> post_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> put_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> del_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> head_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> options_cb;
+	TArray<TPair<FString, FDelegateHttpServerRequestSsl>> patch_cb;
 
 	void RemoveClient(UHttpRemoteSsl* Remote) { ClientSet.Remove(Remote); }
 	void Route(UHttpRemoteSsl* Remote, const FHttpRequest& Request);

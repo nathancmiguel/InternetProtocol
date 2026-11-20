@@ -153,6 +153,18 @@ enum class ERequestMethod : uint8 {
 	PUT = 7
 };
 
+/** One header line. Repeated headers (Set-Cookie...) keep one entry each, in order. */
+USTRUCT(BlueprintType, Category="IP|STRUCT|Common")
+struct FHttpHeaderField {
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Header")
+	FString Name;
+
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Header")
+	FString Value;
+};
+
 USTRUCT(BlueprintType, Category="IP|STRUCT|Common")
 struct FHttpRequest {
 	GENERATED_BODY()
@@ -171,6 +183,17 @@ struct FHttpRequest {
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|Request")
 	TMap<FString, FString> Headers;
+
+	/**
+	 * Every header in order, one entry per line (received), or extra headers to send that may repeat.
+	 * Headers keeps one value per name (repeated values joined with ", "; Set-Cookie with a new line).
+	 */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Request")
+	TArray<FHttpHeaderField> HeaderList;
+
+	/** Server: values of the route parameters (":id" / "*") of the matched route. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Request")
+	TMap<FString, FString> RouteParams;
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|Request")
 	FString Body;
@@ -191,6 +214,10 @@ struct FHttpResponse {
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|Response")
 	TMap<FString, FString> Headers;
+
+	/** See FHttpRequest::HeaderList (e.g. several Set-Cookie). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Response")
+	TArray<FHttpHeaderField> HeaderList;
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|Response")
 	FString Body;

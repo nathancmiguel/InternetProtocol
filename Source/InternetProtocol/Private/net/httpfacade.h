@@ -23,8 +23,19 @@ namespace IPNet {
 
 	class FHttpServerSession : public std::enable_shared_from_this<FHttpServerSession> {
 	public:
-		explicit FHttpServerSession(std::function<void(FHttpRequest&&)> InOnRequest)
-			: Parser(FHttpParser::EMode::Request), OnRequest(MoveTemp(InOnRequest)) {}
+		explicit FHttpServerSession(std::function<void(FHttpRequest&&)> InOnRequest, const FHttpLimits& Limits = FHttpLimits())
+			: Parser(FHttpParser::EMode::Request, Limits), OnRequest(MoveTemp(InOnRequest)) {
+			// "Expect: 100-continue": the client waits for this before sending the body (RFC 9110 10.1.1).
+			Parser.OnRequestHeaders = [this](const FHttpRequest& Request) {
+				const FString* Expect = FindHeader(Request.Headers, TEXT("expect"));
+				if (Expect && Expect->Equals(TEXT("100-continue"), ESearchCase::IgnoreCase) && Request.Version == TEXT("1.1")) {
+					if (std::shared_ptr<FTransport> Strong = Transport.lock()) {
+						static const char Continue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+						Strong->Send(FBytes(Continue, Continue + sizeof(Continue) - 1));
+					}
+				}
+			};
+		}
 
 		std::weak_ptr<FTransport> Transport;
 
@@ -204,6 +215,8 @@ namespace IPNet {
 				});
 			};
 			Events.OnClosed = [Weak, Id, Parser, Tls, bTls]() {
+				// Nothing of a response arrived: the server closed an idle keep-alive connection under us.
+				const bool bNothingReceived = !Parser->HasPartialMessage();
 				// A response delimited by the end of the connection is complete now.
 				if (Parser->OnEof() == FHttpParser::EResult::Complete) {
 					FHttpResponse Response = MoveTemp(Parser->Response);
@@ -211,8 +224,8 @@ namespace IPNet {
 						OnResponse(Owner, Id, Response, Tls, bTls);
 					});
 				}
-				RunOnGameThread(Weak, [Id, Tls, bTls](T* Owner) {
-					OnConnectionClosed(Owner, Id, Tls, bTls);
+				RunOnGameThread(Weak, [Id, Tls, bTls, bNothingReceived](T* Owner) {
+					OnConnectionClosed(Owner, Id, Tls, bTls, bNothingReceived);
 				});
 			};
 
@@ -226,6 +239,7 @@ namespace IPNet {
 			}
 			FFacadeAccess::BeginSession(S.Net, Transport, Id);
 			S.Parser = Parser;
+			S.ResponsesOnConnection = 0;
 			S.ConnectionError = FErrorCode();
 			Transport->Connect(ToStd(Self->bind_options.Address), ToStd(Self->bind_options.Port), Self->bind_options.Protocol);
 		}
@@ -239,6 +253,7 @@ namespace IPNet {
 			const FDelegateHttpClientResponse Callback = S.Queue[0].Callback;
 			S.Queue.RemoveAt(0);
 			S.bInFlight = false;
+			++S.ResponsesOnConnection;
 
 			const FString* Connection = FindHeader(Response.Headers, TEXT("connection"));
 			const bool bKeepAlive = Response.Version == TEXT("1.0")
@@ -253,8 +268,13 @@ namespace IPNet {
 			Pump(Self, Tls, bTls);
 		}
 
+		static bool IsIdempotent(ERequestMethod Method) {
+			return Method == ERequestMethod::GET || Method == ERequestMethod::HEAD || Method == ERequestMethod::OPTIONS ||
+			       Method == ERequestMethod::PUT || Method == ERequestMethod::DEL;
+		}
+
 		template <typename T>
-		static void OnConnectionClosed(T* Self, uint64 Id, const std::shared_ptr<const FTlsConfig>& Tls, bool bTls) {
+		static void OnConnectionClosed(T* Self, uint64 Id, const std::shared_ptr<const FTlsConfig>& Tls, bool bTls, bool bNothingReceived = false) {
 			FIpHttpClientState& S = Self->State;
 			if (S.Net.SessionId != Id) {
 				return;
@@ -268,7 +288,15 @@ namespace IPNet {
 				return;
 			}
 			if (S.bInFlight) {
-				FailFront(Self, Error);
+				const bool bReused = S.ResponsesOnConnection > 0;
+				if (bReused && bNothingReceived && S.Queue.Num() > 0 && !S.Queue[0].bRetried && IsIdempotent(S.Queue[0].Request.Method)) {
+					// Stale keep-alive connection (closed by the server while idle): send it again once on a new
+					// connection. Only idempotent methods: a POST might have been processed already.
+					S.Queue[0].bRetried = true;
+					S.bInFlight = false;
+				} else {
+					FailFront(Self, Error);
+				}
 			}
 			Pump(Self, Tls, bTls);
 		}
@@ -342,6 +370,9 @@ namespace IPNet {
 			const uint64 Id = NextSessionId();
 			TWeakObjectPtr<TRemote> Weak(Remote);
 
+			FHttpLimits Limits;
+			Limits.MaxHeaderBytes = static_cast<size_t>(FMath::Max(Server->MaxHeaderBytes, 1024));
+			Limits.MaxBodyBytes = static_cast<size_t>(FMath::Max<int64>(Server->MaxBodyBytes, 0));
 			std::shared_ptr<FHttpServerSession> Session = std::make_shared<FHttpServerSession>(
 				[Weak, Id](FHttpRequest&& Request) {
 					RunOnGameThread(Weak, [Id, Request = MoveTemp(Request)](TRemote* Owner) {
@@ -349,7 +380,7 @@ namespace IPNet {
 							Owner->OnRequestNative(Request);
 						}
 					});
-				});
+				}, Limits);
 
 			FTransportEvents Events;
 			Events.OnConnected = [Weak, Id](const asio::ip::tcp::endpoint& Local, const asio::ip::tcp::endpoint& RemoteEp) {
@@ -389,6 +420,158 @@ namespace IPNet {
 			Remote->Session = Session;
 			FFacadeAccess::BindRemoteToServer(Server, Clients, Remote);
 			return Remote;
+		}
+
+		// ---- routing ----
+
+		template <typename TDelegate>
+		static void AddRoute(TArray<TPair<FString, TDelegate>>& Routes, const FString& Path, const TDelegate& Callback) {
+			for (TPair<FString, TDelegate>& Route : Routes) {
+				if (Route.Key.Equals(Path, ESearchCase::CaseSensitive)) {
+					Route.Value = Callback;
+					return;
+				}
+			}
+			Routes.Emplace(Path, Callback);
+		}
+
+		/**
+		 * Case-sensitive match of a route pattern against a path. Pattern segments: literal, ":name"
+		 * (one segment) or a final "*" (the rest of the path, stored as "*").
+		 */
+		static bool MatchRoute(const FString& Pattern, const FString& Path, TMap<FString, FString>& OutParams) {
+			if (Pattern.Equals(Path, ESearchCase::CaseSensitive)) {
+				return true;
+			}
+			TArray<FString> P, S;
+			Pattern.ParseIntoArray(P, TEXT("/"), true);
+			Path.ParseIntoArray(S, TEXT("/"), true);
+			TMap<FString, FString> Params;
+			for (int32 Index = 0; Index < P.Num(); ++Index) {
+				if (P[Index] == TEXT("*") && Index == P.Num() - 1) {
+					TArray<FString> Rest(S.GetData() + FMath::Min(Index, S.Num()), FMath::Max(S.Num() - Index, 0));
+					Params.Add(TEXT("*"), FString::Join(Rest, TEXT("/")));
+					OutParams = MoveTemp(Params);
+					return true;
+				}
+				if (Index >= S.Num()) {
+					return false;
+				}
+				if (P[Index].StartsWith(TEXT(":")) && P[Index].Len() > 1) {
+					Params.Add(P[Index].Mid(1), S[Index]);
+				} else if (!P[Index].Equals(S[Index], ESearchCase::CaseSensitive)) {
+					return false;
+				}
+			}
+			if (P.Num() != S.Num()) {
+				return false;
+			}
+			OutParams = MoveTemp(Params);
+			return true;
+		}
+
+		/** Exact routes win over patterns; among patterns, the first registered wins. */
+		template <typename TDelegate>
+		static const TDelegate* FindRoute(const TArray<TPair<FString, TDelegate>>& Routes, const FString& Path, TMap<FString, FString>& OutParams) {
+			for (const TPair<FString, TDelegate>& Route : Routes) {
+				if (Route.Key.Equals(Path, ESearchCase::CaseSensitive)) {
+					OutParams.Reset();
+					return &Route.Value;
+				}
+			}
+			for (const TPair<FString, TDelegate>& Route : Routes) {
+				if (MatchRoute(Route.Key, Path, OutParams)) {
+					return &Route.Value;
+				}
+			}
+			return nullptr;
+		}
+
+		template <typename TDelegate, typename TRemote>
+		static void RouteRequest(TRemote* Remote, const FHttpRequest& Request, float ResponseTimeoutSeconds,
+		                         const TArray<TPair<FString, TDelegate>>& All, const TArray<TPair<FString, TDelegate>>& Get,
+		                         const TArray<TPair<FString, TDelegate>>& Post, const TArray<TPair<FString, TDelegate>>& Put,
+		                         const TArray<TPair<FString, TDelegate>>& Del, const TArray<TPair<FString, TDelegate>>& Head,
+		                         const TArray<TPair<FString, TDelegate>>& Options, const TArray<TPair<FString, TDelegate>>& Patch) {
+			struct FMethodRoutes {
+				ERequestMethod Method;
+				const TCHAR* Name;
+				const TArray<TPair<FString, TDelegate>>* Routes;
+			};
+			const FMethodRoutes Table[] = {
+				{ERequestMethod::DEL, TEXT("DELETE"), &Del}, {ERequestMethod::GET, TEXT("GET"), &Get},
+				{ERequestMethod::HEAD, TEXT("HEAD"), &Head}, {ERequestMethod::OPTIONS, TEXT("OPTIONS"), &Options},
+				{ERequestMethod::PATCH, TEXT("PATCH"), &Patch}, {ERequestMethod::POST, TEXT("POST"), &Post},
+				{ERequestMethod::PUT, TEXT("PUT"), &Put},
+			};
+			auto Answer = [Remote](int32 Status, const TCHAR* Message, const FString& Body) {
+				Remote->Headers.Status_Code = Status;
+				Remote->Headers.Status_Message = Message;
+				Remote->Headers.Body = Body;
+				Remote->Write(FDelegateHttpRemoteMessageSent());
+			};
+			if (Request.Method == ERequestMethod::UNKNOWN) {
+				Remote->Headers.Headers.Add(TEXT("Allow"), TEXT("DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"));
+				Answer(405, TEXT("Method Not Allowed"), TEXT("Method not supported."));
+				return;
+			}
+
+			// Copy the delegates: a handler may register routes or close the server while we iterate.
+			TArray<TPair<TDelegate, TMap<FString, FString>>> Handlers;
+			TMap<FString, FString> Params;
+			if (const TDelegate* Any = FindRoute(All, Request.Path, Params)) {
+				Handlers.Emplace(*Any, Params);
+			}
+			const TArray<TPair<FString, TDelegate>>* MethodRoutes = nullptr;
+			for (const FMethodRoutes& Entry : Table) {
+				if (Entry.Method == Request.Method) {
+					MethodRoutes = Entry.Routes;
+				}
+			}
+			const TDelegate* Specific = MethodRoutes ? FindRoute(*MethodRoutes, Request.Path, Params) : nullptr;
+			if (!Specific && Request.Method == ERequestMethod::HEAD) {
+				// HEAD is GET without the body (the body is dropped when the response is written).
+				Specific = FindRoute(Get, Request.Path, Params);
+			}
+			if (Specific) {
+				Handlers.Emplace(*Specific, Params);
+			}
+
+			bool bHandled = false;
+			for (const TPair<TDelegate, TMap<FString, FString>>& Handler : Handlers) {
+				if (Handler.Key.IsBound()) {
+					bHandled = true;
+					FHttpRequest Routed = Request;
+					Routed.RouteParams = Handler.Value;
+					Handler.Key.ExecuteIfBound(Routed, Remote);
+				}
+			}
+			if (!IsValid(Remote)) {
+				return;
+			}
+			if (bHandled) {
+				ArmResponseTimeout(Remote, ResponseTimeoutSeconds);
+				return;
+			}
+
+			// The path exists for other methods: 405 with the allowed ones, otherwise 404.
+			TArray<FString> Allowed;
+			for (const FMethodRoutes& Entry : Table) {
+				TMap<FString, FString> Ignored;
+				if (FindRoute(*Entry.Routes, Request.Path, Ignored)) {
+					Allowed.AddUnique(Entry.Name);
+					if (Entry.Method == ERequestMethod::GET) {
+						Allowed.AddUnique(TEXT("HEAD"));
+					}
+				}
+			}
+			if (Allowed.Num() > 0) {
+				Allowed.Sort();
+				Remote->Headers.Headers.Add(TEXT("Allow"), FString::Join(Allowed, TEXT(", ")));
+				Answer(405, TEXT("Method Not Allowed"), TEXT("Method Not Allowed"));
+				return;
+			}
+			Answer(404, TEXT("Not Found"), TEXT("Not Found"));
 		}
 
 		template <typename TRemote>
@@ -448,7 +631,9 @@ namespace IPNet {
 				return false;
 			}
 			Remote->bResponsePending = false;
-			const bool bClose = Remote->bWillClose;
+			// The handler may ask to close the connection with "Connection: close".
+			const FString* HandlerConnection = FindHeader(Remote->Headers.Headers, TEXT("Connection"));
+			const bool bClose = Remote->bWillClose || (HandlerConnection && HeaderHasToken(*HandlerConnection, TEXT("close")));
 			FBytes Bytes = SerializeResponse(Remote->Headers, Remote->bHeadRequest, bClose);
 
 			FSendCallback UserCallback = MakeSendCallback(Remote, Callback);

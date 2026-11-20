@@ -60,6 +60,9 @@ namespace IPNet {
 
 		/** Response mode: the request was HEAD, so the response has no body whatever its headers say. */
 		void SetNoBody(bool bValue) { bNoBody = bValue; }
+		/** Request mode: called when the headers of a request with a body are parsed (before the body). */
+		std::function<void(const FHttpRequest&)> OnRequestHeaders;
+
 		/** Complete right after the headers (WebSocket upgrade). Remaining bytes are available with TakeRemaining(). */
 		void SetHeadersOnly(bool bValue) { bHeadersOnly = bValue; }
 		FBytes TakeRemaining();
