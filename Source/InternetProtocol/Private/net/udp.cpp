@@ -24,6 +24,47 @@ namespace IPNet {
 		DWORD Returned = 0;
 		::WSAIoctl(Socket.native_handle(), SIO_UDP_CONNRESET, &bReport, sizeof(bReport), nullptr, 0, &Returned, nullptr, nullptr);
 #endif
+		asio::error_code Ignored;
+		if (SockReceive > 0) {
+			Socket.set_option(asio::socket_base::receive_buffer_size(SockReceive), Ignored);
+		}
+		if (SockSend > 0) {
+			Socket.set_option(asio::socket_base::send_buffer_size(SockSend), Ignored);
+		}
+	}
+
+	template <typename TOption>
+	void FUdpSocket::PostOption(TOption Option) {
+		asio::post(Executor, [Self = shared_from_this(), Option]() {
+			if (!Self->Socket.is_open()) {
+				return;
+			}
+			asio::error_code Ec;
+			Self->Socket.set_option(Option, Ec);
+			if (Ec && Self->Events.OnError) {
+				Self->Events.OnError(Ec);
+			}
+		});
+	}
+
+	void FUdpSocket::SetBroadcast(bool bEnable) {
+		PostOption(asio::socket_base::broadcast(bEnable));
+	}
+
+	void FUdpSocket::JoinGroup(const asio::ip::address& Group) {
+		PostOption(asio::ip::multicast::join_group(Group));
+	}
+
+	void FUdpSocket::LeaveGroup(const asio::ip::address& Group) {
+		PostOption(asio::ip::multicast::leave_group(Group));
+	}
+
+	void FUdpSocket::SetMulticastTtl(int32 Hops) {
+		PostOption(asio::ip::multicast::hops(FMath::Clamp(Hops, 0, 255)));
+	}
+
+	void FUdpSocket::SetMulticastLoopback(bool bEnable) {
+		PostOption(asio::ip::multicast::enable_loopback(bEnable));
 	}
 
 	void FUdpSocket::CountDrop(const TCHAR* Why) {
@@ -96,6 +137,11 @@ namespace IPNet {
 		Socket.open(Remote.protocol(), OpenEc);
 		if (!OpenEc) {
 			ConfigureSocket();
+			if (bLocalRequested) {
+				Socket.bind(LocalRequested, OpenEc);
+			}
+		}
+		if (!OpenEc) {
 			// UDP "connect" only sets the default peer and filters incoming datagrams; it does not block.
 			Socket.connect(Remote, OpenEc);
 		}

@@ -80,3 +80,11 @@ bool UTCPRemoteSsl::WriteBuffer(const TArray<uint8>& Buffer, const FDelegateTcpR
 void UTCPRemoteSsl::Close() {
 	FFacadeAccess::CloseStream(Net);
 }
+
+FConnectionStats UTCPRemote::GetStats() {
+	return FFacadeAccess::StreamStats(Net);
+}
+
+FConnectionStats UTCPRemoteSsl::GetStats() {
+	return FFacadeAccess::StreamStats(Net);
+}

@@ -71,6 +71,14 @@ public:
 	/** Subprotocols supported, in order of preference; the first one the client offers is selected. */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
 	TArray<FString> SubProtocols;
+	/** Remotes send a Ping after this much silence (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float PingIntervalSeconds = 20.0f;
+
+	/** Remotes are closed (TimedOut) after this much time without any frame from the client (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float IdleTimeoutSeconds = 60.0f;
+
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
 	FDelegateWsServer OnClose;
@@ -144,6 +152,14 @@ public:
 	/** Subprotocols supported, in order of preference; the first one the client offers is selected. */
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
 	TArray<FString> SubProtocols;
+	/** Remotes send a Ping after this much silence (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float PingIntervalSeconds = 20.0f;
+
+	/** Remotes are closed (TimedOut) after this much time without any frame from the client (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float IdleTimeoutSeconds = 60.0f;
+
 
 	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|Websocket|Events")
 	FDelegateWsServer OnClose;

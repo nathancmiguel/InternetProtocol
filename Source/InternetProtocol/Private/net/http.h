@@ -33,6 +33,10 @@ namespace IPNet {
 	FBytes SerializeRequest(const FHttpRequest& Request, const FString& Host);
 	/** Status line + headers (+ Content-Length, Connection: close) + body unless bOmitBody (HEAD). */
 	FBytes SerializeResponse(const FHttpResponse& Response, bool bOmitBody, bool bClose);
+	/** Status line + headers only, for a streamed response (chunked, or until the connection closes). */
+	FBytes SerializeResponseHead(const FHttpResponse& Response, bool bChunked, bool bClose);
+	/** One chunk of a chunked body; an empty chunk ends the body. */
+	FBytes EncodeChunk(const uint8* Data, size_t Size);
 
 	struct FHttpLimits {
 		size_t MaxHeaderBytes = 64 * 1024;
@@ -68,6 +72,9 @@ namespace IPNet {
 		FBytes TakeRemaining();
 
 		bool HasPartialMessage() const { return Phase != EPhase::Headers || Pos < Buffer.size(); }
+		/** Download progress of the current message: body bytes so far and Content-Length (-1 unknown). */
+		size_t BodyBytesSoFar() const { return Body.size(); }
+		int64 ExpectedBodyBytes() const { return ExpectedLength; }
 		/** Bytes received and not parsed yet (pipelined requests waiting for the current response). */
 		size_t BufferedBytes() const { return Buffer.size() - Pos; }
 
@@ -101,7 +108,19 @@ namespace IPNet {
 		std::vector<uint8> Body;
 		bool bNoBody = false;
 		bool bHeadersOnly = false;
+		int64 ExpectedLength = -1;
 	};
+
+	struct FParsedHttpUrl {
+		FString Scheme;
+		FString Host;
+		int32 Port = 0;
+		/** Path and query, at least "/". */
+		FString Target = TEXT("/");
+	};
+
+	/** "scheme://host[:port][/path][?query]" (IPv6 hosts in brackets). Default ports: 80 / 443 (ws: 80, wss: 443). */
+	bool ParseHttpUrl(const FString& Url, FParsedHttpUrl& Out);
 
 	/** Parses "a=1&b=2" into Params (URL-decoded). */
 	void ParseQueryString(const FString& Query, TMap<FString, FString>& OutParams);

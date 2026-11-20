@@ -144,6 +144,9 @@ namespace IPNet {
 	inline FTransportOptions ClientTransportOptions(const FClientBindOptions& Bind, bool bFlow) {
 		FTransportOptions Options;
 		Options.ConnectTimeout = ToMs(Bind.ConnectTimeoutSeconds);
+		Options.bNoDelay = Bind.bNoDelay;
+		Options.bKeepAlive = Bind.bKeepAlive;
+		Options.MaxQueuedBytes = static_cast<size_t>(FMath::Max(Bind.MaxQueuedMB, 1)) * 1024 * 1024;
 		if (bFlow) {
 			Options.Flow = MakeFlow(Bind.MaxPendingReceiveMB);
 		}
@@ -154,6 +157,9 @@ namespace IPNet {
 	inline FTransportOptions AcceptedTransportOptions(const FServerBindOptions& Bind, bool bFlow, bool bEstablishOnOpen) {
 		FTransportOptions Options;
 		Options.HandshakeTimeout = ToMs(Bind.HandshakeTimeoutSeconds);
+		Options.bNoDelay = Bind.bNoDelay;
+		Options.bKeepAlive = Bind.bKeepAlive;
+		Options.MaxQueuedBytes = static_cast<size_t>(FMath::Max(Bind.MaxQueuedMB, 1)) * 1024 * 1024;
 		Options.bEstablishOnOpen = bEstablishOnOpen;
 		if (bFlow) {
 			Options.Flow = MakeFlow(Bind.MaxPendingReceiveMB);
@@ -208,6 +214,7 @@ namespace IPNet {
 						}
 						RunOnGameThread(Weak, [Id, Guard = FFlowGuard(Flow, Length), Buffer = MoveTemp(Buffer)](T* Self) {
 							if (Self->Net.SessionId == Id) {
+								++Self->Net.MessagesReceived;
 								Self->OnMessage.Broadcast(Buffer, Buffer.Num());
 							}
 						});
@@ -229,6 +236,7 @@ namespace IPNet {
 				// The Consume runs even when the object is gone (FFlowGuard), so reading can never stay paused.
 				RunOnGameThread(Weak, [Id, Guard = FFlowGuard(Flow, Size), Buffer = MoveTemp(Buffer)](T* Self) {
 					if (Self->Net.SessionId == Id) {
+						++Self->Net.MessagesReceived;
 						Self->OnMessage.Broadcast(Buffer, Buffer.Num());
 					}
 				});
@@ -339,6 +347,8 @@ namespace IPNet {
 
 		static void BeginSession(FIpStreamState& State, const std::shared_ptr<FTransport>& Transport, uint64 Id) {
 			State.Transport = Transport;
+			State.MessagesSent = 0;
+			State.MessagesReceived = 0;
 			State.SessionId = Id;
 			State.bOpen = false;
 			State.Local = FTcpEndpoint();
@@ -382,7 +392,22 @@ namespace IPNet {
 				FailImmediately(Self, EError::QueueFull);
 				return false;
 			}
+			++Self->Net.MessagesSent;
 			return true;
+		}
+
+		/** Counters of the current connection (bytes from the transport, messages from the facade). */
+		static FConnectionStats StreamStats(const FIpStreamState& State) {
+			FConnectionStats Stats;
+			if (State.Transport) {
+				const FTransportStats Native = State.Transport->GetStats();
+				Stats.BytesSent = static_cast<int64>(Native.BytesSent);
+				Stats.BytesReceived = static_cast<int64>(Native.BytesReceived);
+				Stats.QueuedBytes = static_cast<int64>(Native.QueuedBytes);
+			}
+			Stats.MessagesSent = State.MessagesSent;
+			Stats.MessagesReceived = State.MessagesReceived;
+			return Stats;
 		}
 
 		// ------------------------------------------------------------------------------------------------

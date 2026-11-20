@@ -82,6 +82,17 @@ bool UUDPClient::Connect(const FClientBindOptions& BindOpts) {
 		return false;
 	}
 	Socket->SetFlowControl(Flow);
+	Socket->SetSocketBuffers(BindOpts.SocketReceiveBufferBytes, BindOpts.SocketSendBufferBytes);
+	if (!BindOpts.LocalAddress.IsEmpty() || BindOpts.LocalPort != 0) {
+		asio::ip::address Local;
+		if (!IPNet::MakeListenAddress(BindOpts.LocalAddress, BindOpts.Protocol == EProtocolType::V6 ? EProtocolType::V6 : EProtocolType::V4, Local) ||
+		    BindOpts.LocalPort < 0 || BindOpts.LocalPort > 65535) {
+			Socket->Close();
+			FFacadeAccess::FailImmediately(this, IPNet::EError::InvalidArgument);
+			return false;
+		}
+		Socket->SetLocalEndpoint(asio::ip::udp::endpoint(Local, static_cast<uint16>(BindOpts.LocalPort)));
+	}
 	Net.Socket = Socket;
 	Net.SessionId = Id;
 	Net.bOpen = false;
@@ -94,4 +105,48 @@ bool UUDPClient::Connect(const FClientBindOptions& BindOpts) {
 
 void UUDPClient::Close() {
 	FFacadeAccess::CloseUdp(Net);
+}
+
+namespace {
+	bool ParseGroup(const FString& Text, asio::ip::address& Out) {
+		asio::error_code Ec;
+		Out = asio::ip::make_address(TCHAR_TO_UTF8(*Text), Ec);
+		return !Ec && Out.is_multicast();
+	}
+}
+
+void UUDPClient::SetBroadcast(bool bEnable) {
+	if (Net.Socket) {
+		Net.Socket->SetBroadcast(bEnable);
+	}
+}
+
+bool UUDPClient::JoinMulticastGroup(const FString& GroupAddress) {
+	asio::ip::address Group;
+	if (!Net.Socket || !ParseGroup(GroupAddress, Group)) {
+		return false;
+	}
+	Net.Socket->JoinGroup(Group);
+	return true;
+}
+
+bool UUDPClient::LeaveMulticastGroup(const FString& GroupAddress) {
+	asio::ip::address Group;
+	if (!Net.Socket || !ParseGroup(GroupAddress, Group)) {
+		return false;
+	}
+	Net.Socket->LeaveGroup(Group);
+	return true;
+}
+
+void UUDPClient::SetMulticastTTL(int32 Hops) {
+	if (Net.Socket) {
+		Net.Socket->SetMulticastTtl(Hops);
+	}
+}
+
+void UUDPClient::SetMulticastLoopback(bool bEnable) {
+	if (Net.Socket) {
+		Net.Socket->SetMulticastLoopback(bEnable);
+	}
 }

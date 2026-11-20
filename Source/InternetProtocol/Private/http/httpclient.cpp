@@ -39,8 +39,8 @@ void UHttpClient::SetHost(const FClientBindOptions& BindOpts) {
 	bind_options = BindOpts;
 }
 
-void UHttpClient::Request(const FHttpRequest& Req, const FDelegateHttpClientResponse& Callback) {
-	FHttpAccess::Request(this, Req, Callback, nullptr, false);
+int32 UHttpClient::Request(const FHttpRequest& Req, const FDelegateHttpClientResponse& Callback) {
+	return FHttpAccess::Request(this, Req, Callback, nullptr, false);
 }
 
 void UHttpClient::Close() {
@@ -85,13 +85,47 @@ void UHttpClientSsl::SetHost(const FClientBindOptions& BindOpts) {
 	bind_options = BindOpts;
 }
 
-void UHttpClientSsl::Request(const FHttpRequest& Req, const FDelegateHttpClientResponse& Callback) {
+int32 UHttpClientSsl::Request(const FHttpRequest& Req, const FDelegateHttpClientResponse& Callback) {
 	if (!Tls) {
 		Tls = IPNet::GetDefaultClientTlsConfig();
 	}
-	FHttpAccess::Request(this, Req, Callback, Tls, true);
+	return FHttpAccess::Request(this, Req, Callback, Tls, true);
 }
 
 void UHttpClientSsl::Close() {
 	FHttpAccess::Close(this);
+}
+
+bool UHttpClient::Cancel(int32 RequestId) {
+	return FHttpAccess::Cancel(this, RequestId);
+}
+
+bool UHttpClient::SetUrl(const FString& Url) {
+	IPNet::FParsedHttpUrl Parsed;
+	if (!IPNet::ParseHttpUrl(Url, Parsed) || Parsed.Scheme != TEXT("http")) {
+		UE_LOG(LogAsio, Warning, TEXT("HTTP SetUrl: expected a http:// URL."));
+		return false;
+	}
+	FClientBindOptions Options = bind_options;
+	Options.Address = Parsed.Host;
+	Options.Port = FString::FromInt(Parsed.Port);
+	SetHost(Options);
+	return true;
+}
+
+bool UHttpClientSsl::Cancel(int32 RequestId) {
+	return FHttpAccess::Cancel(this, RequestId);
+}
+
+bool UHttpClientSsl::SetUrl(const FString& Url) {
+	IPNet::FParsedHttpUrl Parsed;
+	if (!IPNet::ParseHttpUrl(Url, Parsed) || Parsed.Scheme != TEXT("https")) {
+		UE_LOG(LogAsio, Warning, TEXT("HTTP SetUrl: expected a https:// URL."));
+		return false;
+	}
+	FClientBindOptions Options = bind_options;
+	Options.Address = Parsed.Host;
+	Options.Port = FString::FromInt(Parsed.Port);
+	SetHost(Options);
+	return true;
 }

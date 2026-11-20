@@ -118,3 +118,11 @@ bool UTCPClientSsl::Connect(const FClientBindOptions& BindOpts) {
 void UTCPClientSsl::Close() {
 	FFacadeAccess::CloseStream(Net);
 }
+
+FConnectionStats UTCPClient::GetStats() {
+	return FFacadeAccess::StreamStats(Net);
+}
+
+FConnectionStats UTCPClientSsl::GetStats() {
+	return FFacadeAccess::StreamStats(Net);
+}

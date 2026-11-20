@@ -197,6 +197,14 @@ struct FHttpRequest {
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|Request")
 	FString Body;
+
+	/** Binary body: sent instead of Body when not empty; received bodies are always here too. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Request")
+	TArray<uint8> BodyBytes;
+
+	/** Client: fails the request with TimedOut if the response did not arrive in time (0 = no limit). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Request")
+	float TimeoutSeconds = 0.0f;
 };
 
 USTRUCT(BlueprintType, Category="IP|STRUCT|Common")
@@ -221,6 +229,10 @@ struct FHttpResponse {
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|Response")
 	FString Body;
+
+	/** Binary body: sent instead of Body when not empty; received bodies are always here too. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|Response")
+	TArray<uint8> BodyBytes;
 };
 
 UENUM(Blueprintable, Category="IP|ENUM|Common")
@@ -274,6 +286,32 @@ enum class ECloseState: uint8  {
 };
 
 // Client side
+/** Traffic counters of a connection. */
+USTRUCT(BlueprintType, Category="IP|STRUCT|Common")
+struct FConnectionStats {
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "IP|Stats")
+	int64 BytesSent = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "IP|Stats")
+	int64 BytesReceived = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "IP|Stats")
+	int64 MessagesSent = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "IP|Stats")
+	int64 MessagesReceived = 0;
+
+	/** Bytes waiting in the send queue. */
+	UPROPERTY(BlueprintReadOnly, Category = "IP|Stats")
+	int64 QueuedBytes = 0;
+
+	/** WebSocket: last Ping -> Pong round trip in ms (-1: none). */
+	UPROPERTY(BlueprintReadOnly, Category = "IP|Stats")
+	float RoundTripMs = -1.0f;
+};
+
 /** How a TCP byte stream is cut into messages. */
 UENUM(BlueprintType, Category="IP|ENUM|Common")
 enum class ETcpFramingMode : uint8 {
@@ -324,6 +362,34 @@ struct FClientBindOptions {
 	 */
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ClientBindOptions")
 	int MaxPendingReceiveMB = 8;
+
+	/** Disables Nagle's algorithm: small messages leave immediately (lower latency). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	bool bNoDelay = true;
+
+	/** TCP keep-alive probes detect dead peers on idle connections. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	bool bKeepAlive = false;
+
+	/** Upper bound of data waiting to be sent per connection; Write fails (QueueFull) above it. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	int MaxQueuedMB = 64;
+
+	/** OS socket receive buffer (SO_RCVBUF) in bytes; 0 = OS default. Larger values absorb UDP bursts. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	int SocketReceiveBufferBytes = 0;
+
+	/** OS socket send buffer (SO_SNDBUF) in bytes; 0 = OS default. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	int SocketSendBufferBytes = 0;
+
+	/** UDP client: local address to bind before connecting (empty = any). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ClientBindOptions")
+	FString LocalAddress;
+
+	/** UDP client: local port to bind before connecting (0 = any). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|ClientBindOptions")
+	int LocalPort = 0;
 };
 
 // Server side
@@ -351,6 +417,26 @@ struct FServerBindOptions {
 	/** Per connection, see FClientBindOptions::MaxPendingReceiveMB. */
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ServerBindOptions")
 	int MaxPendingReceiveMB = 8;
+
+	/** Disables Nagle's algorithm: small messages leave immediately (lower latency). */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	bool bNoDelay = true;
+
+	/** TCP keep-alive probes detect dead peers on idle connections. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	bool bKeepAlive = false;
+
+	/** Upper bound of data waiting to be sent per connection; Write fails (QueueFull) above it. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	int MaxQueuedMB = 64;
+
+	/** OS socket receive buffer (SO_RCVBUF) in bytes; 0 = OS default. Larger values absorb UDP bursts. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	int SocketReceiveBufferBytes = 0;
+
+	/** OS socket send buffer (SO_SNDBUF) in bytes; 0 = OS default. */
+	UPROPERTY(BlueprintReadWrite, Category = "IP|BindOptions")
+	int SocketSendBufferBytes = 0;
 
 	UPROPERTY(BlueprintReadWrite, Category = "IP|ServerBindOptions")
 	bool bReuse_Address = true;

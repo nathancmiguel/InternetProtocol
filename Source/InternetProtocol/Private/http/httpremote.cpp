@@ -70,3 +70,37 @@ bool UHttpRemoteSsl::Write(const FDelegateHttpRemoteMessageSent& Callback) {
 void UHttpRemoteSsl::Close() {
 	FHttpAccess::CloseRemote(this);
 }
+
+bool UHttpRemote::BeginStream() {
+	return FHttpAccess::BeginStream(this);
+}
+
+bool UHttpRemote::WriteChunk(const FString& Data) {
+	const IPNet::FBytes Utf8 = IPNet::ToUtf8(Data);
+	return FHttpAccess::WriteChunk(this, Utf8.data(), Utf8.size());
+}
+
+bool UHttpRemote::WriteChunkBuffer(const TArray<uint8>& Data) {
+	return FHttpAccess::WriteChunk(this, Data.GetData(), static_cast<size_t>(Data.Num()));
+}
+
+bool UHttpRemote::EndStream() {
+	return FHttpAccess::EndStream(this);
+}
+
+bool UHttpRemoteSsl::BeginStream() {
+	return FHttpAccess::BeginStream(this);
+}
+
+bool UHttpRemoteSsl::WriteChunk(const FString& Data) {
+	const IPNet::FBytes Utf8 = IPNet::ToUtf8(Data);
+	return FHttpAccess::WriteChunk(this, Utf8.data(), Utf8.size());
+}
+
+bool UHttpRemoteSsl::WriteChunkBuffer(const TArray<uint8>& Data) {
+	return FHttpAccess::WriteChunk(this, Data.GetData(), static_cast<size_t>(Data.Num()));
+}
+
+bool UHttpRemoteSsl::EndStream() {
+	return FHttpAccess::EndStream(this);
+}

@@ -136,3 +136,11 @@ void UWSRemoteSsl::AcceptUpgrade() {
 void UWSRemoteSsl::RejectUpgrade(int32 Status, const FString& Reason) {
 	FWsAccess::RejectUpgrade(this, Status, Reason);
 }
+
+FConnectionStats UWSRemote::GetStats() {
+	return FWsAccess::Stats(this);
+}
+
+FConnectionStats UWSRemoteSsl::GetStats() {
+	return FWsAccess::Stats(this);
+}

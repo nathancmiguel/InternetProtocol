@@ -4,6 +4,7 @@
 
 #include "IPTestListener.h"
 #include "Misc/AutomationTest.h"
+#include "Tests/AutomationCommon.h"
 #include "Modules/ModuleManager.h"
 #include "HAL/PlatformTime.h"
 #include "UObject/UObjectGlobals.h"
@@ -1379,6 +1380,257 @@ bool FIPTcpFramingTest::RunTest(const FString& Parameters) {
 		Release(LineServer);
 		Release(L);
 		Release(LineL);
+		Release(ServerL);
+	});
+	return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Phase 3: new features
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPTcpStatsTest, "InternetProtocol.TCP.Stats", IPTests::Flags)
+bool FIPTcpStatsTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UTCPServer* Server = Make<UTCPServer>();
+	UTCPClient* Client = Make<UTCPClient>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnTcpAccepted);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnMessage.AddDynamic(L, &UIPTestListener::OnBytes);
+	if (!TestTrue(TEXT("Server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	Client->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("connected"), [L]() { return L->Connected == 1; });
+	Then([Client]() { Client->Write(TEXT("0123456789"), FDelegateTcpClientMessageSent()); });
+	WaitUntil(this, TEXT("echo"), [L]() { return L->Received.Num() == 10; });
+	Then([this, L, ServerL, Server, Client]() {
+		const FConnectionStats Stats = Client->GetStats();
+		TestEqual(TEXT("Bytes sent"), Stats.BytesSent, int64(10));
+		TestEqual(TEXT("Bytes received"), Stats.BytesReceived, int64(10));
+		TestEqual(TEXT("Messages sent"), Stats.MessagesSent, int64(1));
+		TestTrue(TEXT("Messages received"), Stats.MessagesReceived >= 1);
+		Client->Close();
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPUdpMulticastTest, "InternetProtocol.UDP.Multicast", IPTests::Flags)
+bool FIPUdpMulticastTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UUDPServer* Server = Make<UUDPServer>();
+	UUDPClient* Client = Make<UUDPClient>();
+	Server->OnMessage.AddDynamic(ServerL, &UIPTestListener::OnUdpServerMessage);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnConnected);
+	Client->OnError.AddDynamic(L, &UIPTestListener::OnError);
+	FServerBindOptions Bind;
+	Bind.Address = TEXT("0.0.0.0");
+	Bind.Port = 0;
+	Bind.Protocol = EProtocolType::V4;
+	if (!TestTrue(TEXT("UDP server binds"), Server->Bind(Bind))) {
+		return false;
+	}
+	TestTrue(TEXT("Join group"), Server->JoinMulticastGroup(TEXT("239.255.42.99")));
+	TestFalse(TEXT("Not a multicast address"), Server->JoinMulticastGroup(TEXT("10.0.0.1")));
+	FClientBindOptions Target = ClientTo(Server->LocalEndpoint().Port, TEXT("239.255.42.99"));
+	Target.Protocol = EProtocolType::V4;
+	Client->Connect(Target);
+	WaitUntil(this, TEXT("client ready"), [L]() { return L->Connected == 1; });
+	Then([Client]() {
+		Client->SetMulticastLoopback(true);
+		Client->SetMulticastTTL(1);
+		Client->SendBuffer({1, 2, 3}, FDelegateUdpClientMessageSent());
+	});
+	WaitUntil(this, TEXT("multicast datagram received"), [ServerL]() { return ServerL->Messages >= 1; });
+	Then([this, L, ServerL, Server, Client]() {
+		TestEqual(TEXT("No error"), L->Errors, 0);
+		Client->Close();
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPWsReconnectTest, "InternetProtocol.WebSocket.ConnectUrlAndReconnect", IPTests::Flags)
+bool FIPWsReconnectTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UWSServer* Server = Make<UWSServer>();
+	UWSClient* Client = Make<UWSClient>();
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnWsAccepted);
+	Client->OnConnected.AddDynamic(L, &UIPTestListener::OnWsConnected);
+	Client->OnClose.AddDynamic(L, &UIPTestListener::OnWsClose);
+	Client->bAutoReconnect = true;
+	if (!TestTrue(TEXT("WS server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	const int32 Port = Server->LocalEndpoint().Port;
+	TestTrue(TEXT("ConnectUrl"), Client->ConnectUrl(FString::Printf(TEXT("ws://127.0.0.1:%d/chat?room=1"), Port)));
+	TestFalse(TEXT("Wrong scheme refused"), Client->ConnectUrl(TEXT("wss://127.0.0.1:1/")));
+	WaitUntil(this, TEXT("first connection"), [L]() { return L->Connected == 1; });
+	Then([Server]() { Server->Close(); }); // remotes end with 1001: an unexpected close for the client
+	WaitUntil(this, TEXT("client notices"), [L]() { return L->Closed == 1; });
+	Then([this, Server, Port]() {
+		FServerBindOptions Bind = Loopback();
+		Bind.Port = Port;
+		TestTrue(TEXT("Server reopens on the same port"), Server->Open(Bind));
+	});
+	WaitUntil(this, TEXT("automatic reconnection"), [L]() { return L->Connected == 2; }, 15.0);
+	Then([this, L, ServerL, Server, Client]() {
+		Client->Close(1000, TEXT("done")); // user close: no reconnection
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPWsKeepAliveTest, "InternetProtocol.WebSocket.PingAndIdleTimeout", IPTests::Flags)
+bool FIPWsKeepAliveTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UWSServer* Server = Make<UWSServer>();
+	Server->PingIntervalSeconds = 0.0f; // the server stays silent
+	Server->IdleTimeoutSeconds = 0.0f;
+	Server->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnWsAccepted);
+	if (!TestTrue(TEXT("WS server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	UIPTestListener* Alive = Make<UIPTestListener>();
+	UIPTestListener* Silent = Make<UIPTestListener>();
+	UWSClient* Pinging = Make<UWSClient>();
+	UWSClient* Quiet = Make<UWSClient>();
+	Pinging->PingIntervalSeconds = 0.3f; // pongs count as activity
+	Pinging->IdleTimeoutSeconds = 1.0f;
+	Quiet->PingIntervalSeconds = 0.0f;
+	Quiet->IdleTimeoutSeconds = 1.0f;
+	Pinging->OnConnected.AddDynamic(Alive, &UIPTestListener::OnWsConnected);
+	Pinging->OnClose.AddDynamic(Alive, &UIPTestListener::OnWsClose);
+	Quiet->OnConnected.AddDynamic(Silent, &UIPTestListener::OnWsConnected);
+	Quiet->OnClose.AddDynamic(Silent, &UIPTestListener::OnWsClose);
+	Quiet->OnError.AddDynamic(Silent, &UIPTestListener::OnError);
+	Pinging->Connect(ClientTo(Server->LocalEndpoint().Port));
+	Quiet->Connect(ClientTo(Server->LocalEndpoint().Port));
+	WaitUntil(this, TEXT("idle client closed"), [Silent]() { return Silent->Closed == 1; }, 10.0);
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(1.5f));
+	Then([this, Alive, Silent, ServerL, Server, Pinging, Quiet]() {
+		TestTrue(TEXT("Idle timeout reported"), Silent->LastError.Message.Contains(TEXT("timed out")));
+		TestEqual(TEXT("Pinging client still open"), Alive->Closed, 0);
+		TestTrue(TEXT("Pinging client open"), Pinging->IsOpen());
+		TestTrue(TEXT("RTT measured by the automatic pings"), Pinging->GetStats().RoundTripMs >= 0.0f);
+		Pinging->Close(1000, TEXT("done"));
+		Server->Close();
+		Release(Pinging);
+		Release(Quiet);
+		Release(Server);
+		Release(Alive);
+		Release(Silent);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpFeaturesTest, "InternetProtocol.HTTP.BinaryRedirectStreamProgress", IPTests::Flags)
+bool FIPHttpFeaturesTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UHttpServer* Server = Make<UHttpServer>();
+	UHttpClient* Client = Make<UHttpClient>();
+	auto Bind = [ServerL](const TCHAR* Function) {
+		FDelegateHttpServerRequest Delegate;
+		Delegate.BindUFunction(ServerL, Function);
+		return Delegate;
+	};
+	Server->Post(TEXT("/bytes"), Bind(TEXT("OnHttpEchoBytes")));
+	Server->Get(TEXT("/old"), Bind(TEXT("OnHttpRedirect")));
+	Server->Get(TEXT("/new"), Bind(TEXT("OnHttpNew")));
+	Server->Get(TEXT("/big"), Bind(TEXT("OnHttpBig")));
+	Server->Get(TEXT("/stream"), Bind(TEXT("OnHttpStream")));
+	if (!TestTrue(TEXT("HTTP server opens"), Server->Open(Loopback()))) {
+		return false;
+	}
+	TestTrue(TEXT("SetUrl"), Client->SetUrl(FString::Printf(TEXT("http://127.0.0.1:%d/ignored"), Server->LocalEndpoint().Port)));
+	TestFalse(TEXT("SetUrl refuses https on UHttpClient"), Client->SetUrl(TEXT("https://127.0.0.1:1/")));
+	Client->MaxRedirects = 3;
+	Client->OnProgress.AddDynamic(L, &UIPTestListener::OnProgressEvent);
+	FDelegateHttpClientResponse OnResponse;
+	OnResponse.BindUFunction(L, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpResponse));
+
+	FHttpRequest Bytes;
+	Bytes.Method = ERequestMethod::POST;
+	Bytes.Path = TEXT("/bytes");
+	Bytes.BodyBytes = {0, 255, 0, 128, 10, 13};
+	FHttpRequest Old;
+	Old.Path = TEXT("/old");
+	FHttpRequest Big;
+	Big.Path = TEXT("/big");
+	FHttpRequest Stream;
+	Stream.Path = TEXT("/stream");
+	const int32 FirstId = Client->Request(Bytes, OnResponse); // 0
+	Client->Request(Old, OnResponse);                          // 1: followed to /new
+	Client->Request(Big, OnResponse);                          // 2: progress events
+	Client->Request(Stream, OnResponse);                       // 3: chunked stream
+	Client->Request(Old, OnResponse);                          // 4: keep-alive still fine after the stream
+	WaitUntil(this, TEXT("5 responses"), [L]() { return L->Responses.Num() == 5; });
+	Then([this, L, Bytes, FirstId, Server, Client, ServerL]() {
+		TestTrue(TEXT("Request ids"), FirstId > 0);
+		TestTrue(TEXT("Binary body round trip"), L->Responses[0].BodyBytes == Bytes.BodyBytes);
+		TestEqual(TEXT("Redirect followed"), L->Responses[1].Body, FString(TEXT("new from old")));
+		TestEqual(TEXT("1 MiB body"), L->Responses[2].Body.Len(), 1024 * 1024);
+		TestTrue(TEXT("Progress reported"), L->Progress > 0);
+		TestEqual(TEXT("Streamed body"), L->Responses[3].Body, FString(TEXT("abcdef")));
+		TestEqual(TEXT("Request after a stream"), L->Responses[4].Status_Code, 200);
+		Client->Close();
+		Server->Close();
+		Release(Client);
+		Release(Server);
+		Release(L);
+		Release(ServerL);
+	});
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPHttpTimeoutCancelTest, "InternetProtocol.HTTP.TimeoutAndCancel", IPTests::Flags)
+bool FIPHttpTimeoutCancelTest::RunTest(const FString& Parameters) {
+	UIPTestListener* ServerL = Make<UIPTestListener>();
+	UIPTestListener* L = Make<UIPTestListener>();
+	UTCPServer* Silent = Make<UTCPServer>();
+	UHttpClient* Client = Make<UHttpClient>();
+	Silent->OnClientAccepted.AddDynamic(ServerL, &UIPTestListener::OnRawAccepted);
+	if (!TestTrue(TEXT("Silent server opens"), Silent->Open(Loopback()))) {
+		return false;
+	}
+	Client->SetHost(ClientTo(Silent->LocalEndpoint().Port));
+	FDelegateHttpClientResponse OnResponse;
+	OnResponse.BindUFunction(L, GET_FUNCTION_NAME_CHECKED(UIPTestListener, OnHttpResponse));
+	FHttpRequest Timed;
+	Timed.TimeoutSeconds = 0.5f;
+	Client->Request(Timed, OnResponse);
+	const int32 Queued = Client->Request(FHttpRequest(), OnResponse);
+	WaitUntil(this, TEXT("timeout"), [L]() { return L->Responses.Num() == 1; }, 10.0);
+	Then([this, L, Client, Queued]() {
+		TestTrue(TEXT("TimedOut"), L->ResponseErrors[0].Message.Contains(TEXT("timed out")));
+		TestTrue(TEXT("Cancel the next (now in flight)"), Client->Cancel(Queued));
+		TestFalse(TEXT("Unknown id"), Client->Cancel(12345));
+	});
+	WaitUntil(this, TEXT("cancelled"), [L]() { return L->Responses.Num() == 2; });
+	Then([this, L, ServerL, Silent, Client]() {
+		TestTrue(TEXT("Cancelled error"), L->ResponseErrors[1].Message.Contains(TEXT("cancelled")));
+		Client->Close();
+		Silent->Close();
+		Release(Client);
+		Release(Silent);
+		Release(L);
 		Release(ServerL);
 	});
 	return true;

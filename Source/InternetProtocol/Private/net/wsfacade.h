@@ -6,8 +6,18 @@
 
 #include "net/facade.h"
 #include "net/wssession.h"
+#include "Containers/Ticker.h"
+
+/** Callback type for internal sends that nobody listens to. */
+DECLARE_DELEGATE_TwoParams(FDelegateWsNoCallback, const FErrorCode&, int);
 
 namespace IPNet {
+
+	/** Clients have bAutoReconnect; remotes do not. */
+	template <typename T, typename = void>
+	struct THasReconnect { static constexpr bool Value = false; };
+	template <typename T>
+	struct THasReconnect<T, std::void_t<decltype(std::declval<T&>().bAutoReconnect)>> { static constexpr bool Value = true; };
 
 	/**
 	 * WebSocket facades (UWSClient, UWSClientSsl, UWSRemote, UWSRemoteSsl).
@@ -36,6 +46,8 @@ namespace IPNet {
 				}
 				RunOnGameThread(Weak, [Id, bBinary, Guard = FFlowGuard(Flow, Payload.size()), Buffer = MoveTemp(Buffer)](T* Self) {
 					if (Self->State.Net.SessionId == Id) {
+						Self->State.LastActivitySeconds = FPlatformTime::Seconds();
+						++Self->State.Net.MessagesReceived;
 						Self->OnMessage.Broadcast(Buffer, bBinary);
 					}
 				});
@@ -50,6 +62,7 @@ namespace IPNet {
 			Callbacks.OnPong = [Weak, Id]() {
 				RunOnGameThread(Weak, [Id](T* Self) {
 					if (Self->State.Net.SessionId == Id) {
+						Self->State.LastActivitySeconds = FPlatformTime::Seconds();
 						if (Self->State.LastPingSeconds > 0.0) {
 							Self->State.RoundTripMs = static_cast<float>((FPlatformTime::Seconds() - Self->State.LastPingSeconds) * 1000.0);
 							Self->State.LastPingSeconds = 0.0;
@@ -96,6 +109,9 @@ namespace IPNet {
 						}
 						Self->OnClose.Broadcast(Code, Reason);
 						FFacadeAccess::NotifyClosed(Self);
+						if (Kind == FFacadeAccess::EClosed::Current) {
+							ScheduleReconnect(Self);
+						}
 					}
 				});
 			};
@@ -164,6 +180,8 @@ namespace IPNet {
 						Owner->State.Net.bOpen = true;
 						const FString* Protocol = FindHeader(Response.Headers, TEXT("Sec-WebSocket-Protocol"));
 						Owner->State.SubProtocol = Protocol ? Protocol->TrimStartAndEnd() : FString();
+						Owner->State.ReconnectAttempt = 0;
+						StartKeepAlive(Owner, Id, Owner->PingIntervalSeconds, Owner->IdleTimeoutSeconds);
 						Owner->OnConnected.Broadcast(Response);
 					}
 				});
@@ -192,6 +210,13 @@ namespace IPNet {
 			FFacadeAccess::BeginSession(S.Net, Transport, Id);
 			S.Session = Session;
 			S.bClosing = false;
+			S.bFragmenting = false;
+			S.bUserClosed = false;
+			S.LastActivitySeconds = FPlatformTime::Seconds();
+			S.Reconnect = [Weak, Options, Tls, bTls]() {
+				T* Owner = Weak.Get();
+				return Owner && Connect(Owner, Options, Tls, bTls);
+			};
 			Transport->Connect(ToStd(Options.Address), ToStd(Options.Port), Options.Protocol);
 			return true;
 		}
@@ -217,6 +242,11 @@ namespace IPNet {
 						FString Selected;
 						Request.Headers.RemoveAndCopyValue(TEXT("x-selected-protocol"), Selected);
 						Owner->State.SubProtocol = Selected;
+						if (UObject* ServerObject = Owner->GetOuter()) {
+							float Ping = 0.0f, Idle = 0.0f;
+							GetServerKeepAlive(ServerObject, Ping, Idle);
+							StartKeepAlive(Owner, Id, Ping, Idle);
+						}
 						Owner->OnConnected.Broadcast(Request);
 					}
 				});
@@ -301,6 +331,9 @@ namespace IPNet {
 				return false;
 			}
 			Self->State.bFragmenting = !Frame.bFin;
+			if (Frame.bFin) {
+				++Self->State.Net.MessagesSent;
+			}
 			return true;
 		}
 
@@ -325,6 +358,85 @@ namespace IPNet {
 				Self->State.LastPingSeconds = FPlatformTime::Seconds();
 			}
 			return SendFrame(Self, Opcode, Payload.GetData(), static_cast<size_t>(Payload.Num()), FDataframe(), Callback);
+		}
+
+		// ---- keep-alive, reconnection, stats ----
+
+		/** Server properties without knowing the exact server class. */
+		static void GetServerKeepAlive(UObject* Server, float& OutPing, float& OutIdle) {
+			auto Read = [Server](const TCHAR* Name) {
+				const FFloatProperty* Property = FindFProperty<FFloatProperty>(Server->GetClass(), Name);
+				return Property ? Property->GetPropertyValue_InContainer(Server) : 0.0f;
+			};
+			OutPing = Read(TEXT("PingIntervalSeconds"));
+			OutIdle = Read(TEXT("IdleTimeoutSeconds"));
+		}
+
+		/**
+		 * Sends a Ping every PingSeconds of silence and closes the connection (TimedOut, 1001) after IdleSeconds
+		 * without any frame from the peer. Game Thread ticker, removed when the connection ends.
+		 */
+		template <typename T>
+		static void StartKeepAlive(T* Self, uint64 Id, float PingSeconds, float IdleSeconds) {
+			if (PingSeconds <= 0.0f && IdleSeconds <= 0.0f) {
+				return;
+			}
+			Self->State.LastActivitySeconds = FPlatformTime::Seconds();
+			TWeakObjectPtr<T> Weak(Self);
+			const float Step = FMath::Clamp(FMath::Min(PingSeconds > 0.0f ? PingSeconds : IdleSeconds, IdleSeconds > 0.0f ? IdleSeconds : PingSeconds) / 4.0f, 0.05f, 1.0f);
+			TSharedRef<double> LastPing = MakeShared<double>(FPlatformTime::Seconds());
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak, Id, PingSeconds, IdleSeconds, LastPing](float) {
+				T* Owner = Weak.Get();
+				if (!Owner || Owner->State.Net.SessionId != Id || !Owner->State.Session) {
+					return false; // connection gone: stop ticking
+				}
+				const double Now = FPlatformTime::Seconds();
+				const double Silence = Now - Owner->State.LastActivitySeconds;
+				if (IdleSeconds > 0.0f && Silence > IdleSeconds) {
+					UE_LOG(LogAsio, Warning, TEXT("InternetProtocol WebSocket: no data for %.0f s, closing."), Silence);
+					Owner->State.Net.LastError = FErrorCode(MakeError(EError::TimedOut));
+					Owner->OnError.Broadcast(Owner->State.Net.LastError);
+					// Not a user close: automatic reconnection (if enabled) still applies.
+					Owner->State.Session->Close(1001, TEXT("Idle timeout"));
+					return false;
+				}
+				if (PingSeconds > 0.0f && Silence >= PingSeconds && Now - *LastPing >= PingSeconds) {
+					*LastPing = Now;
+					SendFrame(Owner, EOpcode::PING, nullptr, 0, FDataframe(), FDelegateWsNoCallback());
+					Owner->State.LastPingSeconds = Now;
+				}
+				return true;
+			}), Step);
+		}
+
+		/** Unexpected close of a client with bAutoReconnect: connects again after 1, 2, 4... s (capped). */
+		template <typename T>
+		static void ScheduleReconnect(T* Self) {
+			if constexpr (THasReconnect<T>::Value) {
+				if (!Self->bAutoReconnect || Self->State.bUserClosed || !Self->State.Reconnect) {
+					return;
+				}
+				const int32 Attempt = Self->State.ReconnectAttempt++;
+				const float Delay = FMath::Min(FMath::Pow(2.0f, static_cast<float>(FMath::Min(Attempt, 10))), FMath::Max(Self->ReconnectMaxDelaySeconds, 1.0f));
+				TWeakObjectPtr<T> Weak(Self);
+				FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak](float) {
+					T* Owner = Weak.Get();
+					if (Owner && !Owner->State.bUserClosed && !Owner->State.Session && Owner->State.Reconnect) {
+						TFunction<bool()> Reconnect = Owner->State.Reconnect;
+						if (!Reconnect()) {
+							ScheduleReconnect(Owner);
+						}
+					}
+					return false;
+				}), Delay);
+			}
+		}
+
+		template <typename T>
+		static FConnectionStats Stats(const T* Self) {
+			FConnectionStats Result = FFacadeAccess::StreamStats(Self->State.Net);
+			Result.RoundTripMs = Self->State.RoundTripMs;
+			return Result;
 		}
 
 		static uint16 SendableCloseCode(int32 Code) {
@@ -358,6 +470,7 @@ namespace IPNet {
 			}
 			Self->State.Session->End(SendableCloseCode(Code), Reason);
 			Self->State.bClosing = true;
+			Self->State.bUserClosed = true;
 		}
 
 		template <typename T>
@@ -365,6 +478,7 @@ namespace IPNet {
 			if (!Self->State.Session) {
 				return;
 			}
+			Self->State.bUserClosed = true;
 			Self->State.Session->Close(SendableCloseCode(Code), Reason);
 			// The session aborts the transport; the final OnClose(Code, Reason) is still delivered
 			// (PendingCloseIds), nothing else from this connection is.

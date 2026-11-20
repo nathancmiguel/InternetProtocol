@@ -42,6 +42,22 @@ public:
 
 	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
 	bool Write(const FDelegateHttpRemoteMessageSent &Callback);
+	/**
+	 * Starts a streamed response with the current Headers (status + headers, no Content-Length): the body is
+	 * sent with WriteChunk / WriteChunkBuffer and finished with EndStream (chunked encoding for HTTP/1.1).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool BeginStream();
+
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool WriteChunk(const FString& Data);
+
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool WriteChunkBuffer(const TArray<uint8>& Data);
+
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool EndStream();
+
 
 	
 	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
@@ -62,6 +78,9 @@ private:
 	bool bResponsePending = false;
 	/** Incremented for every request; the automatic 503 only answers the request it was armed for. */
 	uint32 ResponseSerial = 0;
+	/** BeginStream was called: chunks go out until EndStream. */
+	bool bStreaming = false;
+	bool bStreamChunked = false;
 	bool bWillClose = false;
 	bool bHeadRequest = false;
 	/** Set by the owning server (Game Thread). */
@@ -96,6 +115,22 @@ public:
 
 	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
 	bool Write(const FDelegateHttpRemoteMessageSent &Callback);
+	/**
+	 * Starts a streamed response with the current Headers (status + headers, no Content-Length): the body is
+	 * sent with WriteChunk / WriteChunkBuffer and finished with EndStream (chunked encoding for HTTP/1.1).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool BeginStream();
+
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool WriteChunk(const FString& Data);
+
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool WriteChunkBuffer(const TArray<uint8>& Data);
+
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	bool EndStream();
+
 
 	
 	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
@@ -116,6 +151,9 @@ private:
 	bool bResponsePending = false;
 	/** Incremented for every request; the automatic 503 only answers the request it was armed for. */
 	uint32 ResponseSerial = 0;
+	/** BeginStream was called: chunks go out until EndStream. */
+	bool bStreaming = false;
+	bool bStreamChunked = false;
 	bool bWillClose = false;
 	bool bHeadRequest = false;
 	/** Set by the owning server (Game Thread). */

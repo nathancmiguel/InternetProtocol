@@ -151,6 +151,14 @@ namespace IPNet {
 
 			virtual bool IsTls() const override { return bTls; }
 
+			virtual FTransportStats GetStats() const override {
+				FTransportStats Stats;
+				Stats.BytesSent = BytesSent.load(std::memory_order_relaxed);
+				Stats.BytesReceived = BytesReceived.load(std::memory_order_relaxed);
+				Stats.QueuedBytes = QueuedBytes.load(std::memory_order_relaxed);
+				return Stats;
+			}
+
 			virtual void MarkEstablished() override {
 				asio::post(Executor, [Self = this->shared_from_this()]() {
 					Self->bEstablished = true;
@@ -300,6 +308,11 @@ namespace IPNet {
 
 			void OnOpen() {
 				State.store(EState::Open);
+				{
+					asio::error_code Ignored;
+					Lowest().set_option(tcp::no_delay(Options.bNoDelay), Ignored);
+					Lowest().set_option(asio::socket_base::keep_alive(Options.bKeepAlive), Ignored);
+				}
 				if (Options.bEstablishOnOpen) {
 					bEstablished = true;
 					SetupTimer.cancel();
@@ -365,6 +378,7 @@ namespace IPNet {
 					return;
 				}
 				ArmIdle();
+				BytesReceived.fetch_add(Bytes, std::memory_order_relaxed);
 				if (Events.OnData && Bytes > 0) {
 					Events.OnData(ReadBuffer.data(), Bytes);
 				}
@@ -416,6 +430,9 @@ namespace IPNet {
 				}
 				FWriteItem Item = MoveTemp(WriteQueue.front());
 				WriteQueue.pop_front();
+				if (!Ec) {
+					BytesSent.fetch_add(Bytes, std::memory_order_relaxed);
+				}
 				QueuedBytes.fetch_sub(Item.Data.size(), std::memory_order_acq_rel);
 				if (Item.Callback) {
 					Item.Callback(Ec, Bytes);
@@ -610,6 +627,8 @@ namespace IPNet {
 			std::string ConnectHost;
 			std::atomic<EState> State{EState::Idle};
 			std::atomic<size_t> QueuedBytes{0};
+			std::atomic<uint64> BytesSent{0};
+			std::atomic<uint64> BytesReceived{0};
 			bool bWriting = false;
 			bool bReadPending = false;
 			bool bFlushing = false;

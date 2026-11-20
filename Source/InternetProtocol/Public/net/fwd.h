@@ -46,6 +46,8 @@ struct FIpStreamState {
 	FErrorCode LastError;
 	/** TCP facades: framing applied to sent and received data. */
 	FTcpFramingOptions Framing;
+	int64 MessagesSent = 0;
+	int64 MessagesReceived = 0;
 };
 
 /** Game Thread state of a listening server facade. */
@@ -85,4 +87,11 @@ struct FIpWsState {
 	FString SubProtocol;
 	double LastPingSeconds = 0.0;
 	float RoundTripMs = -1.0f;
+	/** Last frame received (Game Thread time), for the automatic ping / idle timeout. */
+	double LastActivitySeconds = 0.0;
+	/** Close() / End() called by the user: no automatic reconnection. */
+	bool bUserClosed = false;
+	int32 ReconnectAttempt = 0;
+	/** Client: connects again with the options of the last Connect (automatic reconnection). */
+	TFunction<bool()> Reconnect;
 };

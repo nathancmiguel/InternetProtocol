@@ -77,6 +77,14 @@ namespace IPNet {
 		size_t MaxQueuedBytes = 64u * 1024u * 1024u;
 		/** Optional receive backpressure (see FFlowControl). */
 		std::shared_ptr<FFlowControl> Flow;
+		bool bNoDelay = true;
+		bool bKeepAlive = false;
+	};
+
+	struct FTransportStats {
+		uint64 BytesSent = 0;
+		uint64 BytesReceived = 0;
+		uint64 QueuedBytes = 0;
 	};
 
 	class FTransport : public FNetObject {
@@ -97,6 +105,8 @@ namespace IPNet {
 		virtual void MarkEstablished() = 0;
 		/** Resumes reading after a backpressure pause. Thread-safe. */
 		virtual void ResumeRead() = 0;
+		/** Any thread. */
+		virtual FTransportStats GetStats() const = 0;
 		virtual bool IsTls() const = 0;
 	};
 

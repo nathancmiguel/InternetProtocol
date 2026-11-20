@@ -125,10 +125,58 @@ namespace IPNet {
 		}
 
 		template <typename T>
-		static void Request(T* Self, const FHttpRequest& Request, const FDelegateHttpClientResponse& Callback,
-		                    const std::shared_ptr<const FTlsConfig>& Tls, bool bTls) {
-			Self->State.Queue.Add(FIpHttpPendingRequest{Request, Callback});
+		static int32 Request(T* Self, const FHttpRequest& Request, const FDelegateHttpClientResponse& Callback,
+		                     const std::shared_ptr<const FTlsConfig>& Tls, bool bTls) {
+			FIpHttpPendingRequest& Pending = Self->State.Queue.AddDefaulted_GetRef();
+			Pending.Request = Request;
+			Pending.Callback = Callback;
+			Pending.Id = ++Self->State.NextRequestId;
+			const int32 Id = Pending.Id;
+			Self->State.Tls = Tls;
+			Self->State.bTls = bTls;
 			Pump(Self, Tls, bTls);
+			return Id;
+		}
+
+		template <typename T>
+		static bool Cancel(T* Self, int32 RequestId) {
+			FIpHttpClientState& S = Self->State;
+			const int32 Index = S.Queue.IndexOfByPredicate([RequestId](const FIpHttpPendingRequest& Item) { return Item.Id == RequestId; });
+			if (Index == INDEX_NONE) {
+				return false;
+			}
+			const FIpHttpPendingRequest Item = S.Queue[Index];
+			S.Queue.RemoveAt(Index);
+			if (Index == 0 && S.bInFlight) {
+				// The response of a cancelled in-flight request must not be delivered to the next one.
+				S.bInFlight = false;
+				Detach(S);
+			}
+			Item.Callback.ExecuteIfBound(FErrorCode(MakeError(EError::Cancelled)), FHttpResponse());
+			Pump(Self, S.Tls, S.bTls);
+			return true;
+		}
+
+		/** Fails the in-flight request with TimedOut if it is still the same request after Seconds. */
+		template <typename T>
+		static void ArmRequestTimeout(T* Self, int32 RequestId, float Seconds) {
+			if (Seconds <= 0.0f) {
+				return;
+			}
+			TWeakObjectPtr<T> Weak(Self);
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak, RequestId](float) {
+				T* Owner = Weak.Get();
+				if (!Owner) {
+					return false;
+				}
+				FIpHttpClientState& S = Owner->State;
+				if (S.bInFlight && S.Queue.Num() > 0 && S.Queue[0].Id == RequestId) {
+					Detach(S);
+					FailFront(Owner, FErrorCode(MakeError(EError::TimedOut)));
+					Pump(Owner, S.Tls, S.bTls);
+				}
+				return false;
+			}), Seconds);
 		}
 
 		template <typename T>
@@ -153,6 +201,7 @@ namespace IPNet {
 				S.Net.Transport->Post([Parser, bHead]() { Parser->SetNoBody(bHead); });
 				if (S.Net.Transport->Send(MoveTemp(Bytes))) {
 					S.bInFlight = true;
+					ArmRequestTimeout(Self, Front.Id, Front.Request.TimeoutSeconds);
 					return;
 				}
 				FailFront(Self, FErrorCode(MakeError(EError::QueueFull)));
@@ -178,7 +227,8 @@ namespace IPNet {
 					Pump(Owner, Tls, bTls);
 				});
 			};
-			Events.OnData = [Weak, Id, Parser, Tls, bTls](const uint8* Data, size_t Size) {
+			std::shared_ptr<size_t> LastProgress = std::make_shared<size_t>(0);
+			Events.OnData = [Weak, Id, Parser, Tls, bTls, LastProgress](const uint8* Data, size_t Size) {
 				Parser->Append(Data, Size);
 				for (;;) {
 					const FHttpParser::EResult Result = Parser->Parse();
@@ -194,6 +244,19 @@ namespace IPNet {
 							OnResponse(Owner, Id, Response, Tls, bTls);
 						});
 						continue;
+					}
+					if (Result == FHttpParser::EResult::NeedMore) {
+						// Progress events at most every 64 KiB of body.
+						const size_t Received = Parser->BodyBytesSoFar();
+						if (Received >= *LastProgress + 64 * 1024) {
+							*LastProgress = Received;
+							const int64 Total = Parser->ExpectedBodyBytes();
+							RunOnGameThread(Weak, [Id, Received, Total](T* Owner) {
+								if (Owner->State.Net.SessionId == Id && Owner->State.bInFlight && Owner->State.Queue.Num() > 0) {
+									Owner->OnProgress.Broadcast(Owner->State.Queue[0].Id, static_cast<int64>(Received), Total);
+								}
+							});
+						}
 					}
 					if (Result == FHttpParser::EResult::Error) {
 						RunOnGameThread(Weak, [Id, Tls, bTls](T* Owner) {
@@ -250,10 +313,16 @@ namespace IPNet {
 			if (S.Net.SessionId != Id || !S.bInFlight || S.Queue.Num() == 0) {
 				return;
 			}
-			const FDelegateHttpClientResponse Callback = S.Queue[0].Callback;
+			const FIpHttpPendingRequest Finished = S.Queue[0];
+			const FDelegateHttpClientResponse Callback = Finished.Callback;
 			S.Queue.RemoveAt(0);
 			S.bInFlight = false;
 			++S.ResponsesOnConnection;
+
+			if (FollowRedirect(Self, Finished, Response)) {
+				Pump(Self, Tls, bTls);
+				return;
+			}
 
 			const FString* Connection = FindHeader(Response.Headers, TEXT("connection"));
 			const bool bKeepAlive = Response.Version == TEXT("1.0")
@@ -266,6 +335,51 @@ namespace IPNet {
 			Callback.ExecuteIfBound(FErrorCode(), Response);
 			// The callback may have destroyed state (e.g. Close()); Pump re-validates everything.
 			Pump(Self, Tls, bTls);
+		}
+
+		/**
+		 * Redirect handling (MaxRedirects > 0): a relative Location or an absolute one on the same host and
+		 * scheme is followed by queueing the request again at the front. 303 (and 301/302 after a POST) turn
+		 * into GET without a body, as browsers do.
+		 */
+		template <typename T>
+		static bool FollowRedirect(T* Self, const FIpHttpPendingRequest& Finished, const FHttpResponse& Response) {
+			const int32 Code = Response.Status_Code;
+			if (Self->MaxRedirects <= 0 || Finished.Redirects >= Self->MaxRedirects ||
+			    !(Code == 301 || Code == 302 || Code == 303 || Code == 307 || Code == 308)) {
+				return false;
+			}
+			const FString* Location = FindHeader(Response.Headers, TEXT("location"));
+			if (!Location || Location->IsEmpty()) {
+				return false;
+			}
+			FString Target = Location->TrimStartAndEnd();
+			if (Target.Contains(TEXT("://"))) {
+				FParsedHttpUrl Parsed;
+				if (!ParseHttpUrl(Target, Parsed) || Parsed.Scheme != (Self->State.bTls ? TEXT("https") : TEXT("http")) ||
+				    !Parsed.Host.Equals(Self->bind_options.Address, ESearchCase::IgnoreCase) ||
+				    FString::FromInt(Parsed.Port) != Self->bind_options.Port) {
+					return false; // another host: delivered as a response (call SetUrl and request again)
+				}
+				Target = Parsed.Target;
+			} else if (!Target.StartsWith(TEXT("/"))) {
+				return false;
+			}
+			FIpHttpPendingRequest Next = Finished;
+			++Next.Redirects;
+			FString Path = Target, Query;
+			Next.Request.Params.Reset();
+			if (Target.Split(TEXT("?"), &Path, &Query)) {
+				ParseQueryString(Query, Next.Request.Params);
+			}
+			Next.Request.Path = Path;
+			if (Code == 303 || ((Code == 301 || Code == 302) && Next.Request.Method == ERequestMethod::POST)) {
+				Next.Request.Method = ERequestMethod::GET;
+				Next.Request.Body.Reset();
+				Next.Request.BodyBytes.Reset();
+			}
+			Self->State.Queue.Insert(Next, 0);
+			return true;
 		}
 
 		static bool IsIdempotent(ERequestMethod Method) {
@@ -655,6 +769,62 @@ namespace IPNet {
 						Session->Resume();
 					}
 				});
+		}
+
+		// ---- streamed responses ----
+
+		template <typename TRemote>
+		static bool BeginStream(TRemote* Remote) {
+			if (!Remote->Net.Transport || !Remote->bResponsePending || Remote->bStreaming) {
+				return false;
+			}
+			Remote->bResponsePending = false;
+			Remote->bStreaming = true;
+			// HTTP/1.0 has no chunked encoding: the body ends when the connection closes.
+			Remote->bStreamChunked = Remote->Headers.Version != TEXT("1.0");
+			const FString* HandlerConnection = FindHeader(Remote->Headers.Headers, TEXT("Connection"));
+			if (!Remote->bStreamChunked || (HandlerConnection && HeaderHasToken(*HandlerConnection, TEXT("close")))) {
+				Remote->bWillClose = true;
+			}
+			return Remote->Net.Transport->Send(SerializeResponseHead(Remote->Headers, Remote->bStreamChunked, Remote->bWillClose));
+		}
+
+		template <typename TRemote>
+		static bool WriteChunk(TRemote* Remote, const uint8* Data, size_t Size) {
+			if (!Remote->Net.Transport || !Remote->bStreaming || Size == 0 || Remote->bHeadRequest) {
+				return Remote->bStreaming && Size == 0;
+			}
+			FBytes Bytes = Remote->bStreamChunked ? EncodeChunk(Data, Size) : FBytes(Data, Data + Size);
+			return Remote->Net.Transport->Send(MoveTemp(Bytes));
+		}
+
+		template <typename TRemote>
+		static bool EndStream(TRemote* Remote) {
+			if (!Remote->Net.Transport || !Remote->bStreaming) {
+				return false;
+			}
+			Remote->bStreaming = false;
+			std::weak_ptr<FHttpServerSession> WeakSession = Remote->Session;
+			std::weak_ptr<FTransport> WeakTransport = Remote->Net.Transport;
+			const bool bClose = Remote->bWillClose;
+			FBytes Tail = Remote->bStreamChunked ? EncodeChunk(nullptr, 0) : FBytes();
+			auto Finish = [WeakSession, WeakTransport, bClose](const asio::error_code& Ec, size_t) {
+				if (Ec) {
+					return;
+				}
+				if (bClose) {
+					if (std::shared_ptr<FTransport> Transport = WeakTransport.lock()) {
+						Transport->Close();
+					}
+				} else if (std::shared_ptr<FHttpServerSession> Session = WeakSession.lock()) {
+					Session->Resume();
+				}
+			};
+			if (Tail.empty()) {
+				Remote->Net.Transport->Close();
+				return true;
+			}
+			return Remote->Net.Transport->Send(MoveTemp(Tail), Finish);
 		}
 
 		template <typename TRemote>

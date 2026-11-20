@@ -52,6 +52,17 @@ namespace IPNet {
 		/** Datagrams dropped so far (truncated or over the pending limit). Any thread. */
 		uint64 DroppedDatagrams() const { return Dropped.load(std::memory_order_relaxed); }
 
+		/** Before Connect / Bind: OS buffers (0 = default) and the client's local endpoint. */
+		void SetSocketBuffers(int32 ReceiveBytes, int32 SendBytes) { SockReceive = ReceiveBytes; SockSend = SendBytes; }
+		void SetLocalEndpoint(const asio::ip::udp::endpoint& Endpoint) { LocalRequested = Endpoint; bLocalRequested = true; }
+
+		/** Socket options applied on the strand; errors are reported through OnError. Any thread. */
+		void SetBroadcast(bool bEnable);
+		void JoinGroup(const asio::ip::address& Group);
+		void LeaveGroup(const asio::ip::address& Group);
+		void SetMulticastTtl(int32 Hops);
+		void SetMulticastLoopback(bool bEnable);
+
 		void Close();
 		virtual void abort() override { Close(); }
 
@@ -81,6 +92,12 @@ namespace IPNet {
 		bool bConnected = false;
 
 		void ConfigureSocket();
+		template <typename TOption>
+		void PostOption(TOption Option);
+		int32 SockReceive = 0;
+		int32 SockSend = 0;
+		asio::ip::udp::endpoint LocalRequested;
+		bool bLocalRequested = false;
 		void CountDrop(const TCHAR* Why);
 
 		static constexpr size_t MaxPendingBytes = 16u * 1024u * 1024u;

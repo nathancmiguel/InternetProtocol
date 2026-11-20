@@ -168,6 +168,35 @@ public:
 		Remote->Write(FDelegateHttpRemoteMessageSent());
 	}
 
+	// ---- Phase 3 ----
+	int32 Progress = 0;
+	UFUNCTION() void OnProgressEvent(int32 RequestId, int64 BytesSoFar, int64 Total) { ++Progress; }
+	UFUNCTION() void OnHttpEchoBytes(const FHttpRequest& Request, UHttpRemote* Remote) {
+		Remote->Headers.BodyBytes = Request.BodyBytes;
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
+	UFUNCTION() void OnHttpRedirect(const FHttpRequest& Request, UHttpRemote* Remote) {
+		Remote->Headers.Status_Code = 302;
+		Remote->Headers.Headers.Add(TEXT("Location"), TEXT("/new?from=old"));
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
+	UFUNCTION() void OnHttpNew(const FHttpRequest& Request, UHttpRemote* Remote) {
+		const FString* From = Request.Params.Find(TEXT("from"));
+		Remote->Headers.Body = FString::Printf(TEXT("new from %s"), From ? **From : TEXT("?"));
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
+	UFUNCTION() void OnHttpBig(const FHttpRequest& Request, UHttpRemote* Remote) {
+		Remote->Headers.Body = FString::ChrN(1024 * 1024, TEXT('z'));
+		Remote->Write(FDelegateHttpRemoteMessageSent());
+	}
+	UFUNCTION() void OnHttpStream(const FHttpRequest& Request, UHttpRemote* Remote) {
+		Remote->BeginStream();
+		Remote->WriteChunk(TEXT("a"));
+		Remote->WriteChunk(TEXT("bc"));
+		Remote->WriteChunk(TEXT("def"));
+		Remote->EndStream();
+	}
+
 	// ---- WebSocket extras ----
 	int32 Pongs = 0;
 	int32 Upgrades = 0;

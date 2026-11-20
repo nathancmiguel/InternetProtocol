@@ -159,3 +159,37 @@ FString UWSClientSsl::GetSubProtocol() {
 float UWSClientSsl::GetRoundTripTimeMs() {
 	return State.RoundTripMs;
 }
+
+bool UWSClient::ConnectUrl(const FString& Url) {
+	IPNet::FParsedHttpUrl Parsed;
+	if (!IPNet::ParseHttpUrl(Url, Parsed) || Parsed.Scheme != TEXT("ws")) {
+		UE_LOG(LogAsio, Warning, TEXT("WebSocket ConnectUrl: expected a ws:// URL."));
+		return false;
+	}
+	Handshake.Path = Parsed.Target;
+	FClientBindOptions Options;
+	Options.Address = Parsed.Host;
+	Options.Port = FString::FromInt(Parsed.Port);
+	return Connect(Options);
+}
+
+FConnectionStats UWSClient::GetStats() {
+	return FWsAccess::Stats(this);
+}
+
+bool UWSClientSsl::ConnectUrl(const FString& Url) {
+	IPNet::FParsedHttpUrl Parsed;
+	if (!IPNet::ParseHttpUrl(Url, Parsed) || Parsed.Scheme != TEXT("wss")) {
+		UE_LOG(LogAsio, Warning, TEXT("WebSocket ConnectUrl: expected a wss:// URL."));
+		return false;
+	}
+	Handshake.Path = Parsed.Target;
+	FClientBindOptions Options;
+	Options.Address = Parsed.Host;
+	Options.Port = FString::FromInt(Parsed.Port);
+	return Connect(Options);
+}
+
+FConnectionStats UWSClientSsl::GetStats() {
+	return FWsAccess::Stats(this);
+}

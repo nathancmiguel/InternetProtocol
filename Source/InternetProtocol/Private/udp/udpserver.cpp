@@ -87,6 +87,7 @@ bool UUDPServer::Bind(const FServerBindOptions& BindOpts) {
 		return false;
 	}
 	Socket->SetFlowControl(Flow);
+	Socket->SetSocketBuffers(BindOpts.SocketReceiveBufferBytes, BindOpts.SocketSendBufferBytes);
 
 	asio::ip::address Address;
 	asio::error_code Ec;
@@ -115,4 +116,48 @@ bool UUDPServer::Bind(const FServerBindOptions& BindOpts) {
 
 void UUDPServer::Close() {
 	FFacadeAccess::CloseUdp(Net);
+}
+
+namespace {
+	bool ParseGroup(const FString& Text, asio::ip::address& Out) {
+		asio::error_code Ec;
+		Out = asio::ip::make_address(TCHAR_TO_UTF8(*Text), Ec);
+		return !Ec && Out.is_multicast();
+	}
+}
+
+void UUDPServer::SetBroadcast(bool bEnable) {
+	if (Net.Socket) {
+		Net.Socket->SetBroadcast(bEnable);
+	}
+}
+
+bool UUDPServer::JoinMulticastGroup(const FString& GroupAddress) {
+	asio::ip::address Group;
+	if (!Net.Socket || !ParseGroup(GroupAddress, Group)) {
+		return false;
+	}
+	Net.Socket->JoinGroup(Group);
+	return true;
+}
+
+bool UUDPServer::LeaveMulticastGroup(const FString& GroupAddress) {
+	asio::ip::address Group;
+	if (!Net.Socket || !ParseGroup(GroupAddress, Group)) {
+		return false;
+	}
+	Net.Socket->LeaveGroup(Group);
+	return true;
+}
+
+void UUDPServer::SetMulticastTTL(int32 Hops) {
+	if (Net.Socket) {
+		Net.Socket->SetMulticastTtl(Hops);
+	}
+}
+
+void UUDPServer::SetMulticastLoopback(bool bEnable) {
+	if (Net.Socket) {
+		Net.Socket->SetMulticastLoopback(bEnable);
+	}
 }

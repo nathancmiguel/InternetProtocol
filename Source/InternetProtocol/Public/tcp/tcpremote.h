@@ -37,6 +37,10 @@ public:
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	FErrorCode GetErrorCode();
+	/** Traffic counters of the current connection. */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|TCP")
+	FConnectionStats GetStats();
+
 
 	UFUNCTION(BlueprintCallable, Category = "IP|TCP")
 	bool Write(const FString &Message, const FDelegateTcpRemoteMessageSent &Callback);
@@ -88,6 +92,10 @@ public:
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|TCP")
 	FErrorCode GetErrorCode();
+	/** Traffic counters of the current connection. */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|TCP")
+	FConnectionStats GetStats();
+
 
 	UFUNCTION(BlueprintCallable, Category = "IP|TCP")
 	bool Write(const FString &Message, const FDelegateTcpRemoteMessageSent &Callback);

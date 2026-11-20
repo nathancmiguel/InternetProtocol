@@ -79,6 +79,29 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
 	bool Connect(const FClientBindOptions &BindOpts);
+	/** Connects to "ws://host[:port]/path?query" (or wss:// with UWSClientSsl); the path goes to Handshake.Path. */
+	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
+	bool ConnectUrl(const FString& Url);
+
+	/** Sends a Ping after this much silence (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float PingIntervalSeconds = 20.0f;
+
+	/** Closes the connection (TimedOut) after this much time without any frame from the server (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float IdleTimeoutSeconds = 60.0f;
+
+	/** Connects again after an unexpected close (not after Close / End), waiting 1, 2, 4... s. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	bool bAutoReconnect = false;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float ReconnectMaxDelaySeconds = 30.0f;
+
+	/** Traffic counters of the current connection (with the last ping round trip). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FConnectionStats GetStats();
+
 
 	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
 	void End(int code, const FString &reason);
@@ -175,6 +198,29 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
 	bool Connect(const FClientBindOptions &BindOpts);
+	/** Connects to "ws://host[:port]/path?query" (or wss:// with UWSClientSsl); the path goes to Handshake.Path. */
+	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
+	bool ConnectUrl(const FString& Url);
+
+	/** Sends a Ping after this much silence (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float PingIntervalSeconds = 20.0f;
+
+	/** Closes the connection (TimedOut) after this much time without any frame from the server (0 = never). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float IdleTimeoutSeconds = 60.0f;
+
+	/** Connects again after an unexpected close (not after Close / End), waiting 1, 2, 4... s. */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	bool bAutoReconnect = false;
+
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|Websocket")
+	float ReconnectMaxDelaySeconds = 30.0f;
+
+	/** Traffic counters of the current connection (with the last ping round trip). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FConnectionStats GetStats();
+
 
 	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
 	void End(int code, const FString &reason);

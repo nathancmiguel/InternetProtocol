@@ -46,6 +46,25 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "IP|UDP")
 	void SetRecvBufferSize(int Val);
+	/** Allows sending to broadcast addresses (e.g. 255.255.255.255 or 192.168.1.255). */
+	UFUNCTION(BlueprintCallable, Category = "IP|UDP")
+	void SetBroadcast(bool bEnable);
+
+	/** Joins a multicast group (e.g. "239.0.0.1" or "ff02::1"); errors are reported through OnError. */
+	UFUNCTION(BlueprintCallable, Category = "IP|UDP")
+	bool JoinMulticastGroup(const FString& GroupAddress);
+
+	UFUNCTION(BlueprintCallable, Category = "IP|UDP")
+	bool LeaveMulticastGroup(const FString& GroupAddress);
+
+	/** Hops of outgoing multicast datagrams (1 = local network only). */
+	UFUNCTION(BlueprintCallable, Category = "IP|UDP")
+	void SetMulticastTTL(int32 Hops);
+
+	/** Whether multicast datagrams sent by this host are received by it too. */
+	UFUNCTION(BlueprintCallable, Category = "IP|UDP")
+	void SetMulticastLoopback(bool bEnable);
+
 
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|UDP")
 	int GetRecvBufferSize();

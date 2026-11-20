@@ -207,8 +207,60 @@ namespace IPNet {
 		}
 	}
 
+	bool ParseHttpUrl(const FString& Url, FParsedHttpUrl& Out) {
+		FString Rest;
+		if (!Url.Split(TEXT("://"), &Out.Scheme, &Rest) || Rest.IsEmpty()) {
+			return false;
+		}
+		Out.Scheme.ToLowerInline();
+		const bool bSecure = Out.Scheme == TEXT("https") || Out.Scheme == TEXT("wss");
+		if (!bSecure && Out.Scheme != TEXT("http") && Out.Scheme != TEXT("ws")) {
+			return false;
+		}
+		int32 TargetAt = INDEX_NONE;
+		for (int32 Index = 0; Index < Rest.Len(); ++Index) {
+			if (Rest[Index] == TEXT('/') || Rest[Index] == TEXT('?')) {
+				TargetAt = Index;
+				break;
+			}
+		}
+		FString Authority = TargetAt == INDEX_NONE ? Rest : Rest.Left(TargetAt);
+		Out.Target = TargetAt == INDEX_NONE ? FString(TEXT("/")) : Rest.Mid(TargetAt);
+		if (Out.Target.StartsWith(TEXT("?"))) {
+			Out.Target = TEXT("/") + Out.Target;
+		}
+		int32 At;
+		if (Authority.FindLastChar(TEXT('@'), At)) {
+			Authority.RightChopInline(At + 1); // credentials are not supported in the URL
+		}
+		Out.Port = bSecure ? 443 : 80;
+		if (Authority.StartsWith(TEXT("["))) {
+			int32 Close;
+			if (!Authority.FindChar(TEXT(']'), Close)) {
+				return false;
+			}
+			Out.Host = Authority.Mid(1, Close - 1);
+			const FString After = Authority.Mid(Close + 1);
+			if (After.StartsWith(TEXT(":"))) {
+				Out.Port = FCString::Atoi(*After.Mid(1));
+			}
+		} else {
+			FString PortText;
+			if (Authority.Split(TEXT(":"), &Out.Host, &PortText, ESearchCase::CaseSensitive, ESearchDir::FromEnd)) {
+				if (!PortText.IsNumeric()) {
+					return false;
+				}
+				Out.Port = FCString::Atoi(*PortText);
+			} else {
+				Out.Host = Authority;
+			}
+		}
+		return !Out.Host.IsEmpty() && Out.Port > 0 && Out.Port <= 65535;
+	}
+
 	FBytes SerializeRequest(const FHttpRequest& Request, const FString& Host) {
-		const FBytes Body = ToUtf8(Request.Body);
+		const FBytes Body = Request.BodyBytes.Num() > 0 ? FBytes(Request.BodyBytes.GetData(), Request.BodyBytes.GetData() + Request.BodyBytes.Num())
+		                                                : ToUtf8(Request.Body);
 		FString Target = Request.Path.IsEmpty() ? FString(TEXT("/")) : Request.Path;
 		if (Request.Params.Num() > 0) {
 			Target += Target.Contains(TEXT("?")) ? TEXT("&") : TEXT("?");
@@ -251,8 +303,40 @@ namespace IPNet {
 		return Out;
 	}
 
+	FBytes SerializeResponseHead(const FHttpResponse& Response, bool bChunked, bool bClose) {
+		const FString Version = Response.Version.IsEmpty() ? FString(TEXT("1.1")) : Response.Version;
+		const FString Message = Response.Status_Message.IsEmpty() ? GetHttpStatusMessage(Response.Status_Code) : Response.Status_Message;
+		FString Head = FString::Printf(TEXT("HTTP/%s %d "), *Version, Response.Status_Code) + Message + TEXT("\r\n");
+		auto Skip = [](const FString& Key) {
+			return Key.Equals(TEXT("Content-Length"), ESearchCase::IgnoreCase) || Key.Equals(TEXT("Connection"), ESearchCase::IgnoreCase) ||
+			       Key.Equals(TEXT("Transfer-Encoding"), ESearchCase::IgnoreCase);
+		};
+		AppendHeaders(Head, Response.Headers, Skip);
+		AppendHeaderList(Head, Response.HeaderList, Skip);
+		if (bChunked) {
+			Head += TEXT("Transfer-Encoding: chunked\r\n");
+		}
+		if (bClose) {
+			Head += TEXT("Connection: close\r\n");
+		}
+		Head += TEXT("\r\n");
+		FBytes Out;
+		AppendAscii(Out, Head);
+		return Out;
+	}
+
+	FBytes EncodeChunk(const uint8* Data, size_t Size) {
+		FBytes Out;
+		AppendAscii(Out, FString::Printf(TEXT("%llx\r\n"), static_cast<uint64>(Size)));
+		Out.insert(Out.end(), Data, Data + Size);
+		Out.push_back('\r');
+		Out.push_back('\n');
+		return Out;
+	}
+
 	FBytes SerializeResponse(const FHttpResponse& Response, bool bOmitBody, bool bClose) {
-		const FBytes Body = ToUtf8(Response.Body);
+		const FBytes Body = Response.BodyBytes.Num() > 0 ? FBytes(Response.BodyBytes.GetData(), Response.BodyBytes.GetData() + Response.BodyBytes.Num())
+		                                                 : ToUtf8(Response.Body);
 		const FString Version = Response.Version.IsEmpty() ? FString(TEXT("1.1")) : Response.Version;
 		const FString Message = Response.Status_Message.IsEmpty() ? GetHttpStatusMessage(Response.Status_Code) : Response.Status_Message;
 		FString Head = FString::Printf(TEXT("HTTP/%s %d "), *Version, Response.Status_Code) + Message + TEXT("\r\n");
@@ -321,6 +405,7 @@ namespace IPNet {
 		HeaderScan = 0;
 		TrailerBytes = 0;
 		TrailerLines = 0;
+		ExpectedLength = -1;
 		ErrorStatus = 400;
 		ErrorMessage.Reset();
 	}
@@ -481,6 +566,7 @@ namespace IPNet {
 				return Fail(400, TEXT("invalid Content-Length"));
 			}
 			const uint64 Length = FCString::Strtoui64(**ContentLength, nullptr, 10);
+			ExpectedLength = static_cast<int64>(Length);
 			if (Length > Limits.MaxBodyBytes) {
 				return Fail(413, TEXT("body too large"));
 			}
@@ -678,7 +764,9 @@ namespace IPNet {
 	void FHttpParser::FinishBody() {
 		Phase = EPhase::Done;
 		FString& Target = Mode == EMode::Request ? Request.Body : Response.Body;
+		TArray<uint8>& Bytes = Mode == EMode::Request ? Request.BodyBytes : Response.BodyBytes;
 		Target = FromUtf8(Body.data(), Body.size());
+		Bytes = TArray<uint8>(Body.data(), static_cast<int32>(Body.size()));
 		Body.clear();
 		Body.shrink_to_fit();
 	}

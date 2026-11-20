@@ -38,6 +38,10 @@ public:
 	/** Round trip of the last Ping answered by a Pong, in ms (-1: none yet). */
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
 	float GetRoundTripTimeMs();
+	/** Traffic counters of the current connection (with the last ping round trip). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FConnectionStats GetStats();
+
 
 	/** Server with OnUpgradeRequest bound: accepts the pending upgrade request. */
 	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
@@ -123,6 +127,10 @@ public:
 	/** Round trip of the last Ping answered by a Pong, in ms (-1: none yet). */
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
 	float GetRoundTripTimeMs();
+	/** Traffic counters of the current connection (with the last ping round trip). */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|Websocket")
+	FConnectionStats GetStats();
+
 
 	/** Server with OnUpgradeRequest bound: accepts the pending upgrade request. */
 	UFUNCTION(BlueprintCallable, Category = "IP|Websocket")
