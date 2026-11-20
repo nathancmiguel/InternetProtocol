@@ -59,8 +59,16 @@ bool UWSClient::Pong(const FDelegateWsClientMessageSent& Callback) {
 	return FWsAccess::Control(this, EOpcode::PONG, Callback);
 }
 
+void UWSClient::SetTlsOptions(const FSecurityContextOpts& SecOpts) {
+	Tls = IPNet::MakeTlsConfig(SecOpts, false);
+	bUseTls = true;
+}
+
 bool UWSClient::Connect(const FClientBindOptions& BindOpts) {
-	return FWsAccess::Connect(this, BindOpts, nullptr, false);
+	if (bUseTls && !Tls) {
+		Tls = IPNet::GetDefaultClientTlsConfig();
+	}
+	return FWsAccess::Connect(this, BindOpts, Tls, bUseTls);
 }
 
 void UWSClient::End(int code, const FString& reason) {
@@ -73,77 +81,6 @@ void UWSClient::Close(int code, const FString& reason) {
 
 // ---------------------------------------------------------------------------------------------------------
 
-void UWSClientSsl::Construct(const FSecurityContextOpts& SecOpts) {
-	Tls = IPNet::MakeTlsConfig(SecOpts, false);
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// UWSClientSsl
-
-void UWSClientSsl::BeginDestroy() {
-	FWsAccess::Release(this);
-	Super::BeginDestroy();
-}
-
-void UWSClientSsl::AddToRoot() {
-	Super::AddToRoot();
-}
-
-void UWSClientSsl::RemoveFromRoot() {
-	Super::RemoveFromRoot();
-}
-
-bool UWSClientSsl::IsRooted() {
-	return Super::IsRooted();
-}
-
-bool UWSClientSsl::IsOpen() {
-	return FWsAccess::IsOpen(this);
-}
-
-FTcpEndpoint UWSClientSsl::LocalEndpoint() {
-	return State.Net.Local;
-}
-
-FTcpEndpoint UWSClientSsl::RemoteEndpoint() {
-	return State.Net.Remote;
-}
-
-FErrorCode UWSClientSsl::GetErrorCode() {
-	return State.Net.LastError;
-}
-
-bool UWSClientSsl::Write(const FString& Message, const FDataframe& Dataframe, const FDelegateWsClientMessageSent& Callback) {
-	return FWsAccess::Write(this, Message, Dataframe, Callback);
-}
-
-bool UWSClientSsl::WriteBuffer(const TArray<uint8>& Buffer, const FDataframe& Dataframe, const FDelegateWsClientMessageSent& Callback) {
-	return FWsAccess::WriteBuffer(this, Buffer, Dataframe, Callback);
-}
-
-bool UWSClientSsl::Ping(const FDelegateWsClientMessageSent& Callback) {
-	return FWsAccess::Control(this, EOpcode::PING, Callback);
-}
-
-bool UWSClientSsl::Pong(const FDelegateWsClientMessageSent& Callback) {
-	return FWsAccess::Control(this, EOpcode::PONG, Callback);
-}
-
-bool UWSClientSsl::Connect(const FClientBindOptions& BindOpts) {
-	if (!Tls) {
-		Tls = IPNet::GetDefaultClientTlsConfig();
-	}
-	return FWsAccess::Connect(this, BindOpts, Tls, true);
-}
-
-void UWSClientSsl::End(int code, const FString& reason) {
-	FWsAccess::End(this, code, reason);
-}
-
-void UWSClientSsl::Close(int code, const FString& reason) {
-	FWsAccess::Close(this, code, reason);
-}
-
 FString UWSClient::GetSubProtocol() {
 	return State.SubProtocol;
 }
@@ -152,44 +89,29 @@ float UWSClient::GetRoundTripTimeMs() {
 	return State.RoundTripMs;
 }
 
-FString UWSClientSsl::GetSubProtocol() {
-	return State.SubProtocol;
-}
-
-float UWSClientSsl::GetRoundTripTimeMs() {
-	return State.RoundTripMs;
-}
-
 bool UWSClient::ConnectUrl(const FString& Url) {
 	IPNet::FParsedHttpUrl Parsed;
-	if (!IPNet::ParseHttpUrl(Url, Parsed) || Parsed.Scheme != TEXT("ws")) {
-		UE_LOG(LogAsio, Warning, TEXT("WebSocket ConnectUrl: expected a ws:// URL."));
+	if (!IPNet::ParseHttpUrl(Url, Parsed) || (Parsed.Scheme != TEXT("ws") && Parsed.Scheme != TEXT("wss"))) {
+		UE_LOG(LogAsio, Warning, TEXT("WebSocket ConnectUrl: expected a ws:// or wss:// URL."));
 		return false;
 	}
+	// The scheme decides: wss:// turns TLS on, ws:// off (only if the connection actually starts).
+	const bool bPreviousTls = bUseTls;
+	const FString PreviousPath = Handshake.Path;
+	bUseTls = Parsed.Scheme == TEXT("wss");
 	Handshake.Path = Parsed.Target;
 	FClientBindOptions Options;
 	Options.Address = Parsed.Host;
 	Options.Port = FString::FromInt(Parsed.Port);
-	return Connect(Options);
+	if (!Connect(Options)) {
+		bUseTls = bPreviousTls;
+		Handshake.Path = PreviousPath;
+		return false;
+	}
+	return true;
 }
 
 FConnectionStats UWSClient::GetStats() {
 	return FWsAccess::Stats(this);
 }
 
-bool UWSClientSsl::ConnectUrl(const FString& Url) {
-	IPNet::FParsedHttpUrl Parsed;
-	if (!IPNet::ParseHttpUrl(Url, Parsed) || Parsed.Scheme != TEXT("wss")) {
-		UE_LOG(LogAsio, Warning, TEXT("WebSocket ConnectUrl: expected a wss:// URL."));
-		return false;
-	}
-	Handshake.Path = Parsed.Target;
-	FClientBindOptions Options;
-	Options.Address = Parsed.Host;
-	Options.Port = FString::FromInt(Parsed.Port);
-	return Connect(Options);
-}
-
-FConnectionStats UWSClientSsl::GetStats() {
-	return FWsAccess::Stats(this);
-}

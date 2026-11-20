@@ -73,7 +73,7 @@ TSharedPtr<FJsonObject> UJavaScriptObjectNotation::GetJsonObject()
 	return Json;
 }
 
-void UJavaScriptObjectNotation::ConstructJson(TEnumAsByte<EOutputExecPins>& Output)
+void UJavaScriptObjectNotation::ConstructJson(EOutputExecPins& Output)
 {
 	if (Json.IsValid()) Reset();
 	Json = MakeShareable(new FJsonObject());
@@ -85,7 +85,7 @@ void UJavaScriptObjectNotation::ConstructJson(TEnumAsByte<EOutputExecPins>& Outp
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::ConstructJsonFromString(TEnumAsByte<EOutputExecPins>& Output, const FString& Data)
+void UJavaScriptObjectNotation::ConstructJsonFromString(EOutputExecPins& Output, const FString& Data)
 {
 	if (Json.IsValid()) Reset();
 	TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(Data);
@@ -269,7 +269,7 @@ void UJavaScriptObjectNotation::SetObjectArrayField(const FString& FieldName, co
 	Json->SetArrayField(FieldName, JsonArray);
 }
 
-void UJavaScriptObjectNotation::TryGetBoolField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, bool& Value)
+void UJavaScriptObjectNotation::TryGetBoolField(EOutputExecPins& Output, const FString& FieldName, bool& Value)
 {
 	Value = false;
 	if (!Json.IsValid())
@@ -285,7 +285,7 @@ void UJavaScriptObjectNotation::TryGetBoolField(TEnumAsByte<EOutputExecPins>& Ou
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetByteField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, uint8& Value)
+void UJavaScriptObjectNotation::TryGetByteField(EOutputExecPins& Output, const FString& FieldName, uint8& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -302,7 +302,7 @@ void UJavaScriptObjectNotation::TryGetByteField(TEnumAsByte<EOutputExecPins>& Ou
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetIntegerField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, int& Value)
+void UJavaScriptObjectNotation::TryGetIntegerField(EOutputExecPins& Output, const FString& FieldName, int& Value)
 {
 	if (!Json.IsValid()) 
 	{
@@ -317,7 +317,7 @@ void UJavaScriptObjectNotation::TryGetIntegerField(TEnumAsByte<EOutputExecPins>&
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetInteger64Field(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, int64& Value)
+void UJavaScriptObjectNotation::TryGetInteger64Field(EOutputExecPins& Output, const FString& FieldName, int64& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -332,7 +332,7 @@ void UJavaScriptObjectNotation::TryGetInteger64Field(TEnumAsByte<EOutputExecPins
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetFloatField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, float& Value)
+void UJavaScriptObjectNotation::TryGetFloatField(EOutputExecPins& Output, const FString& FieldName, float& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -349,7 +349,7 @@ void UJavaScriptObjectNotation::TryGetFloatField(TEnumAsByte<EOutputExecPins>& O
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetStringField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, FString& Value)
+void UJavaScriptObjectNotation::TryGetStringField(EOutputExecPins& Output, const FString& FieldName, FString& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -364,7 +364,7 @@ void UJavaScriptObjectNotation::TryGetStringField(TEnumAsByte<EOutputExecPins>& 
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetObjectField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, UJavaScriptObjectNotation*& Value)
+void UJavaScriptObjectNotation::TryGetObjectField(EOutputExecPins& Output, const FString& FieldName, UJavaScriptObjectNotation*& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -388,7 +388,7 @@ void UJavaScriptObjectNotation::TryGetObjectField(TEnumAsByte<EOutputExecPins>& 
 	Output = EOutputExecPins::Success;
 }
 
-void UJavaScriptObjectNotation::TryGetBoolArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<bool>& Value)
+void UJavaScriptObjectNotation::TryGetBoolArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<bool>& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -414,7 +414,7 @@ void UJavaScriptObjectNotation::TryGetBoolArrayField(TEnumAsByte<EOutputExecPins
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetByteArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<uint8>& Value)
+void UJavaScriptObjectNotation::TryGetByteArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<uint8>& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -440,7 +440,7 @@ void UJavaScriptObjectNotation::TryGetByteArrayField(TEnumAsByte<EOutputExecPins
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetIntegerArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<int>& Value)
+void UJavaScriptObjectNotation::TryGetIntegerArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<int>& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -465,7 +465,7 @@ void UJavaScriptObjectNotation::TryGetIntegerArrayField(TEnumAsByte<EOutputExecP
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetInteger64ArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<int64>& Value)
+void UJavaScriptObjectNotation::TryGetInteger64ArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<int64>& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -491,7 +491,7 @@ void UJavaScriptObjectNotation::TryGetInteger64ArrayField(TEnumAsByte<EOutputExe
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetFloatArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<float>& Value)
+void UJavaScriptObjectNotation::TryGetFloatArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<float>& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -517,7 +517,7 @@ void UJavaScriptObjectNotation::TryGetFloatArrayField(TEnumAsByte<EOutputExecPin
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetStringArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<FString>& Value)
+void UJavaScriptObjectNotation::TryGetStringArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<FString>& Value)
 {
 	if (!Json.IsValid())
 	{
@@ -532,7 +532,7 @@ void UJavaScriptObjectNotation::TryGetStringArrayField(TEnumAsByte<EOutputExecPi
 	Output = EOutputExecPins::Failure;
 }
 
-void UJavaScriptObjectNotation::TryGetObjectArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<UJavaScriptObjectNotation*>& Value)
+void UJavaScriptObjectNotation::TryGetObjectArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<UJavaScriptObjectNotation*>& Value)
 {
 	if (!Json.IsValid())
 	{

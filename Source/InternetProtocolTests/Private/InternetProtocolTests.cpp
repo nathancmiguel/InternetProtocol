@@ -1475,7 +1475,7 @@ bool FIPWsReconnectTest::RunTest(const FString& Parameters) {
 	}
 	const int32 Port = Server->LocalEndpoint().Port;
 	TestTrue(TEXT("ConnectUrl"), Client->ConnectUrl(FString::Printf(TEXT("ws://127.0.0.1:%d/chat?room=1"), Port)));
-	TestFalse(TEXT("Wrong scheme refused"), Client->ConnectUrl(TEXT("wss://127.0.0.1:1/")));
+	TestFalse(TEXT("Wrong scheme refused"), Client->ConnectUrl(TEXT("http://127.0.0.1:1/")));
 	WaitUntil(this, TEXT("first connection"), [L]() { return L->Connected == 1; });
 	Then([Server]() { Server->Close(); }); // remotes end with 1001: an unexpected close for the client
 	WaitUntil(this, TEXT("client notices"), [L]() { return L->Closed == 1; });
@@ -1559,8 +1559,10 @@ bool FIPHttpFeaturesTest::RunTest(const FString& Parameters) {
 	if (!TestTrue(TEXT("HTTP server opens"), Server->Open(Loopback()))) {
 		return false;
 	}
+	TestTrue(TEXT("https URL turns TLS on"), Client->SetUrl(TEXT("https://127.0.0.1:1/")) && Client->bUseTls);
+	TestFalse(TEXT("Unknown scheme refused"), Client->SetUrl(TEXT("ftp://127.0.0.1/")));
 	TestTrue(TEXT("SetUrl"), Client->SetUrl(FString::Printf(TEXT("http://127.0.0.1:%d/ignored"), Server->LocalEndpoint().Port)));
-	TestFalse(TEXT("SetUrl refuses https on UHttpClient"), Client->SetUrl(TEXT("https://127.0.0.1:1/")));
+	TestFalse(TEXT("http URL turns TLS off"), Client->bUseTls);
 	Client->MaxRedirects = 3;
 	Client->OnProgress.AddDynamic(L, &UIPTestListener::OnProgressEvent);
 	FDelegateHttpClientResponse OnResponse;

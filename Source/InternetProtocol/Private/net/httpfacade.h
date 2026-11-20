@@ -478,7 +478,7 @@ namespace IPNet {
 		// TFunction<void()> OnClosedNative; OnClose(); OnError(Error).
 
 		template <typename TServer, typename TRemote>
-		static TRemote* AdoptRemote(TServer* Server, TSet<TRemote*>& Clients, asio::ip::tcp::socket&& Socket,
+		static TRemote* AdoptRemote(TServer* Server, TSet<TObjectPtr<TRemote>>& Clients, asio::ip::tcp::socket&& Socket,
 		                            const std::shared_ptr<const FTlsConfig>& Tls, bool bTls) {
 			TRemote* Remote = NewObject<TRemote>(Server);
 			const uint64 Id = NextSessionId();

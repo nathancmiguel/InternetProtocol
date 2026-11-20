@@ -65,7 +65,7 @@ template <typename Exception>
 }
 
 UENUM(Blueprintable, Category="IP|ENUM|Common")
-enum EOutputExecPins {
+enum class EOutputExecPins : uint8 {
 	Success,
 	Failure,
 };
@@ -273,9 +273,6 @@ struct FDataframe {
 	UPROPERTY(BlueprintReadWrite, Category = "IP|DataFrame")
 	bool bMask = true;
 
-	EOpcode Opcode = EOpcode::TEXT_FRAME;
-	uint64 Length = 0;
-	std::array<uint8, 4> masking_key{};
 };
 
 UENUM(Blueprintable, Category="IP|ENUM|Common")

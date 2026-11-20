@@ -1,4 +1,4 @@
-﻿/** 
+/** 
  * Copyright © 2025 Nathan Miguel
  */
 
@@ -25,10 +25,10 @@ public:
 
 public:
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void ConstructJson(TEnumAsByte<EOutputExecPins>& Output);
+	void ConstructJson(EOutputExecPins& Output);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void ConstructJsonFromString(TEnumAsByte<EOutputExecPins>& Output, const FString& Data);
+	void ConstructJsonFromString(EOutputExecPins& Output, const FString& Data);
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP||Json")
 	FString ToString();
@@ -88,46 +88,46 @@ public:
 	void SetObjectArrayField(const FString& FieldName, const TArray<UJavaScriptObjectNotation*>& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetBoolField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, bool& Value);
+	void TryGetBoolField(EOutputExecPins& Output, const FString& FieldName, bool& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetByteField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, uint8& Value);
+	void TryGetByteField(EOutputExecPins& Output, const FString& FieldName, uint8& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetIntegerField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, int& Value);
+	void TryGetIntegerField(EOutputExecPins& Output, const FString& FieldName, int& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetInteger64Field(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, int64& Value);
+	void TryGetInteger64Field(EOutputExecPins& Output, const FString& FieldName, int64& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetFloatField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, float& Value);
+	void TryGetFloatField(EOutputExecPins& Output, const FString& FieldName, float& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetStringField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, FString& Value);
+	void TryGetStringField(EOutputExecPins& Output, const FString& FieldName, FString& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetObjectField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, UJavaScriptObjectNotation*& Value);
+	void TryGetObjectField(EOutputExecPins& Output, const FString& FieldName, UJavaScriptObjectNotation*& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetBoolArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<bool>& Value);
+	void TryGetBoolArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<bool>& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetByteArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<uint8>& Value);
+	void TryGetByteArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<uint8>& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetIntegerArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<int>& Value);
+	void TryGetIntegerArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<int>& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetInteger64ArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<int64>& Value);
+	void TryGetInteger64ArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<int64>& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetFloatArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<float>& Value);
+	void TryGetFloatArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<float>& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetStringArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<FString>& Value);
+	void TryGetStringArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<FString>& Value);
 
 	UFUNCTION(BlueprintCallable, Category = "IP||Json", meta = (ExpandEnumAsExecs = "Output"))
-	void TryGetObjectArrayField(TEnumAsByte<EOutputExecPins>& Output, const FString& FieldName, TArray<UJavaScriptObjectNotation*>& Value);
+	void TryGetObjectArrayField(EOutputExecPins& Output, const FString& FieldName, TArray<UJavaScriptObjectNotation*>& Value);
 
 private:
 	TSharedPtr<FJsonObject> Json;

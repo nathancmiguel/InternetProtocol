@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 3,
-	"VersionName": "3.1.0",
+	"Version": 4,
+	"VersionName": "4.0.0",
 	"FriendlyName": "Internet Protocol",
 	"Description": "UDP, TCP, HTTP, Websocket, RTMP and TLS connections, plus RTMP audio/video receive and publish.",
 	"Category": "Online",

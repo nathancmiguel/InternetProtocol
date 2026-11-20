@@ -26,13 +26,13 @@ public:
 
 	virtual void BeginDestroy() override;
 
-	UFUNCTION(blueprintcallable, Category = "IP|UDP")
+	UFUNCTION(blueprintcallable, Category = "IP|UDP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	void AddToRoot();
 
-	UFUNCTION(blueprintcallable, Category = "IP|UDP")
+	UFUNCTION(blueprintcallable, Category = "IP|UDP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	void RemoveFromRoot();
 
-	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|UDP")
+	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|UDP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	bool IsRooted();
 	
 	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|UDP")

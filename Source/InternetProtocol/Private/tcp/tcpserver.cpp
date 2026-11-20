@@ -37,17 +37,35 @@ FTcpEndpoint UTCPServer::LocalEndpoint() {
 	return Server.Local;
 }
 
-const TSet<UTCPRemote*>& UTCPServer::Clients() {
-	return ClientSet;
+TSet<UTCPRemote*> UTCPServer::Clients() {
+	TSet<UTCPRemote*> Result;
+	Result.Reserve(ClientSet.Num());
+	for (const TObjectPtr<UTCPRemote>& Remote : ClientSet) {
+		Result.Add(Remote.Get());
+	}
+	return Result;
 }
 
 FErrorCode UTCPServer::GetErrorCode() {
 	return Server.LastError;
 }
 
+void UTCPServer::SetTlsOptions(const FSecurityContextOpts& SecOpts) {
+	Tls = IPNet::MakeTlsConfig(SecOpts, true);
+	bUseTls = true;
+}
+
 bool UTCPServer::Open(const FServerBindOptions& BindOpts) {
+	if (bUseTls && (!Tls || !Tls->IsValid())) {
+		if (!Tls) {
+			UE_LOG(LogAsio, Error, TEXT("InternetProtocol: a TLS server requires SetTlsOptions() with a certificate and key."));
+		}
+		Server.LastError = FErrorCode(IPNet::MakeError(IPNet::EError::TlsSetupFailed));
+		OnError.Broadcast(Server.LastError);
+		return false;
+	}
 	const bool bOpened = FFacadeAccess::OpenServer<UTCPServer>(this, BindOpts, [](UTCPServer* Self, asio::ip::tcp::socket&& Socket) {
-		UTCPRemote* Remote = FFacadeAccess::AdoptTcpRemote(Self, Self->ClientSet, MoveTemp(Socket), nullptr, false);
+		UTCPRemote* Remote = FFacadeAccess::AdoptTcpRemote(Self, Self->ClientSet, MoveTemp(Socket), Self->Tls, Self->bUseTls);
 		if (!Remote) {
 			return;
 		}
@@ -63,7 +81,7 @@ bool UTCPServer::Open(const FServerBindOptions& BindOpts) {
 
 void UTCPServer::Close() {
 	FFacadeAccess::CloseServer(this);
-	TArray<UTCPRemote*> Remotes = ClientSet.Array();
+	TArray<TObjectPtr<UTCPRemote>> Remotes = ClientSet.Array();
 	// Remotes stay referenced until their own OnClose (they remove themselves then).
 	for (UTCPRemote* Remote : Remotes) {
 		if (IsValid(Remote)) {
@@ -74,79 +92,3 @@ void UTCPServer::Close() {
 
 // ---------------------------------------------------------------------------------------------------------
 
-void UTCPServerSsl::Construct(const FSecurityContextOpts& SecOpts) {
-	Tls = IPNet::MakeTlsConfig(SecOpts, true);
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// UTCPServerSsl
-
-void UTCPServerSsl::BeginDestroy() {
-	FFacadeAccess::ReleaseServer(Server);
-	// Remotes are owned by this server (Outer) and close themselves when they are destroyed.
-	ClientSet.Empty();
-	Super::BeginDestroy();
-}
-
-void UTCPServerSsl::AddToRoot() {
-	Super::AddToRoot();
-}
-
-void UTCPServerSsl::RemoveFromRoot() {
-	Super::RemoveFromRoot();
-}
-
-bool UTCPServerSsl::IsRooted() {
-	return Super::IsRooted();
-}
-
-bool UTCPServerSsl::IsOpen() {
-	return Server.bOpen;
-}
-
-FTcpEndpoint UTCPServerSsl::LocalEndpoint() {
-	return Server.Local;
-}
-
-const TSet<UTCPRemoteSsl*>& UTCPServerSsl::Clients() {
-	return ClientSet;
-}
-
-FErrorCode UTCPServerSsl::GetErrorCode() {
-	return Server.LastError;
-}
-
-bool UTCPServerSsl::Open(const FServerBindOptions& BindOpts) {
-	if (!Tls || !Tls->IsValid()) {
-		if (!Tls) {
-			UE_LOG(LogAsio, Error, TEXT("InternetProtocol: UTCPServerSsl requires Construct() with a certificate and key."));
-		}
-		Server.LastError = FErrorCode(IPNet::MakeError(IPNet::EError::TlsSetupFailed));
-		OnError.Broadcast(Server.LastError);
-		return false;
-	}
-	const bool bOpened = FFacadeAccess::OpenServer<UTCPServerSsl>(this, BindOpts, [](UTCPServerSsl* Self, asio::ip::tcp::socket&& Socket) {
-		UTCPRemoteSsl* Remote = FFacadeAccess::AdoptTcpRemote(Self, Self->ClientSet, MoveTemp(Socket), Self->Tls, true);
-		if (!Remote) {
-			return;
-		}
-		Self->OnClientAccepted.Broadcast(Remote);
-		// Reading (and the TLS handshake) only starts now, so handlers bound in OnClientAccepted see every event.
-		FFacadeAccess::StartRemote(Remote);
-	});
-	if (bOpened) {
-		OnListening.Broadcast();
-	}
-	return bOpened;
-}
-
-void UTCPServerSsl::Close() {
-	FFacadeAccess::CloseServer(this);
-	TArray<UTCPRemoteSsl*> Remotes = ClientSet.Array();
-	// Remotes stay referenced until their own OnClose (they remove themselves then).
-	for (UTCPRemoteSsl* Remote : Remotes) {
-		if (IsValid(Remote)) {
-			Remote->Close();
-		}
-	}
-}

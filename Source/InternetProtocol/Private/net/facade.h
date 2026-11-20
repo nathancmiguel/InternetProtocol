@@ -528,7 +528,7 @@ namespace IPNet {
 
 		/** Creates a remote facade owned by the server and adopts an accepted TCP/TLS connection. */
 		template <typename TServer, typename TRemote>
-		static TRemote* AdoptTcpRemote(TServer* Server, TSet<TRemote*>& Clients, asio::ip::tcp::socket&& Socket,
+		static TRemote* AdoptTcpRemote(TServer* Server, TSet<TObjectPtr<TRemote>>& Clients, asio::ip::tcp::socket&& Socket,
 		                               const std::shared_ptr<const FTlsConfig>& Tls, bool bUseTls) {
 			TRemote* Remote = NewObject<TRemote>(Server);
 			const uint64 Id = NextSessionId();
@@ -619,7 +619,7 @@ namespace IPNet {
 
 		/** The server keeps its remotes alive through a UPROPERTY set and forgets them when they close. */
 		template <typename TServer, typename TRemote>
-		static void BindRemoteToServer(TServer* Server, TSet<TRemote*>& Clients, TRemote* Remote) {
+		static void BindRemoteToServer(TServer* Server, TSet<TObjectPtr<TRemote>>& Clients, TRemote* Remote) {
 			Clients.Add(Remote);
 			TWeakObjectPtr<TServer> WeakServer(Server);
 			TWeakObjectPtr<TRemote> WeakRemote(Remote);

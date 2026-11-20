@@ -50,13 +50,13 @@ public:
 
 	virtual void BeginDestroy() override;
 
-	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
+	UFUNCTION(blueprintcallable, Category = "IP|HTTP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	void AddToRoot();
 
-	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
+	UFUNCTION(blueprintcallable, Category = "IP|HTTP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	void RemoveFromRoot();
 
-	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
+	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	bool IsRooted();
 	
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
@@ -92,68 +92,30 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
 	void Close();
 
+
+	/** Encrypts the connection with TLS, verifying the server with these options. Applies to the next connection. */
+	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
+	void SetTlsOptions(const FSecurityContextOpts& SecOpts);
+
+	/** TLS (with the default, verifying options unless SetTlsOptions was called). */
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
+	bool bUseTls = false;
+
+	/** Same as SetTlsOptions (name kept from the former Ssl classes). */
+	void Construct(const FSecurityContextOpts& SecOpts) { SetTlsOptions(SecOpts); }
+
 private:
+	std::shared_ptr<const IPNet::FTlsConfig> Tls;
 	friend struct IPNet::FHttpAccess;
 	FIpHttpClientState State;
 	FClientBindOptions bind_options;
 };
 
+/** UHttpClient with TLS on (kept for existing Blueprints and code). New code: UHttpClient with SetTlsOptions / bUseTls. */
 UCLASS(Blueprintable, BlueprintType, Category = "IP|HTTP")
-class INTERNETPROTOCOL_API UHttpClientSsl : public UObject
+class INTERNETPROTOCOL_API UHttpClientSsl : public UHttpClient
 {
 	GENERATED_BODY()
 public:
-	UHttpClientSsl() {}
-
-	void Construct(const FSecurityContextOpts &SecOpts);
-
-	virtual void BeginDestroy() override;
-
-	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
-	void AddToRoot();
-
-	UFUNCTION(blueprintcallable, Category = "IP|HTTP")
-	void RemoveFromRoot();
-
-	UFUNCTION(blueprintcallable, BlueprintPure, Category = "IP|HTTP")
-	bool IsRooted();
-
-	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
-	uint8 IdleTimeoutSeconds = 0;
-	
-	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|HTTP")
-	bool IsOpen();
-
-	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
-	void SetHost(const FClientBindOptions& BindOpts);
-
-	/** Sends the request (queued behind earlier ones) and returns its id for Cancel. */
-	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
-	int32 Request(const FHttpRequest& Request, const FDelegateHttpClientResponse& Callback);
-
-	/** Cancels a queued or in-flight request: its callback receives the Cancelled error. */
-	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
-	bool Cancel(int32 RequestId);
-
-	/** Sets the host from a URL ("https://host[:port]/..."); the path part is not used (set FHttpRequest.Path). */
-	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
-	bool SetUrl(const FString& Url);
-
-	/** Follows up to this many redirects (301, 302, 303, 307, 308) on the same host. 0 = deliver them as responses. */
-	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|HTTP")
-	int32 MaxRedirects = 0;
-
-	/** Download progress of the current request: bytes received and Content-Length (-1 if unknown). */
-	UPROPERTY(BlueprintCallable, BlueprintAssignable, Category = "IP|HTTP|Events")
-	FDelegateHttpClientProgress OnProgress;
-
-
-	UFUNCTION(BlueprintCallable, Category = "IP|HTTP")
-	void Close();
-
-private:
-	friend struct IPNet::FHttpAccess;
-	FIpHttpClientState State;
-	FClientBindOptions bind_options;
-	std::shared_ptr<const IPNet::FTlsConfig> Tls;
+	UHttpClientSsl() { bUseTls = true; }
 };

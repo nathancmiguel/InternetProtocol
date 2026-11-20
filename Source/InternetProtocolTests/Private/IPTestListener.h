@@ -23,9 +23,9 @@ class UIPEcho : public UObject
 	GENERATED_BODY()
 public:
 	UPROPERTY() TObjectPtr<UTCPRemote> Tcp;
-	UPROPERTY() TObjectPtr<UTCPRemoteSsl> TcpSsl;
+	UPROPERTY() TObjectPtr<UTCPRemote> TcpSsl;
 	UPROPERTY() TObjectPtr<UWSRemote> Ws;
-	UPROPERTY() TObjectPtr<UWSRemoteSsl> Wss;
+	UPROPERTY() TObjectPtr<UWSRemote> Wss;
 
 	UFUNCTION() void OnTcpBytes(const TArray<uint8>& Buffer, int Bytes) {
 		if (Tcp) { Tcp->WriteBuffer(Buffer, FDelegateTcpRemoteMessageSent()); }
@@ -85,7 +85,7 @@ public:
 		Remote->OnMessage.AddDynamic(Echo, &UIPEcho::OnTcpBytes);
 		Remotes.Add(Echo);
 	}
-	UFUNCTION() void OnTcpSslAccepted(UTCPRemoteSsl* Remote) {
+	UFUNCTION() void OnTcpSslAccepted(UTCPRemote* Remote) {
 		++Accepted;
 		UIPEcho* Echo = NewObject<UIPEcho>(this);
 		Echo->TcpSsl = Remote;
@@ -224,7 +224,7 @@ public:
 		Remote->OnMessage.AddDynamic(Echo, &UIPEcho::OnWsMessage);
 		Remotes.Add(Echo);
 	}
-	UFUNCTION() void OnWssAccepted(UWSRemoteSsl* Remote) {
+	UFUNCTION() void OnWssAccepted(UWSRemote* Remote) {
 		++Accepted;
 		UIPEcho* Echo = NewObject<UIPEcho>(this);
 		Echo->Wss = Remote;

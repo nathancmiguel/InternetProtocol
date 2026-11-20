@@ -36,13 +36,13 @@ class INTERNETPROTOCOL_API URTMPServer : public UObject
 public:
 	virtual void BeginDestroy() override;
 
-	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	void AddToRoot();
 
-	UFUNCTION(BlueprintCallable, Category = "IP|RTMP")
+	UFUNCTION(BlueprintCallable, Category = "IP|RTMP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	void RemoveFromRoot();
 
-	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|RTMP")
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "IP|RTMP", meta = (DeprecatedFunction, DeprecationMessage = "Keep a reference in a variable instead: objects referenced by a Blueprint stay alive. Will be removed in a future version."))
 	bool IsRooted();
 
 	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "IP|RTMP")

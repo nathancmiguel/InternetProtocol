@@ -94,7 +94,6 @@ namespace IPNet {
 		FWsFrameParser Frames;
 		EState State = EState::Handshake;
 		bool bCloseSent = false;
-		bool bCloseReceived = false;
 		bool bUserAbort = false;
 		uint16 CloseCode = 1006;
 		FString CloseReason = TEXT("Abnormal closure");

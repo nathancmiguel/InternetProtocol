@@ -1,6 +1,6 @@
-# InternetProtocol | 4.27 to 5.8 |
+# InternetProtocol 4.0 | UE 5.x (tested on 5.8) |
 
-> The networking modules (TCP, UDP, HTTP, WebSocket, SSL, RTMP protocol) target 4.27 to 5.8. The live audio/video
+> Version 4.0 requires **Unreal Engine 5** (tested on 5.8); use the 3.x releases for UE 4.27. The live audio/video
 > modules (`InternetProtocolMedia`, `InternetProtocolExample`) require **UE 5.8, Win64**.
 
 The InternetProtocol plugin is a versatile networking solution designed for Unreal Engine, enabling developers to seamlessly establish and manage HTTP, WebSocket, TCP, UDP and RTMP connections, including live audio/video receive and publish (see [RTMP and live audio/video](#rtmp-and-live-audiovideo-ue-58-win64)). This powerful plugin caters to the creation of both clients and servers, providing a robust framework for real-time data exchange and online interaction. Whether you’re developing multiplayer games, interactive applications, or complex networked systems, the InternetProtocol plugin offers the essential tools to bring your project’s connectivity to the next level.
@@ -74,6 +74,51 @@ A description of what actually happens.
 - Clone the repository or download the latest release.
 - Create a C++ empty class if your project is blueprint based.
 - Extract/Move `InternetProtocol` folder into your project's `Plugin` folder.
+
+# Migrating from 3.x to 4.0
+
+Run `Scripts/migrate_4_0.py` once (Python Editor Script Plugin, see the header of the script): it recompiles and
+re-saves your Blueprints and maps and lists those that need manual fixes. Back up or commit first.
+
+**Classes**
+- **TLS on the base classes:** every client and server class has `bUseTls` and `SetTlsOptions(...)`. `UTCPClientSsl`,
+  `UTCPServerSsl`, `UWSClientSsl`, `UWSServerSsl`, `UHttpClientSsl` and `UHttpServerSsl` still exist: they are the same
+  classes with TLS on.
+- **Remotes are shared:** `UTCPRemoteSsl`, `UWSRemoteSsl` and `UHttpRemoteSsl` were merged into `UTCPRemote`,
+  `UWSRemote` and `UHttpRemote`. CoreRedirects keep old assets loading; event pins change to the shared class.
+- **Deprecated:** `AddToRoot` / `RemoveFromRoot` / `IsRooted` nodes. Keep the object in a variable instead.
+- **`Server->Clients()`** returns a copy.
+
+**Behaviour changes (new defaults)**
+- **Timeouts:** `ConnectTimeoutSeconds` 15 s on clients (DNS + connect + TLS + WebSocket upgrade);
+  `HandshakeTimeoutSeconds` 10 s on servers; HTTP servers close idle connections after 60 s; an unanswered HTTP
+  request gets 503 after `ResponseTimeoutSeconds` (30 s).
+- **WebSocket keep-alive:** clients and remotes ping after 20 s of silence and close after 60 s without data
+  (`PingIntervalSeconds` / `IdleTimeoutSeconds`, 0 disables).
+- **Limits:** servers accept up to `MaxConnections` (1024); a connection stops reading when the Game Thread is more
+  than `MaxPendingReceiveMB` (8) behind (UDP drops instead).
+- **Sockets:** `EProtocolType::Any` is the default (IPv4 and IPv6); TCP sockets use `bNoDelay`; the UDP receive
+  buffer is 64 KiB.
+- **HTTP:** the parser rejects malformed headers (bare LF, folded lines, spaces before ":"), HTTP/1.1 requests
+  without Host, and ambiguous framing. Routes are case-sensitive.
+- **WebSocket:** close codes that cannot be sent are replaced by 1000.
+
+**New features (highlights)**
+- **Errors and stats:** `FErrorCode.Category`; `GetStats()` on connections.
+- **TCP framing:** `Framing` with `LengthPrefixed` or `Delimiter` modes.
+- **UDP:** broadcast and multicast.
+- **WebSocket:**
+  - `ConnectUrl`, fragmented messages (`bFin = false`), subprotocols;
+  - `OnUpgradeRequest` with `AcceptUpgrade` / `RejectUpgrade`;
+  - automatic reconnection, ping round trip.
+- **HTTP client:**
+  - binary bodies (`BodyBytes`) and repeated headers (`HeaderList`, e.g. several Set-Cookie);
+  - `Request` returns an id for `Cancel`, per-request `TimeoutSeconds`;
+  - `OnProgress`, redirects (`MaxRedirects`), `SetUrl`.
+- **HTTP server:**
+  - route parameters (`/users/:id`, `/files/*` in `RouteParams`), 405, HEAD via GET, 100-continue;
+  - streamed responses (`BeginStream` / `WriteChunk` / `EndStream`).
+- **JSON:** exact int64 values; missing fields no longer crash.
 
 # RTMP and live audio/video (UE 5.8, Win64)
 

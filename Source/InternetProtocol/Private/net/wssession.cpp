@@ -217,7 +217,6 @@ namespace IPNet {
 				}
 				break;
 			case FWsEvent::EType::Close:
-				bCloseReceived = true;
 				CloseCode = Event.Code;
 				CloseReason = Event.Code == 1005 ? FString() : Event.Reason;
 				if (!bCloseSent) {

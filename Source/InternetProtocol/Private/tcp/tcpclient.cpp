@@ -51,71 +51,20 @@ bool UTCPClient::WriteBuffer(const TArray<uint8>& Buffer, const FDelegateTcpClie
 	return FFacadeAccess::SendBytes(this, IPNet::FBytes(Buffer.GetData(), Buffer.GetData() + Buffer.Num()), Callback);
 }
 
+void UTCPClient::SetTlsOptions(const FSecurityContextOpts& SecOpts) {
+	Tls = IPNet::MakeTlsConfig(SecOpts, false);
+	bUseTls = true;
+}
+
 bool UTCPClient::Connect(const FClientBindOptions& BindOpts) {
-	return FFacadeAccess::ConnectTcp(this, BindOpts, nullptr, false);
+	if (bUseTls && !Tls) {
+		// TLS without SetTlsOptions: the secure defaults (system roots, host name verification).
+		Tls = IPNet::GetDefaultClientTlsConfig();
+	}
+	return FFacadeAccess::ConnectTcp(this, BindOpts, Tls, bUseTls);
 }
 
 void UTCPClient::Close() {
-	FFacadeAccess::CloseStream(Net);
-}
-
-// ---------------------------------------------------------------------------------------------------------
-// UTCPClientSsl
-
-void UTCPClientSsl::Construct(const FSecurityContextOpts& SecOpts) {
-	Tls = IPNet::MakeTlsConfig(SecOpts, false);
-}
-
-void UTCPClientSsl::BeginDestroy() {
-	FFacadeAccess::ReleaseStream(Net);
-	Super::BeginDestroy();
-}
-
-void UTCPClientSsl::AddToRoot() {
-	Super::AddToRoot();
-}
-
-void UTCPClientSsl::RemoveFromRoot() {
-	Super::RemoveFromRoot();
-}
-
-bool UTCPClientSsl::IsRooted() {
-	return Super::IsRooted();
-}
-
-bool UTCPClientSsl::IsOpen() {
-	return Net.bOpen;
-}
-
-FTcpEndpoint UTCPClientSsl::LocalEndpoint() {
-	return Net.Local;
-}
-
-FTcpEndpoint UTCPClientSsl::RemoteEndpoint() {
-	return Net.Remote;
-}
-
-FErrorCode UTCPClientSsl::GetErrorCode() {
-	return Net.LastError;
-}
-
-bool UTCPClientSsl::Write(const FString& Message, const FDelegateTcpClientMessageSent& Callback) {
-	return FFacadeAccess::SendBytes(this, IPNet::ToUtf8(Message), Callback);
-}
-
-bool UTCPClientSsl::WriteBuffer(const TArray<uint8>& Buffer, const FDelegateTcpClientMessageSent& Callback) {
-	return FFacadeAccess::SendBytes(this, IPNet::FBytes(Buffer.GetData(), Buffer.GetData() + Buffer.Num()), Callback);
-}
-
-bool UTCPClientSsl::Connect(const FClientBindOptions& BindOpts) {
-	if (!Tls) {
-		// Created without the subsystem: use the secure defaults.
-		Tls = IPNet::GetDefaultClientTlsConfig();
-	}
-	return FFacadeAccess::ConnectTcp(this, BindOpts, Tls, true);
-}
-
-void UTCPClientSsl::Close() {
 	FFacadeAccess::CloseStream(Net);
 }
 
@@ -123,6 +72,3 @@ FConnectionStats UTCPClient::GetStats() {
 	return FFacadeAccess::StreamStats(Net);
 }
 
-FConnectionStats UTCPClientSsl::GetStats() {
-	return FFacadeAccess::StreamStats(Net);
-}

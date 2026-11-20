@@ -56,55 +56,6 @@ void UWSRemote::Close(int code, const FString& reason) {
 	FWsAccess::Close(this, code, reason);
 }
 
-// ---------------------------------------------------------------------------------------------------------
-// UWSRemoteSsl
-
-void UWSRemoteSsl::BeginDestroy() {
-	FWsAccess::Release(this);
-	OnClosedNative = nullptr;
-	Super::BeginDestroy();
-}
-
-bool UWSRemoteSsl::IsOpen() {
-	return FWsAccess::IsOpen(this);
-}
-
-FTcpEndpoint UWSRemoteSsl::LocalEndpoint() {
-	return State.Net.Local;
-}
-
-FTcpEndpoint UWSRemoteSsl::RemoteEndpoint() {
-	return State.Net.Remote;
-}
-
-FErrorCode UWSRemoteSsl::GetErrorCode() {
-	return State.Net.LastError;
-}
-
-bool UWSRemoteSsl::Write(const FString& Message, const FDataframe& Dataframe, const FDelegateWsRemoteMessageSent& Callback) {
-	return FWsAccess::Write(this, Message, Dataframe, Callback);
-}
-
-bool UWSRemoteSsl::WriteBuffer(const TArray<uint8>& Buffer, const FDataframe& Dataframe, const FDelegateWsRemoteMessageSent& Callback) {
-	return FWsAccess::WriteBuffer(this, Buffer, Dataframe, Callback);
-}
-
-bool UWSRemoteSsl::Ping(const FDelegateWsRemoteMessageSent& Callback) {
-	return FWsAccess::Control(this, EOpcode::PING, Callback);
-}
-
-bool UWSRemoteSsl::Pong(const FDelegateWsRemoteMessageSent& Callback) {
-	return FWsAccess::Control(this, EOpcode::PONG, Callback);
-}
-
-void UWSRemoteSsl::End(int code, const FString& reason) {
-	FWsAccess::End(this, code, reason);
-}
-
-void UWSRemoteSsl::Close(int code, const FString& reason) {
-	FWsAccess::Close(this, code, reason);
-}
-
 FString UWSRemote::GetSubProtocol() {
 	return State.SubProtocol;
 }
@@ -121,26 +72,7 @@ void UWSRemote::RejectUpgrade(int32 Status, const FString& Reason) {
 	FWsAccess::RejectUpgrade(this, Status, Reason);
 }
 
-FString UWSRemoteSsl::GetSubProtocol() {
-	return State.SubProtocol;
-}
-
-float UWSRemoteSsl::GetRoundTripTimeMs() {
-	return State.RoundTripMs;
-}
-
-void UWSRemoteSsl::AcceptUpgrade() {
-	FWsAccess::AcceptUpgrade(this);
-}
-
-void UWSRemoteSsl::RejectUpgrade(int32 Status, const FString& Reason) {
-	FWsAccess::RejectUpgrade(this, Status, Reason);
-}
-
 FConnectionStats UWSRemote::GetStats() {
 	return FWsAccess::Stats(this);
 }
 
-FConnectionStats UWSRemoteSsl::GetStats() {
-	return FWsAccess::Stats(this);
-}

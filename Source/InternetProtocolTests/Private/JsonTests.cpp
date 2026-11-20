@@ -15,7 +15,7 @@ namespace IPJsonTests {
 
 	UJavaScriptObjectNotation* Make(const FString& Text = FString()) {
 		UJavaScriptObjectNotation* Json = NewObject<UJavaScriptObjectNotation>(GetTransientPackage());
-		TEnumAsByte<EOutputExecPins> Result;
+		EOutputExecPins Result;
 		if (Text.IsEmpty()) {
 			Json->ConstructJson(Result);
 		} else {
@@ -28,22 +28,22 @@ namespace IPJsonTests {
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPJsonMissingFieldsTest, "InternetProtocol.Json.MissingFields", IPJsonTests::Flags)
 bool FIPJsonMissingFieldsTest::RunTest(const FString& Parameters) {
 	UJavaScriptObjectNotation* Json = IPJsonTests::Make(TEXT("{\"a\":1}"));
-	TEnumAsByte<EOutputExecPins> Result;
+	EOutputExecPins Result;
 
 	// Used to delete an uninitialised pointer: crashed whenever the field was missing.
 	UJavaScriptObjectNotation* Object = nullptr;
 	Json->TryGetObjectField(Result, TEXT("missing"), Object);
-	TestEqual(TEXT("Missing object field fails"), Result.GetValue(), EOutputExecPins::Failure);
+	TestEqual(TEXT("Missing object field fails"), Result, EOutputExecPins::Failure);
 	TestNull(TEXT("No object returned"), Object);
 	Json->TryGetObjectField(Result, TEXT("a"), Object);
-	TestEqual(TEXT("Number is not an object"), Result.GetValue(), EOutputExecPins::Failure);
+	TestEqual(TEXT("Number is not an object"), Result, EOutputExecPins::Failure);
 
 	UJavaScriptObjectNotation* Empty = NewObject<UJavaScriptObjectNotation>(GetTransientPackage());
 	TestEqual(TEXT("ToString of an unset object is empty"), Empty->ToString(), FString());
 
 	UJavaScriptObjectNotation* Nested = IPJsonTests::Make(TEXT("{\"child\":{\"x\":2}}"));
 	Nested->TryGetObjectField(Result, TEXT("child"), Object);
-	TestEqual(TEXT("Existing object field"), Result.GetValue(), EOutputExecPins::Success);
+	TestEqual(TEXT("Existing object field"), Result, EOutputExecPins::Success);
 	int32 X = 0;
 	if (TestNotNull(TEXT("Child"), Object)) {
 		Object->TryGetIntegerField(Result, TEXT("x"), X);
@@ -55,7 +55,7 @@ bool FIPJsonMissingFieldsTest::RunTest(const FString& Parameters) {
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPJsonArraysTest, "InternetProtocol.Json.Arrays", IPJsonTests::Flags)
 bool FIPJsonArraysTest::RunTest(const FString& Parameters) {
 	UJavaScriptObjectNotation* Json = IPJsonTests::Make();
-	TEnumAsByte<EOutputExecPins> Result;
+	EOutputExecPins Result;
 
 	Json->SetBoolArrayField(TEXT("flags"), {true, false, true});
 	const TArray<TSharedPtr<FJsonValue>>& Stored = Json->GetJsonObject()->GetArrayField(TEXT("flags"));
@@ -74,7 +74,7 @@ bool FIPJsonArraysTest::RunTest(const FString& Parameters) {
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIPJsonInt64Test, "InternetProtocol.Json.Int64", IPJsonTests::Flags)
 bool FIPJsonInt64Test::RunTest(const FString& Parameters) {
 	UJavaScriptObjectNotation* Json = IPJsonTests::Make();
-	TEnumAsByte<EOutputExecPins> Result;
+	EOutputExecPins Result;
 	const int64 Big = 9007199254740993LL; // 2^53 + 1: not representable as a double.
 
 	Json->SetInteger64Field(TEXT("id"), Big);
@@ -110,7 +110,7 @@ bool FIPJsonCycleTest::RunTest(const FString& Parameters) {
 
 	Parent->SetObjectArrayField(TEXT("list"), {Child});
 	TArray<UJavaScriptObjectNotation*> List;
-	TEnumAsByte<EOutputExecPins> Result;
+	EOutputExecPins Result;
 	Parent->TryGetObjectArrayField(Result, TEXT("list"), List);
 	TestEqual(TEXT("Cyclic array element skipped"), List.Num(), 0);
 	TestFalse(TEXT("Still serializable"), Parent->ToString().IsEmpty());
